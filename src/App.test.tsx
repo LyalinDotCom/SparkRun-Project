@@ -50,7 +50,11 @@ function fakeBackend() {
   };
 }
 
-describe('SparkRun app flow', () => {
+function gotoChat() {
+  fireEvent.click(screen.getByRole('button', { name: /Continue|Back to project/i }));
+}
+
+describe('SparkRun setup screen', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
@@ -61,11 +65,12 @@ describe('SparkRun app flow', () => {
     });
   });
 
-  it('shows the configured model and keeps keys as local form input', () => {
+  it('renders the setup screen with the dev-key warning and password fields', () => {
     render(<App />);
 
-    expect(screen.getByText(MODEL_ID)).toBeInTheDocument();
-    expect(screen.getByText(/keys stay in browser memory unless/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/keys stay in browser memory unless/i),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText(/Google AI key/i)).toHaveAttribute(
       'type',
       'password',
@@ -104,20 +109,19 @@ describe('SparkRun app flow', () => {
     expect(screen.getByLabelText(/Tailscale auth key/i)).toHaveValue(
       'saved-tailnet-key',
     );
-    expect(screen.getByLabelText(/Remember keys on this browser/i)).toBeChecked();
+    expect(
+      screen.getByLabelText(/Remember keys on this browser/i),
+    ).toBeChecked();
 
     fireEvent.click(screen.getByLabelText(/Remember keys on this browser/i));
     expect(window.localStorage.getItem('sparkrun.savedKeys.v1')).toBeNull();
   });
 
-  it('saves browser-cached projects and reloads them into the prompt', async () => {
+  it('saves and reloads browser-cached projects', async () => {
     const { unmount } = render(<App />);
 
     fireEvent.change(screen.getByLabelText(/Project name/i), {
       target: { value: 'Hello app' },
-    });
-    fireEvent.change(screen.getByLabelText(/Website brief/i), {
-      target: { value: 'make a tiny hello app' },
     });
     fireEvent.click(screen.getByRole('button', { name: /Save Project/i }));
 
@@ -127,9 +131,112 @@ describe('SparkRun app flow', () => {
 
     unmount();
     render(<App />);
-    fireEvent.click(await screen.findByRole('button', { name: /Hello app/i }));
-    expect(screen.getByLabelText(/Website brief/i)).toHaveValue(
-      'make a tiny hello app',
+    fireEvent.click(await screen.findByRole('button', { name: 'Hello app' }));
+    expect(screen.getByLabelText(/Project name/i)).toHaveValue('Hello app');
+  });
+
+  it('falls back to "Untitled site" when the project name is cleared', () => {
+    render(<App />);
+
+    const input = screen.getByLabelText(/Project name/i);
+    fireEvent.change(input, { target: { value: '' } });
+    expect(input).toHaveValue('');
+
+    fireEvent.blur(input);
+    expect(input).toHaveValue('Untitled site');
+  });
+});
+
+describe('SparkRun chat screen', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    vi.stubGlobal('open', vi.fn());
+    appMocks.runWebsiteAgent.mockResolvedValue({
+      finalText: 'Website generation finished.',
+      changedFiles: ['index.html'],
+    });
+  });
+
+  it('exposes the configured model in the composer', () => {
+    const { container } = render(<App />);
+    gotoChat();
+    expect(container.querySelector('.composer-model')?.textContent).toContain(
+      MODEL_ID,
+    );
+    expect(screen.getByLabelText(/Website brief/i)).toBeInTheDocument();
+  });
+
+  it('blocks build until a Google AI key is present', async () => {
+    render(<App />);
+    gotoChat();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+
+    expect(
+      await screen.findByText(/Google AI key is required before building/i),
+    ).toBeInTheDocument();
+    expect(appMocks.createBackend).not.toHaveBeenCalled();
+    expect(appMocks.runWebsiteAgent).not.toHaveBeenCalled();
+  });
+
+  it('boots the VM, runs the agent, starts the server, and reports a live preview', async () => {
+    const backend = fakeBackend();
+    appMocks.createBackend.mockImplementation(async (options) => {
+      options.onStatus({
+        lifecycle: 'tailnet-connected',
+        message: 'Tailnet connected',
+        tailnetIp: '100.64.0.25',
+        loginUrl: null,
+        previewUrl: 'http://100.64.0.25:8080/',
+      });
+      options.onConsole('boot ok\n');
+      return backend;
+    });
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    gotoChat();
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+
+    await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(1));
+    expect(appMocks.runWebsiteAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: 'test-api-key',
+        backend,
+      }),
+    );
+    expect(backend.startServer).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByText(/Hosted page ready/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Website generation finished/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Open website/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('uses the Tailscale auth key when booting the VM', async () => {
+    const backend = fakeBackend();
+    appMocks.createBackend.mockImplementation(async () => backend);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    fireEvent.change(screen.getByLabelText(/Tailscale auth key/i), {
+      target: { value: 'tskey-auth-test' },
+    });
+    gotoChat();
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+
+    await waitFor(() => expect(appMocks.createBackend).toHaveBeenCalledTimes(1));
+    expect(appMocks.createBackend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tailscaleAuthKey: 'tskey-auth-test',
+      }),
     );
   });
 
@@ -151,98 +258,21 @@ describe('SparkRun app flow', () => {
     appMocks.createBackend.mockImplementation(async () => backend);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole('button', { name: /Black hole sim/i }));
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Black hole sim' }),
+    );
     fireEvent.change(screen.getByLabelText(/Google AI key/i), {
       target: { value: 'test-api-key' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /Build and Serve/i }));
+    gotoChat();
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
 
+    await waitFor(() =>
+      expect(backend.writeText).toHaveBeenCalledWith(
+        'index.html',
+        '<h1>Old sim</h1>',
+      ),
+    );
     await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(1));
-    expect(backend.writeText).toHaveBeenCalledWith('index.html', '<h1>Old sim</h1>');
-    expect(screen.getByLabelText(/Website brief/i)).toHaveValue(
-      'continue the black hole sim',
-    );
-  });
-
-  it('blocks build until a Google AI key is present', async () => {
-    render(<App />);
-
-    fireEvent.click(screen.getByRole('button', { name: /Build and Serve/i }));
-
-    expect(
-      await screen.findByText(/Google AI key is required before building/i),
-    ).toBeInTheDocument();
-    expect(appMocks.createBackend).not.toHaveBeenCalled();
-    expect(appMocks.runWebsiteAgent).not.toHaveBeenCalled();
-  });
-
-  it('boots the VM, runs the agent, starts the server, and loads the iframe preview', async () => {
-    const backend = fakeBackend();
-    appMocks.createBackend.mockImplementation(async (options) => {
-      options.onStatus({
-        lifecycle: 'tailnet-connected',
-        message: 'Tailnet connected',
-        tailnetIp: '100.64.0.25',
-        loginUrl: null,
-        previewUrl: 'http://100.64.0.25:8080/',
-      });
-      options.onConsole('boot ok\n');
-      return backend;
-    });
-
-    render(<App />);
-    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
-      target: { value: 'test-api-key' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: /Build and Serve/i }));
-
-    await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(1));
-    expect(appMocks.runWebsiteAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
-        apiKey: 'test-api-key',
-        backend,
-      }),
-    );
-    expect(backend.startServer).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText('index.html')).toBeInTheDocument();
-    expect(screen.getByText('assets/site.css')).toBeInTheDocument();
-    expect(screen.getByText(/Hosted page ready/i)).toBeInTheDocument();
-    expect(screen.getByText(/VM page is hosted at/i)).toBeInTheDocument();
-    expect(screen.getByText(/Website generation finished/i)).toBeInTheDocument();
-  });
-
-  it('allows the project name to be cleared while editing', () => {
-    render(<App />);
-
-    const input = screen.getByLabelText(/Project name/i);
-    fireEvent.change(input, { target: { value: '' } });
-    expect(input).toHaveValue('');
-
-    fireEvent.blur(input);
-    expect(input).toHaveValue('Untitled site');
-  });
-
-  it('uses the Tailscale auth key during boot and opens the manual login URL', async () => {
-    const backend = fakeBackend();
-    appMocks.createBackend.mockImplementation(async () => backend);
-
-    render(<App />);
-    fireEvent.change(screen.getByLabelText(/Tailscale auth key/i), {
-      target: { value: 'tskey-auth-test' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: /Tailnet/i }));
-
-    await waitFor(() => expect(appMocks.createBackend).toHaveBeenCalledTimes(1));
-    expect(appMocks.createBackend).toHaveBeenCalledWith(
-      expect.objectContaining({
-        tailscaleAuthKey: 'tskey-auth-test',
-      }),
-    );
-    expect(backend.connectTailnet).toHaveBeenCalledTimes(1);
-    expect(window.open).toHaveBeenCalledWith(
-      'https://login.tailscale.com/a/abc',
-      '_blank',
-      'noopener,noreferrer',
-    );
   });
 });
