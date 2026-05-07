@@ -8,7 +8,7 @@ declare module '@leaningtech/cheerpx' {
     };
     IDBDevice: {
       create(name: string): Promise<{
-        readFileAsBlob(path: string): Promise<Blob>;
+        readFileAsBlob(path: string): Promise<Blob | null>;
         reset(): Promise<void>;
       }>;
     };

@@ -82,6 +82,8 @@ describe('SparkRun setup screen', () => {
     expect(
       screen.getByLabelText(/Remember keys on this browser/i),
     ).not.toBeChecked();
+    expect(screen.getByText(/Only model enabled/i)).toBeInTheDocument();
+    expect(screen.queryByText(/gemini-3-pro/i)).not.toBeInTheDocument();
   });
 
   it('saves and reloads keys only when browser saving is enabled', () => {
@@ -216,6 +218,40 @@ describe('SparkRun chat screen', () => {
     expect(
       screen.getByRole('button', { name: /Open website/i }),
     ).toBeInTheDocument();
+  });
+
+  it('keeps a successful build live when a generated file disappears during project snapshotting', async () => {
+    const backend = fakeBackend();
+    backend.listDirectory.mockImplementation(async (path: string) => {
+      if (!path) {
+        return [
+          { path: 'index.html', type: 'file' },
+          { path: 'ghost.js', type: 'file' },
+        ];
+      }
+      return [];
+    });
+    backend.readText.mockImplementation(async (path: string) => {
+      if (path === 'ghost.js') {
+        throw new Error('File not found: /workspace/site/ghost.js');
+      }
+      return '<h1>Hello</h1>';
+    });
+    appMocks.createBackend.mockImplementation(async () => backend);
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    gotoChat();
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+
+    expect(await screen.findByText(/Hosted page ready/i)).toBeInTheDocument();
+    expect(screen.getByText(/Could not snapshot ghost.js/i)).toBeInTheDocument();
+
+    const rawProjects = window.localStorage.getItem('sparkrun.projects.v1') ?? '';
+    expect(rawProjects).toContain('index.html');
+    expect(rawProjects).not.toContain('ghost.js');
   });
 
   it('uses the Tailscale auth key when booting the VM', async () => {

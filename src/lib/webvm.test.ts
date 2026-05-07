@@ -91,6 +91,7 @@ vi.mock('@leaningtech/cheerpx', () => {
         const findPath = parseSingleQuoted(command, "find '");
         if (findPath) {
           const listing = listImmediate(findPath);
+          emitConsole('mesg: ttyname failed: Success\n');
           if (listing) {
             emitConsole(`${listing}\n`);
           }
@@ -121,7 +122,7 @@ vi.mock('@leaningtech/cheerpx', () => {
         readFileAsBlob: async (path: string) => {
           const content = mockState.workspaceFiles.get(path);
           if (content === undefined) {
-            throw new Error(`missing ${path}`);
+            return null;
           }
           return { text: async () => content } as Blob;
         },
@@ -219,6 +220,14 @@ describe('WebVM backend setup', () => {
     expect(copyCall?.args[1]).toContain("cp '/data/stage-");
     expect(copyCall?.args[1]).toContain(`' '${SITE_ROOT}/nested/index.html'`);
     expect(await backend.readText('nested/index.html')).toBe('<h1>quoted "hello"</h1>');
+  });
+
+  it('throws a clear file-not-found error when CheerpX returns a null blob', async () => {
+    const backend = await WebVmBackend.create({});
+
+    await expect(backend.readText('missing.js')).rejects.toThrow(
+      `File not found: ${SITE_ROOT}/missing.js`,
+    );
   });
 
   it('lists workspace files through the VM command path', async () => {

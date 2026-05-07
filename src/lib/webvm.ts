@@ -35,7 +35,7 @@ type CheerpXModule = {
 };
 
 type IdbDevice = {
-  readFileAsBlob(path: string): Promise<Blob>;
+  readFileAsBlob(path: string): Promise<Blob | null>;
   reset(): Promise<void>;
 };
 
@@ -290,9 +290,13 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   async readText(relativePath: string): Promise<string> {
+    const normalized = normalizeSitePath(relativePath);
     const blob = await this.workspaceDevice.readFileAsBlob(
-      toWorkspaceDevicePath(relativePath),
+      toWorkspaceDevicePath(normalized),
     );
+    if (!blob || typeof blob.text !== 'function') {
+      throw new Error(`File not found: ${toVmPath(normalized)}`);
+    }
     return blob.text();
   }
 
@@ -330,15 +334,23 @@ export class WebVmBackend implements VmFileBackend {
     return result.output
       .split('\n')
       .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
+      .flatMap((line) => {
+        if (!line || !['f', 'd'].includes(line[0]) || line[1] !== ' ') {
+          return [];
+        }
         const typeCode = line.slice(0, 1);
         const fullPath = line.slice(2);
+        if (fullPath !== SITE_ROOT && !fullPath.startsWith(`${SITE_ROOT}/`)) {
+          return [];
+        }
         const relative = normalizeSitePath(
           fullPath.startsWith(`${SITE_ROOT}/`)
             ? fullPath.slice(SITE_ROOT.length + 1)
             : fullPath,
         );
+        if (!relative) {
+          return [];
+        }
         return {
           path: relative,
           type: typeCode === 'd' ? 'directory' : 'file',

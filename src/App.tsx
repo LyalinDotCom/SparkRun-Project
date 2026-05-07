@@ -82,8 +82,7 @@ const INITIAL_STATUS: WebVmStatus = {
 };
 
 const MODELS = [
-  { id: MODEL_ID, label: 'Flash', sub: 'Fast · default' },
-  { id: 'gemini-3-pro', label: 'Pro', sub: 'Slower · sharper' },
+  { id: MODEL_ID, label: 'Flash preview', sub: 'Only model enabled' },
 ];
 
 function clock(): string {
@@ -253,7 +252,7 @@ interface SetupScreenProps {
   onApiKey: (value: string) => void;
   onTailKey: (value: string) => void;
   onProjectName: (value: string) => void;
-  onProjectNameBlur: () => void;
+  onProjectNameBlur: (value: string) => void;
   onModel: (value: string) => void;
   onRemember: (enabled: boolean) => void;
   hasOpenedBefore: boolean;
@@ -299,7 +298,7 @@ function SetupScreen(props: SetupScreenProps) {
           <input
             id="setup-project-name"
             className="text-input"
-            onBlur={props.onProjectNameBlur}
+            onBlur={(event) => props.onProjectNameBlur(event.currentTarget.value)}
             onChange={(event) => props.onProjectName(event.target.value)}
             placeholder="Untitled site"
             value={props.cfg.projectName}
@@ -1003,8 +1002,8 @@ export default function App() {
     setActiveProject((current) => ({ ...current, name }));
   };
 
-  const finalizeProjectName = () => {
-    const cleaned = renameProject(activeProject, activeProject.name);
+  const finalizeProjectName = (name: string) => {
+    const cleaned = renameProject(activeProject, name);
     setActiveProject((current) => ({ ...current, name: cleaned.name }));
   };
 
@@ -1063,12 +1062,24 @@ export default function App() {
     };
     await visit('', 0);
     const unique = mergeEntries(collected).filter(isSourceFile);
-    return Promise.all(
-      unique.map(async (entry) => ({
-        path: entry.path,
-        content: await vm.readText(entry.path),
-      })),
-    );
+    const sourceFiles: SourceFile[] = [];
+    for (const entry of unique) {
+      try {
+        sourceFiles.push({
+          path: entry.path,
+          content: await vm.readText(entry.path),
+        });
+      } catch (error) {
+        appendEvent({
+          kind: 'status',
+          label: 'Skipped snapshot',
+          text: `Could not snapshot ${entry.path}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        });
+      }
+    }
+    return sourceFiles;
   };
 
   const restoreProjectFiles = async (
