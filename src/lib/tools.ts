@@ -126,6 +126,106 @@ function countOccurrences(content: string, needle: string): number {
   return content.split(needle).length - 1;
 }
 
+function restoreTrailingNewline(original: string, next: string): string {
+  if (original.endsWith('\n') && !next.endsWith('\n')) {
+    return `${next}\n`;
+  }
+  if (!original.endsWith('\n') && next.endsWith('\n')) {
+    return next.replace(/\n$/, '');
+  }
+  return next;
+}
+
+function applyIndentedReplacement(
+  current: string,
+  oldString: string,
+  newString: string,
+): { next: string; occurrences: number; strategy: 'flexible' } | null {
+  const oldLines = oldString.replace(/\r\n/g, '\n').split('\n');
+  const newLines = newString.replace(/\r\n/g, '\n').split('\n');
+  if (oldLines.length < 2) {
+    return null;
+  }
+
+  const currentLines = current.match(/.*(?:\n|$)/g)?.slice(0, -1) ?? [];
+  const strippedNeedle = oldLines.map((line) => line.trim());
+  let occurrences = 0;
+  let index = 0;
+
+  while (index <= currentLines.length - strippedNeedle.length) {
+    const window = currentLines.slice(index, index + strippedNeedle.length);
+    const strippedWindow = window.map((line) => line.trim());
+    const matches = strippedWindow.every(
+      (line, lineIndex) => line === strippedNeedle[lineIndex],
+    );
+
+    if (!matches) {
+      index++;
+      continue;
+    }
+
+    occurrences++;
+    const indentation = window[0].match(/^([ \t]*)/)?.[1] ?? '';
+    const replacement = newLines
+      .map((line, lineIndex) => {
+        if (line.trim() === '') {
+          return line;
+        }
+        return `${indentation}${line}`;
+      })
+      .join('\n')
+      .replace(/\n?$/, '\n');
+    currentLines.splice(index, oldLines.length, replacement);
+    index += newLines.length;
+  }
+
+  if (occurrences === 0) {
+    return null;
+  }
+
+  return {
+    next: restoreTrailingNewline(current, currentLines.join('')),
+    occurrences,
+    strategy: 'flexible',
+  };
+}
+
+function replaceContent(
+  current: string,
+  oldString: string,
+  newString: string,
+): { next: string; occurrences: number; strategy: 'exact' | 'flexible' } {
+  const normalizedCurrent = current.replace(/\r\n/g, '\n');
+  const normalizedOld = oldString.replace(/\r\n/g, '\n');
+  const normalizedNew = newString.replace(/\r\n/g, '\n');
+  const exactOccurrences = countOccurrences(normalizedCurrent, normalizedOld);
+  if (exactOccurrences > 0) {
+    return {
+      next: restoreTrailingNewline(
+        current,
+        normalizedCurrent.split(normalizedOld).join(normalizedNew),
+      ),
+      occurrences: exactOccurrences,
+      strategy: 'exact',
+    };
+  }
+
+  const flexible = applyIndentedReplacement(
+    normalizedCurrent,
+    normalizedOld,
+    normalizedNew,
+  );
+  if (flexible) {
+    return flexible;
+  }
+
+  return {
+    next: current,
+    occurrences: 0,
+    strategy: 'exact',
+  };
+}
+
 function formatDirectory(entries: DirectoryEntry[]): string {
   if (entries.length === 0) {
     return '(empty)';
@@ -256,7 +356,8 @@ export async function executeToolCall(
           throw new Error('File not found. Use write_file to create it.');
         }
 
-        const occurrences = countOccurrences(current, oldString);
+        const replacement = replaceContent(current, oldString, newString);
+        const occurrences = replacement.occurrences;
         if (occurrences === 0) {
           throw new Error('Could not find old_string in the target file.');
         }
@@ -266,12 +367,11 @@ export async function executeToolCall(
           );
         }
 
-        const next = current.split(oldString).join(newString);
-        await backend.writeText(relativePath, next);
+        await backend.writeText(relativePath, replacement.next);
         return {
           llmContent: `Replaced ${allowMultiple ? occurrences : 1} occurrence${
             occurrences === 1 ? '' : 's'
-          } in ${toVmPath(relativePath)}.`,
+          } in ${toVmPath(relativePath)} using ${replacement.strategy} matching.`,
           display: `Edited ${toVmPath(relativePath)}`,
           changedFiles: [relativePath],
         };

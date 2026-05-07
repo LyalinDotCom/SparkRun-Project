@@ -4,6 +4,12 @@ export interface SavedProject {
   prompt: string;
   previewUrl: string | null;
   updatedAt: string;
+  files: SavedProjectFile[];
+}
+
+export interface SavedProjectFile {
+  path: string;
+  content: string;
 }
 
 const PROJECTS_STORAGE_KEY = 'sparkrun.projects.v1';
@@ -31,6 +37,20 @@ function parseProjects(raw: string | null): SavedProject[] {
       .map((item) => ({
         ...item,
         previewUrl: typeof item.previewUrl === 'string' ? item.previewUrl : null,
+        files: Array.isArray((item as { files?: unknown }).files)
+          ? ((item as { files: unknown[] }).files
+              .filter(
+                (file): file is SavedProjectFile =>
+                  file !== null &&
+                  typeof file === 'object' &&
+                  typeof (file as { path?: unknown }).path === 'string' &&
+                  typeof (file as { content?: unknown }).content === 'string',
+              )
+              .map((file) => ({
+                path: file.path,
+                content: file.content,
+              })))
+          : [],
       }));
   } catch {
     return [];
@@ -53,6 +73,7 @@ export function createProject(prompt: string): SavedProject {
     prompt,
     previewUrl: null,
     updatedAt: now,
+    files: [],
   };
 }
 
@@ -83,5 +104,18 @@ export function renameProject(project: SavedProject, name: string): SavedProject
   return {
     ...project,
     name: cleanName || 'Untitled site',
+  };
+}
+
+export function withProjectFiles(
+  project: SavedProject,
+  files: SavedProjectFile[],
+): SavedProject {
+  return {
+    ...project,
+    files: files.map((file) => ({
+      path: file.path,
+      content: file.content,
+    })),
   };
 }

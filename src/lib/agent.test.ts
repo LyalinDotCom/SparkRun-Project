@@ -154,4 +154,33 @@ describe('website agent loop', () => {
       }),
     ).rejects.toThrow('Describe the website');
   });
+
+  it('uses a larger default turn budget and returns a usable result if the budget is reached after edits', async () => {
+    const backend = new MemoryVmFileBackend();
+    const generateContent = vi.fn().mockImplementation(async () =>
+      response({
+        functionCalls: [
+          {
+            name: 'write_file',
+            args: {
+              file_path: 'index.html',
+              content: '<h1>Still useful</h1>',
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await runWebsiteAgent({
+      apiKey: 'test-key',
+      prompt: 'make a slow site',
+      backend,
+      ai: { models: { generateContent } },
+    });
+
+    expect(generateContent).toHaveBeenCalledTimes(40);
+    expect(result.reachedTurnBudget).toBe(true);
+    expect(result.changedFiles).toEqual(['index.html']);
+    expect(result.finalText).toContain('Serving the latest generated version');
+  });
 });

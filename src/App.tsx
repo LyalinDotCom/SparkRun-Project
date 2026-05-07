@@ -36,10 +36,11 @@ import {
   loadProjects,
   renameProject,
   upsertProject,
+  type SavedProjectFile,
   type SavedProject,
 } from './lib/projects';
 import { WebVmBackend, type WebVmStatus } from './lib/webvm';
-import type { DirectoryEntry } from './lib/tools';
+import type { DirectoryEntry, VmFileBackend } from './lib/tools';
 
 type LogKind = 'model' | 'tool' | 'vm' | 'done' | 'warning' | 'error';
 
@@ -112,6 +113,23 @@ function isSourceFile(entry: DirectoryEntry): boolean {
     return false;
   }
   return !entry.path.split('/').some((part) => part.startsWith('.'));
+}
+
+function entriesFromProjectFiles(files: SavedProjectFile[]): DirectoryEntry[] {
+  const entries = new Map<string, DirectoryEntry>();
+  for (const file of files) {
+    const parts = file.path.split('/').filter(Boolean);
+    if (parts.length === 0) {
+      continue;
+    }
+    let prefix = '';
+    for (const part of parts.slice(0, -1)) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      entries.set(prefix, { path: prefix, type: 'directory' });
+    }
+    entries.set(file.path, { path: file.path, type: 'file' });
+  }
+  return mergeEntries(Array.from(entries.values()));
 }
 
 function readSavedKeys(): {
@@ -188,6 +206,7 @@ export default function App() {
   const [sourceDirectoryName, setSourceDirectoryName] = useState('');
   const localFolderSupported = useMemo(() => isLocalFolderSupported(), []);
   const logListRef = useRef<HTMLDivElement | null>(null);
+  const restoredProjectIdRef = useRef<string | null>(null);
 
   const previewUrl = useMemo(
     () => vmStatus.previewUrl ?? backend?.getPreviewUrl() ?? null,
@@ -286,8 +305,10 @@ export default function App() {
   };
 
   const saveActiveProject = (
-    updates: Partial<Pick<SavedProject, 'name' | 'prompt' | 'previewUrl'>> = {},
-  ) => {
+    updates: Partial<
+      Pick<SavedProject, 'name' | 'prompt' | 'previewUrl' | 'files'>
+    > = {},
+  ): SavedProject => {
     const savedName = renameProject(
       activeProject,
       updates.name ?? activeProject.name,
@@ -297,25 +318,33 @@ export default function App() {
       prompt,
       ...updates,
       name: savedName,
+      files: updates.files ?? activeProject.files,
     };
     setActiveProject(nextProject);
     setProjects((current) => upsertProject(current, nextProject));
     appendLog('done', `Project saved: ${nextProject.name}`);
+    return nextProject;
   };
 
   const newProject = () => {
     const project = createProject(DEFAULT_PROMPT);
     setActiveProject(project);
     setPrompt(project.prompt);
+    setFiles([]);
     setFinalText('');
+    restoredProjectIdRef.current = null;
     appendLog('vm', 'Started a new browser-cached project');
   };
 
-  const selectProject = (project: SavedProject) => {
+  const selectProject = async (project: SavedProject) => {
     setActiveProject(project);
     setPrompt(project.prompt);
     setFinalText('');
+    setFiles(entriesFromProjectFiles(project.files));
     appendLog('vm', `Loaded project: ${project.name}`);
+    if (backend && project.files.length > 0) {
+      await restoreProjectFiles(backend, project);
+    }
   };
 
   const updateProjectName = (name: string) => {
@@ -331,11 +360,13 @@ export default function App() {
       const project = createProject(DEFAULT_PROMPT);
       setActiveProject(project);
       setPrompt(project.prompt);
+      setFiles([]);
+      restoredProjectIdRef.current = null;
     }
     appendLog('warning', 'Project removed from browser cache');
   };
 
-  const loadFiles = async (vm = backend) => {
+  const loadFiles = async (vm: VmFileBackend | null = backend) => {
     if (!vm) {
       setFiles([]);
       return;
@@ -359,7 +390,7 @@ export default function App() {
     setFiles(mergeEntries(collected));
   };
 
-  const collectSourceFiles = async (vm: WebVmBackend): Promise<SourceFile[]> => {
+  const collectSourceFiles = async (vm: VmFileBackend): Promise<SourceFile[]> => {
     const collected: DirectoryEntry[] = [];
     const visit = async (dirPath: string, depth: number) => {
       const entries = await vm.listDirectory(dirPath);
@@ -382,6 +413,23 @@ export default function App() {
         content: await vm.readText(entry.path),
       })),
     );
+  };
+
+  const restoreProjectFiles = async (
+    vm: VmFileBackend,
+    project: SavedProject,
+  ) => {
+    if (project.files.length === 0) {
+      restoredProjectIdRef.current = project.id;
+      return;
+    }
+
+    for (const file of project.files) {
+      await vm.writeText(file.path, file.content);
+    }
+    restoredProjectIdRef.current = project.id;
+    await loadFiles(vm);
+    appendLog('done', `Restored ${project.files.length} files from ${project.name}`);
   };
 
   const attachSourceFolder = async () => {
@@ -515,6 +563,12 @@ export default function App() {
     setFinalText('');
     try {
       const vm = await bootVm();
+      if (
+        activeProject.files.length > 0 &&
+        restoredProjectIdRef.current !== activeProject.id
+      ) {
+        await restoreProjectFiles(vm, activeProject);
+      }
       const tailnetPromise = vm.getPreviewUrl()
         ? Promise.resolve()
         : vm
@@ -547,6 +601,7 @@ export default function App() {
       await vm.startServer();
       await tailnetPromise;
       await loadFiles(vm);
+      const sourceFiles = await collectSourceFiles(vm);
       if (sourceDirectory) {
         await syncSourceToFolder(vm, sourceDirectory);
       }
@@ -559,8 +614,12 @@ export default function App() {
         );
       } else {
         appendLog('done', `Preview served from ${url}`);
-        saveActiveProject({ prompt, previewUrl: url });
       }
+      saveActiveProject({
+        prompt,
+        previewUrl: url,
+        files: sourceFiles,
+      });
     } catch (error) {
       appendLog('error', error instanceof Error ? error.message : String(error));
     } finally {
@@ -575,6 +634,7 @@ export default function App() {
     appendLog('vm', 'Resetting persistent workspace');
     await backend.resetWorkspace();
     await loadFiles(backend);
+    restoredProjectIdRef.current = null;
     setFinalText('');
   };
 
@@ -652,11 +712,14 @@ export default function App() {
                       project.id === activeProject.id ? 'active' : ''
                     }`}
                     key={project.id}
-                    onClick={() => selectProject(project)}
+                    onClick={() => void selectProject(project)}
                     type="button"
                   >
                     <span>{project.name}</span>
-                    <small>{new Date(project.updatedAt).toLocaleDateString()}</small>
+                    <small>
+                      {project.files.length} files ·{' '}
+                      {new Date(project.updatedAt).toLocaleDateString()}
+                    </small>
                   </button>
                 ))
               )}

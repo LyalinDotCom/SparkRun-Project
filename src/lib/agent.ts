@@ -1,7 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import type { Content, GenerateContentResponse } from '@google/genai';
 import { MODEL_ID, SERVER_COMMAND, SITE_ROOT } from './constants';
-import { TOOL_DECLARATIONS } from './toolSchemas';
+import { SHELL_TOOL_NAME, TOOL_DECLARATIONS } from './toolSchemas';
 import {
   executeToolCall,
   type ToolCall,
@@ -32,7 +32,10 @@ export interface AgentRunOptions {
 export interface AgentRunResult {
   finalText: string;
   changedFiles: string[];
+  reachedTurnBudget?: boolean;
 }
+
+export const DEFAULT_AGENT_MAX_TURNS = 40;
 
 const SYSTEM_PROMPT = `
 You are a website-building agent running inside a browser-hosted Linux VM.
@@ -45,7 +48,10 @@ Rules:
 - Write complete file contents. Never use placeholders or omitted sections.
 - Do not call any model other than ${MODEL_ID}.
 - When the site files are ready, you may start the server with: ${SERVER_COMMAND}
-- Keep the result simple and runnable without npm install or build steps.
+- Prefer write_file for complete small static files. Use replace for targeted follow-up edits.
+- After the server is started, stop refining unless you are fixing a clear broken requirement.
+- Finish with a concise final summary instead of continuing to make cosmetic edits.
+- Keep the result runnable without npm install or build steps.
 `;
 
 function emit(options: AgentRunOptions, event: AgentEvent): void {
@@ -141,6 +147,20 @@ function buildToolResponseContent(
   } as Content;
 }
 
+function shouldNudgeToFinish(turn: number, maxTurns: number): boolean {
+  return turn === Math.max(2, maxTurns - 5);
+}
+
+function isServerStartCall(call: ToolCall): boolean {
+  if (call.name !== SHELL_TOOL_NAME) {
+    return false;
+  }
+  return (
+    typeof call.args.command === 'string' &&
+    call.args.command.trim().replace(/\s+/g, ' ') === SERVER_COMMAND
+  );
+}
+
 export async function runWebsiteAgent(
   options: AgentRunOptions,
 ): Promise<AgentRunResult> {
@@ -166,9 +186,22 @@ export async function runWebsiteAgent(
     },
   ];
   const changedFiles = new Set<string>();
-  const maxTurns = options.maxTurns ?? 8;
+  const maxTurns = options.maxTurns ?? DEFAULT_AGENT_MAX_TURNS;
+  let serverStartRequested = false;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
+    if (shouldNudgeToFinish(turn, maxTurns)) {
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            text:
+              'You are near the tool turn budget. If index.html and related assets are present and the server has been started, stop calling tools and return the final summary. Only call tools for a critical missing file or broken behavior.',
+          },
+        ],
+      });
+    }
+
     emit(options, {
       type: 'model',
       message: `Calling ${MODEL_ID}, turn ${turn}`,
@@ -204,6 +237,9 @@ export async function runWebsiteAgent(
       });
       const result = await executeToolCall(options.backend, call);
       result.changedFiles?.forEach((file) => changedFiles.add(file));
+      if (!result.error && isServerStartCall(call)) {
+        serverStartRequested = true;
+      }
       emit(options, {
         type: result.error ? 'error' : 'tool',
         message: result.error
@@ -216,5 +252,17 @@ export async function runWebsiteAgent(
     contents.push(...functionResponses);
   }
 
-  throw new Error(`Model did not finish after ${maxTurns} turns.`);
+  if (changedFiles.size > 0) {
+    const finalText = serverStartRequested
+      ? 'Reached the tool turn budget after creating files and starting the server. Serving the latest generated version.'
+      : 'Reached the tool turn budget after creating files. Serving the latest generated version.';
+    emit(options, { type: 'done', message: finalText });
+    return {
+      finalText,
+      changedFiles: Array.from(changedFiles).sort(),
+      reachedTurnBudget: true,
+    };
+  }
+
+  throw new Error(`Model did not produce files after ${maxTurns} turns.`);
 }

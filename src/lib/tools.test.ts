@@ -89,6 +89,43 @@ describe('browser VM tool executor', () => {
     );
   });
 
+  it('recovers replace calls with indentation-only differences like Gemini CLI edit', async () => {
+    const backend = new MemoryVmFileBackend({
+      'script.js': [
+        'function draw() {',
+        '  ctx.fillStyle = "black";',
+        '  ctx.fillRect(0, 0, width, height);',
+        '}',
+      ].join('\n'),
+    });
+
+    const result = await executeToolCall(backend, {
+      name: 'replace',
+      args: {
+        file_path: 'script.js',
+        old_string: [
+          'ctx.fillStyle = "black";',
+          'ctx.fillRect(0, 0, width, height);',
+        ].join('\n'),
+        new_string: [
+          'ctx.fillStyle = "rgba(0, 0, 0, 0.2)";',
+          'ctx.fillRect(0, 0, width, height);',
+        ].join('\n'),
+      },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.llmContent).toContain('flexible matching');
+    expect(await backend.readText('script.js')).toBe(
+      [
+        'function draw() {',
+        '  ctx.fillStyle = "rgba(0, 0, 0, 0.2)";',
+        '  ctx.fillRect(0, 0, width, height);',
+        '}',
+      ].join('\n'),
+    );
+  });
+
   it('creates a missing file with replace only when old_string is empty', async () => {
     const backend = new MemoryVmFileBackend();
 

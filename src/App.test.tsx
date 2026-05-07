@@ -21,6 +21,10 @@ vi.mock('./lib/agent', () => ({
 import App from './App';
 
 function fakeBackend() {
+  const files = new Map<string, string>([
+    ['index.html', '<h1>Hello</h1>'],
+    ['assets/site.css', 'body { color: teal; }'],
+  ]);
   return {
     connectTailnet: vi.fn(async () => 'https://login.tailscale.com/a/abc'),
     getPreviewUrl: vi.fn(() => 'http://100.64.0.25:8080/'),
@@ -32,6 +36,10 @@ function fakeBackend() {
         ];
       }
       return [{ path: 'assets/site.css', type: 'file' }];
+    }),
+    readText: vi.fn(async (path: string) => files.get(path) ?? ''),
+    writeText: vi.fn(async (path: string, content: string) => {
+      files.set(path, content);
     }),
     resetWorkspace: vi.fn(async () => undefined),
     startServer: vi.fn(async () => ({
@@ -122,6 +130,37 @@ describe('SparkRun app flow', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Hello app/i }));
     expect(screen.getByLabelText(/Website brief/i)).toHaveValue(
       'make a tiny hello app',
+    );
+  });
+
+  it('restores saved project files into the VM before continuing a project', async () => {
+    window.localStorage.setItem(
+      'sparkrun.projects.v1',
+      JSON.stringify([
+        {
+          id: 'saved-project',
+          name: 'Black hole sim',
+          prompt: 'continue the black hole sim',
+          previewUrl: 'http://100.64.0.25:8080/',
+          updatedAt: new Date().toISOString(),
+          files: [{ path: 'index.html', content: '<h1>Old sim</h1>' }],
+        },
+      ]),
+    );
+    const backend = fakeBackend();
+    appMocks.createBackend.mockImplementation(async () => backend);
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /Black hole sim/i }));
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Build and Serve/i }));
+
+    await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(1));
+    expect(backend.writeText).toHaveBeenCalledWith('index.html', '<h1>Old sim</h1>');
+    expect(screen.getByLabelText(/Website brief/i)).toHaveValue(
+      'continue the black hole sim',
     );
   });
 
