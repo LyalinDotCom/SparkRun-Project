@@ -101,6 +101,24 @@ function stageName(): string {
   return `stage-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
 }
 
+const SERVER_SCRIPT_PATH = '/workspace/.sparkrun_static_server.py';
+const SERVER_SCRIPT = `
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+class Handler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+class ReusableServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+ReusableServer(("0.0.0.0", ${SERVER_PORT}), Handler).serve_forever()
+`.trimStart();
+
 function formatPreviewUrl(ip: string | null): string | null {
   if (!ip) {
     return null;
@@ -280,9 +298,16 @@ export class WebVmBackend implements VmFileBackend {
 
   async writeText(relativePath: string, content: string): Promise<void> {
     const normalized = normalizeSitePath(relativePath);
+    await this.copyTextToVm(toVmPath(normalized), content, SITE_ROOT);
+  }
+
+  private async copyTextToVm(
+    destination: string,
+    content: string,
+    cwd: string,
+  ): Promise<void> {
     const staged = stageName();
     await this.dataDevice.writeFile(`/${staged}`, content);
-    const destination = toVmPath(normalized);
     const directory = destination.slice(0, destination.lastIndexOf('/')) || SITE_ROOT;
     await this.execBash(
       `mkdir -p ${shellQuote(directory)} && cp ${shellQuote(
@@ -340,9 +365,13 @@ export class WebVmBackend implements VmFileBackend {
       };
     }
 
+    await this.copyTextToVm(SERVER_SCRIPT_PATH, SERVER_SCRIPT, SITE_ROOT);
     const command = [
+      `if [ -f /workspace/site/.server.pid ]; then kill $(cat /workspace/site/.server.pid) 2>/dev/null || true; fi`,
       `cd ${shellQuote(SITE_ROOT)}`,
-      `(nohup ${SERVER_COMMAND} > /workspace/site/.server.log 2>&1 & echo $! > /workspace/site/.server.pid)`,
+      `(nohup python3 ${shellQuote(
+        SERVER_SCRIPT_PATH,
+      )} > /workspace/site/.server.log 2>&1 & echo $! > /workspace/site/.server.pid)`,
       'sleep 1',
       'cat /workspace/site/.server.pid',
     ].join(' && ');

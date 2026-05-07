@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { SERVER_COMMAND, SERVER_PORT, SITE_ROOT } from './constants';
+import { SERVER_PORT, SITE_ROOT } from './constants';
 
 type RunCall = {
   fileName: string;
@@ -74,11 +74,16 @@ vi.mock('@leaningtech/cheerpx', () => {
       const command = args[1] ?? '';
 
       const cpSource = parseSingleQuoted(command, "cp '/data/");
-      const cpDestination = parseSingleQuoted(command, "' '/workspace/site/");
+      const cpDestination = parseSingleQuoted(command, "' '/workspace/");
       if (cpSource && cpDestination) {
         const content = mockState.dataFiles.get(`/${cpSource}`);
         if (content !== undefined) {
-          mockState.workspaceFiles.set(`/site/${cpDestination}`, String(content));
+          mockState.workspaceFiles.set(
+            cpDestination.startsWith('site/')
+              ? `/${cpDestination}`
+              : `/workspace/${cpDestination}`,
+            String(content),
+          );
         }
       }
 
@@ -238,12 +243,20 @@ describe('WebVM backend setup', () => {
     const result = await backend.startServer();
 
     const command = mockState.runCalls.at(-1)?.args[1] ?? '';
+    const stagedServerScript = Array.from(mockState.dataFiles.values()).find(
+      (content) =>
+        typeof content === 'string' &&
+        content.includes('Cross-Origin-Resource-Policy'),
+    );
     expect(result).toMatchObject({
       status: 0,
       background: true,
     });
-    expect(command).toContain(SERVER_COMMAND);
+    expect(command).toContain('python3');
+    expect(command).toContain('/workspace/.sparkrun_static_server.py');
     expect(command).not.toContain('& &&');
+    expect(stagedServerScript).toContain('Cross-Origin-Embedder-Policy');
+    expect(stagedServerScript).toContain('cross-origin');
     expect(statuses).toContain('server-running');
   });
 

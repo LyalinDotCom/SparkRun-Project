@@ -102,6 +102,29 @@ describe('SparkRun app flow', () => {
     expect(window.localStorage.getItem('sparkrun.savedKeys.v1')).toBeNull();
   });
 
+  it('saves browser-cached projects and reloads them into the prompt', async () => {
+    const { unmount } = render(<App />);
+
+    fireEvent.change(screen.getByLabelText(/Project name/i), {
+      target: { value: 'Hello app' },
+    });
+    fireEvent.change(screen.getByLabelText(/Website brief/i), {
+      target: { value: 'make a tiny hello app' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Save Project/i }));
+
+    expect(window.localStorage.getItem('sparkrun.projects.v1')).toContain(
+      'Hello app',
+    );
+
+    unmount();
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /Hello app/i }));
+    expect(screen.getByLabelText(/Website brief/i)).toHaveValue(
+      'make a tiny hello app',
+    );
+  });
+
   it('blocks build until a Google AI key is present', async () => {
     render(<App />);
 
@@ -144,11 +167,20 @@ describe('SparkRun app flow', () => {
     expect(backend.startServer).toHaveBeenCalledTimes(1);
     expect(await screen.findByText('index.html')).toBeInTheDocument();
     expect(screen.getByText('assets/site.css')).toBeInTheDocument();
-    expect(screen.getByTitle('VM hosted website preview')).toHaveAttribute(
-      'src',
-      '/__sparkrun_preview__/100.64.0.25:8080/',
-    );
+    expect(screen.getByText(/Hosted page ready/i)).toBeInTheDocument();
+    expect(screen.getByText(/VM page is hosted at/i)).toBeInTheDocument();
     expect(screen.getByText(/Website generation finished/i)).toBeInTheDocument();
+  });
+
+  it('allows the project name to be cleared while editing', () => {
+    render(<App />);
+
+    const input = screen.getByLabelText(/Project name/i);
+    fireEvent.change(input, { target: { value: '' } });
+    expect(input).toHaveValue('');
+
+    fireEvent.blur(input);
+    expect(input).toHaveValue('Untitled site');
   });
 
   it('uses the Tailscale auth key during boot and opens the manual login URL', async () => {

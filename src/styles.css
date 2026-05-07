@@ -101,7 +101,7 @@ h2 {
 .workflow {
   display: grid;
   gap: 16px;
-  grid-template-columns: minmax(300px, 0.78fr) minmax(420px, 1.1fr) minmax(440px, 1.28fr);
+  grid-template-columns: minmax(320px, 0.92fr) minmax(440px, 1.24fr) minmax(300px, 0.72fr);
   margin: 0 auto;
   max-width: 1720px;
 }
@@ -139,6 +139,107 @@ h2 {
 .warning-strip span {
   font-size: 0.9rem;
   line-height: 1.35;
+}
+
+.project-panel,
+.source-sync-panel {
+  border: 1px solid #d4dae0;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  padding: 10px;
+}
+
+.panel-topline,
+.project-actions,
+.preview-actions,
+.source-status {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.panel-topline {
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.panel-topline span,
+.source-status {
+  color: #303840;
+  font-size: 0.86rem;
+  font-weight: 850;
+}
+
+.compact-field {
+  margin-bottom: 10px;
+}
+
+.project-list {
+  border-top: 1px solid #edf0f3;
+  max-height: 118px;
+  overflow: auto;
+  padding-top: 6px;
+}
+
+.project-row {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid #edf0f3;
+  color: #252b31;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 36px;
+  padding: 7px 2px;
+  text-align: left;
+  width: 100%;
+}
+
+.project-row.active span {
+  color: #0c604f;
+  font-weight: 900;
+}
+
+.project-row small {
+  color: #7d8790;
+  font-size: 0.72rem;
+}
+
+.project-actions {
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+.project-actions .secondary-button {
+  flex: 1;
+}
+
+.source-status {
+  background: #f5f7f8;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  min-height: 34px;
+  padding: 7px 8px;
+}
+
+.source-status.ready {
+  background: #e2f7ee;
+  color: #0c604f;
+}
+
+.button-row.compact {
+  margin: 0;
+}
+
+.link-button {
+  background: transparent;
+  border: 0;
+  color: #a63b23;
+  font-weight: 850;
+  padding: 7px 0 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .field {
@@ -403,35 +504,93 @@ textarea:focus {
 
 .preview-pane {
   display: grid;
-  grid-template-rows: auto minmax(360px, 1fr) minmax(180px, 0.46fr);
+  gap: 10px;
+  grid-template-rows: auto auto auto minmax(160px, auto);
+  height: fit-content;
+  min-height: 0;
+  position: sticky;
+  top: 18px;
+}
+
+.preview-actions {
+  justify-content: flex-end;
+}
+
+.ready-pill {
+  align-items: center;
+  background: #edf2f3;
+  border: 1px solid #cfd6dd;
+  border-radius: 999px;
+  color: #4a5158;
+  display: inline-flex;
+  font-size: 0.78rem;
+  font-weight: 850;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 9px;
+}
+
+.ready-pill.ready,
+.preview-ready-strip {
+  background: #e2f7ee;
+  border-color: #8bcfb2;
+  color: #0c604f;
+}
+
+.preview-ready-strip {
+  align-items: center;
+  border: 1px solid #8bcfb2;
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  margin-bottom: 10px;
+  min-height: 42px;
+  padding: 8px 10px;
+}
+
+.preview-ready-strip span {
+  overflow-wrap: anywhere;
 }
 
 .preview-frame {
   background: #ffffff;
   border: 1px solid #17191c;
   border-radius: 6px;
-  min-height: 360px;
+  min-height: 210px;
   overflow: hidden;
 }
 
-.preview-frame iframe {
-  border: 0;
-  display: block;
-  height: 100%;
-  width: 100%;
-}
-
-.preview-empty {
+.preview-launch {
   align-items: center;
   color: #4f5a64;
   display: flex;
   flex-direction: column;
-  font-weight: 800;
-  gap: 10px;
+  gap: 9px;
   height: 100%;
   justify-content: center;
-  min-height: 360px;
+  min-height: 210px;
+  padding: 18px;
   text-align: center;
+}
+
+.preview-launch.ready {
+  color: #0c604f;
+}
+
+.preview-launch strong {
+  color: #17191c;
+  font-size: 1.05rem;
+}
+
+.preview-launch span {
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.preview-launch .primary-button {
+  margin-top: 6px;
+  min-height: 44px;
 }
 
 .terminal-output {
@@ -470,6 +629,7 @@ textarea:focus {
 
   .preview-pane {
     grid-column: 1 / -1;
+    position: static;
   }
 }
 
@@ -497,6 +657,10 @@ textarea:focus {
   .build-pane {
     height: auto;
     max-height: none;
+    position: static;
+  }
+
+  .preview-pane {
     position: static;
   }
 
