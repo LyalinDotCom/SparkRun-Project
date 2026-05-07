@@ -192,7 +192,9 @@ describe('SparkRun chat screen', () => {
         loginUrl: null,
         previewUrl: 'http://100.64.0.25:8080/',
       });
-      options.onConsole('boot ok\n');
+      options.onConsole(
+        'mesg: ttyname failed: Success\nboot ok\nsg: ttyname failed: Success\n',
+      );
       return backend;
     });
 
@@ -218,6 +220,9 @@ describe('SparkRun chat screen', () => {
     expect(
       screen.getByRole('button', { name: /Open website/i }),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
+    expect(screen.getByText('boot ok')).toBeInTheDocument();
+    expect(screen.queryByText(/ttyname failed/i)).not.toBeInTheDocument();
   });
 
   it('keeps a successful build live when a generated file disappears during project snapshotting', async () => {

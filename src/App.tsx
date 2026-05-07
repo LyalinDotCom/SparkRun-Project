@@ -201,6 +201,20 @@ function makeId(): number {
   return Date.now() + Math.floor(Math.random() * 1000);
 }
 
+const BENIGN_TERMINAL_LINES = new Set([
+  'mesg: ttyname failed: Success',
+  'sg: ttyname failed: Success',
+]);
+
+function filterTerminalOutput(text: string): string {
+  const normalized = text.replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const filtered = lines.filter(
+    (line) => !BENIGN_TERMINAL_LINES.has(line.trim()),
+  );
+  return filtered.join('\n');
+}
+
 interface AppBarProps {
   title: string;
   subtitle?: string;
@@ -942,7 +956,11 @@ export default function App() {
   };
 
   const appendTerminal = (text: string) => {
-    setTerminal((current) => `${current}${text}`.slice(-50_000));
+    const cleaned = filterTerminalOutput(text);
+    if (!cleaned) {
+      return;
+    }
+    setTerminal((current) => `${current}${cleaned}`.slice(-50_000));
   };
 
   useEffect(() => {
