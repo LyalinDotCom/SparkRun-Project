@@ -1,0 +1,395 @@
+import { SERVER_COMMAND, SITE_ROOT } from './constants';
+import {
+  EDIT_TOOL_NAME,
+  LIST_DIRECTORY_TOOL_NAME,
+  READ_FILE_TOOL_NAME,
+  SHELL_TOOL_NAME,
+  WRITE_FILE_TOOL_NAME,
+} from './toolSchemas';
+
+export type ToolName =
+  | typeof READ_FILE_TOOL_NAME
+  | typeof WRITE_FILE_TOOL_NAME
+  | typeof EDIT_TOOL_NAME
+  | typeof LIST_DIRECTORY_TOOL_NAME
+  | typeof SHELL_TOOL_NAME;
+
+export interface ToolCall {
+  id?: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface DirectoryEntry {
+  path: string;
+  type: 'file' | 'directory';
+}
+
+export interface VmCommandResult {
+  status: number;
+  output: string;
+  background?: boolean;
+}
+
+export interface VmFileBackend {
+  readText(relativePath: string): Promise<string>;
+  writeText(relativePath: string, content: string): Promise<void>;
+  listDirectory(relativePath: string): Promise<DirectoryEntry[]>;
+  runCommand(
+    command: string,
+    options: { cwd: string; background?: boolean },
+  ): Promise<VmCommandResult>;
+}
+
+export interface ToolExecutionResult {
+  llmContent: string;
+  display: string;
+  changedFiles?: string[];
+  error?: string;
+}
+
+const PLACEHOLDER_PATTERNS = [
+  /\.\.\.\s*rest\b/i,
+  /\brest of (the )?(code|file|styles|script|markup)\b/i,
+  /\/\/\s*\.\.\./,
+  /\/\*\s*\.\.\.\s*\*\//,
+  /<\!--\s*\.\.\.\s*-->/,
+];
+
+export function normalizeSitePath(rawPath: string | undefined): string {
+  const raw = (rawPath ?? '').trim().replace(/\\/g, '/');
+  if (!raw) {
+    return '';
+  }
+
+  let path = raw;
+  if (path === SITE_ROOT) {
+    return '';
+  }
+  if (path.startsWith(`${SITE_ROOT}/`)) {
+    path = path.slice(SITE_ROOT.length + 1);
+  } else if (path.startsWith('/workspace/')) {
+    throw new Error(`Path is outside ${SITE_ROOT}: ${rawPath}`);
+  } else {
+    path = path.replace(/^\/+/, '');
+  }
+
+  const segments: string[] = [];
+  for (const part of path.split('/')) {
+    if (!part || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      throw new Error(`Path cannot escape ${SITE_ROOT}: ${rawPath}`);
+    }
+    if (part.includes('\0')) {
+      throw new Error('Path cannot contain null bytes.');
+    }
+    segments.push(part);
+  }
+  return segments.join('/');
+}
+
+export function toVmPath(relativePath: string): string {
+  return relativePath ? `${SITE_ROOT}/${relativePath}` : SITE_ROOT;
+}
+
+function expectString(value: unknown, name: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`Missing or invalid "${name}".`);
+  }
+  return value;
+}
+
+function expectOptionalNumber(value: unknown, name: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`Invalid "${name}".`);
+  }
+  return value;
+}
+
+function rejectOmissions(content: string, fieldName: string): void {
+  if (PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(content))) {
+    throw new Error(
+      `"${fieldName}" contains an omission placeholder. Provide exact complete text.`,
+    );
+  }
+}
+
+function countOccurrences(content: string, needle: string): number {
+  if (!needle) {
+    return 0;
+  }
+  return content.split(needle).length - 1;
+}
+
+function formatDirectory(entries: DirectoryEntry[]): string {
+  if (entries.length === 0) {
+    return '(empty)';
+  }
+  return entries
+    .sort((a, b) => a.path.localeCompare(b.path))
+    .map((entry) => `${entry.type === 'directory' ? 'dir' : 'file'} ${entry.path}`)
+    .join('\n');
+}
+
+function readLineRange(
+  content: string,
+  startLine?: number,
+  endLine?: number,
+): string {
+  if (startLine !== undefined && startLine < 1) {
+    throw new Error('start_line must be at least 1.');
+  }
+  if (endLine !== undefined && endLine < 1) {
+    throw new Error('end_line must be at least 1.');
+  }
+  if (
+    startLine !== undefined &&
+    endLine !== undefined &&
+    endLine < startLine
+  ) {
+    throw new Error('end_line must be greater than or equal to start_line.');
+  }
+
+  if (startLine === undefined && endLine === undefined) {
+    return content;
+  }
+
+  const lines = content.split('\n');
+  const startIndex = (startLine ?? 1) - 1;
+  const endIndex = endLine ?? lines.length;
+  return lines.slice(startIndex, endIndex).join('\n');
+}
+
+function isAllowedShellCommand(command: string): boolean {
+  const normalized = command.trim().replace(/\s+/g, ' ');
+  return [
+    SERVER_COMMAND,
+    'pwd',
+    'ls',
+    'ls -la',
+    'find . -maxdepth 2 -type f',
+  ].includes(normalized);
+}
+
+export async function executeToolCall(
+  backend: VmFileBackend,
+  call: ToolCall,
+): Promise<ToolExecutionResult> {
+  try {
+    switch (call.name) {
+      case READ_FILE_TOOL_NAME: {
+        const relativePath = normalizeSitePath(
+          expectString(call.args.file_path, 'file_path'),
+        );
+        if (!relativePath) {
+          throw new Error('read_file requires a file path.');
+        }
+        const startLine = expectOptionalNumber(call.args.start_line, 'start_line');
+        const endLine = expectOptionalNumber(call.args.end_line, 'end_line');
+        const content = await backend.readText(relativePath);
+        const ranged = readLineRange(content, startLine, endLine);
+        return {
+          llmContent: `Read ${toVmPath(relativePath)}:\n${ranged}`,
+          display: `Read ${toVmPath(relativePath)}`,
+        };
+      }
+
+      case WRITE_FILE_TOOL_NAME: {
+        const relativePath = normalizeSitePath(
+          expectString(call.args.file_path, 'file_path'),
+        );
+        if (!relativePath) {
+          throw new Error('write_file requires a file path.');
+        }
+        const content = expectString(call.args.content, 'content');
+        rejectOmissions(content, 'content');
+        await backend.writeText(relativePath, content);
+        return {
+          llmContent: `Wrote ${content.split('\n').length} lines to ${toVmPath(
+            relativePath,
+          )}.`,
+          display: `Wrote ${toVmPath(relativePath)}`,
+          changedFiles: [relativePath],
+        };
+      }
+
+      case EDIT_TOOL_NAME: {
+        const relativePath = normalizeSitePath(
+          expectString(call.args.file_path, 'file_path'),
+        );
+        if (!relativePath) {
+          throw new Error('replace requires a file path.');
+        }
+        const oldString = expectString(call.args.old_string, 'old_string');
+        const newString = expectString(call.args.new_string, 'new_string');
+        const allowMultiple = call.args.allow_multiple === true;
+        rejectOmissions(newString, 'new_string');
+
+        let current = '';
+        let exists = true;
+        try {
+          current = await backend.readText(relativePath);
+        } catch {
+          exists = false;
+        }
+
+        if (!oldString) {
+          if (exists) {
+            throw new Error(
+              'old_string is empty, but the target file already exists.',
+            );
+          }
+          await backend.writeText(relativePath, newString);
+          return {
+            llmContent: `Created ${toVmPath(relativePath)} by replace.`,
+            display: `Created ${toVmPath(relativePath)}`,
+            changedFiles: [relativePath],
+          };
+        }
+
+        if (!exists) {
+          throw new Error('File not found. Use write_file to create it.');
+        }
+
+        const occurrences = countOccurrences(current, oldString);
+        if (occurrences === 0) {
+          throw new Error('Could not find old_string in the target file.');
+        }
+        if (!allowMultiple && occurrences !== 1) {
+          throw new Error(
+            `old_string matched ${occurrences} times. Set allow_multiple to true or provide a more specific old_string.`,
+          );
+        }
+
+        const next = current.split(oldString).join(newString);
+        await backend.writeText(relativePath, next);
+        return {
+          llmContent: `Replaced ${allowMultiple ? occurrences : 1} occurrence${
+            occurrences === 1 ? '' : 's'
+          } in ${toVmPath(relativePath)}.`,
+          display: `Edited ${toVmPath(relativePath)}`,
+          changedFiles: [relativePath],
+        };
+      }
+
+      case LIST_DIRECTORY_TOOL_NAME: {
+        const relativePath = normalizeSitePath(
+          typeof call.args.dir_path === 'string' ? call.args.dir_path : '',
+        );
+        const entries = await backend.listDirectory(relativePath);
+        const listing = formatDirectory(entries);
+        return {
+          llmContent: `Listing ${toVmPath(relativePath)}:\n${listing}`,
+          display: `Listed ${toVmPath(relativePath)}`,
+        };
+      }
+
+      case SHELL_TOOL_NAME: {
+        const command = expectString(call.args.command, 'command');
+        if (!isAllowedShellCommand(command)) {
+          throw new Error(
+            `Command is not allowed in this prototype: ${command}`,
+          );
+        }
+        const relativeCwd = normalizeSitePath(
+          typeof call.args.dir_path === 'string' ? call.args.dir_path : '',
+        );
+        const normalizedCommand = command.trim().replace(/\s+/g, ' ');
+        const result = await backend.runCommand(normalizedCommand, {
+          cwd: toVmPath(relativeCwd),
+          background: normalizedCommand === SERVER_COMMAND,
+        });
+        if (result.status !== 0) {
+          throw new Error(
+            `Command failed with status ${result.status}: ${result.output}`,
+          );
+        }
+        return {
+          llmContent: `Command completed: ${normalizedCommand}\n${result.output}`,
+          display: result.background
+            ? `Started ${normalizedCommand}`
+            : `Ran ${normalizedCommand}`,
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${call.name}`);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      llmContent: `Tool ${call.name} failed: ${message}`,
+      display: `Failed ${call.name}`,
+      error: message,
+    };
+  }
+}
+
+export class MemoryVmFileBackend implements VmFileBackend {
+  private readonly files = new Map<string, string>();
+  readonly commands: Array<{ command: string; cwd: string; background?: boolean }> =
+    [];
+
+  constructor(initialFiles: Record<string, string> = {}) {
+    for (const [path, content] of Object.entries(initialFiles)) {
+      this.files.set(normalizeSitePath(path), content);
+    }
+  }
+
+  async readText(relativePath: string): Promise<string> {
+    const normalized = normalizeSitePath(relativePath);
+    const content = this.files.get(normalized);
+    if (content === undefined) {
+      throw new Error(`File not found: ${toVmPath(normalized)}`);
+    }
+    return content;
+  }
+
+  async writeText(relativePath: string, content: string): Promise<void> {
+    this.files.set(normalizeSitePath(relativePath), content);
+  }
+
+  async listDirectory(relativePath: string): Promise<DirectoryEntry[]> {
+    const normalized = normalizeSitePath(relativePath);
+    const prefix = normalized ? `${normalized}/` : '';
+    const seen = new Map<string, DirectoryEntry>();
+    for (const path of this.files.keys()) {
+      if (!path.startsWith(prefix)) {
+        continue;
+      }
+      const rest = path.slice(prefix.length);
+      if (!rest) {
+        continue;
+      }
+      const [first, ...remaining] = rest.split('/');
+      const entryPath = prefix + first;
+      const type = remaining.length > 0 ? 'directory' : 'file';
+      const existing = seen.get(entryPath);
+      if (!existing || existing.type !== 'directory') {
+        seen.set(entryPath, { path: entryPath, type });
+      }
+    }
+    return Array.from(seen.values());
+  }
+
+  async runCommand(
+    command: string,
+    options: { cwd: string; background?: boolean },
+  ): Promise<VmCommandResult> {
+    this.commands.push({ command, ...options });
+    return {
+      status: 0,
+      output: options.background ? 'started in background' : 'ok',
+      background: options.background,
+    };
+  }
+
+  snapshot(): Record<string, string> {
+    return Object.fromEntries(this.files.entries());
+  }
+}
