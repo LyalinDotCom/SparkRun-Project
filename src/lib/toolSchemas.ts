@@ -102,7 +102,7 @@ export const TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: SHELL_TOOL_NAME,
-    description: `Runs one of a few safe commands in /workspace/site. For this prototype, the only server command is "${SERVER_COMMAND}".`,
+    description: `Runs safe commands in /workspace/site. Allowed commands include "${SERVER_COMMAND}", pwd, ls, ls -R /workspace/site, and find . -maxdepth 2 -type f. The server command starts the Python static server on the next available VM port. Use list_directory or read_file for normal inspection.`,
     parametersJsonSchema: {
       type: 'object',
       properties: {

@@ -195,5 +195,28 @@ describe('browser VM tool executor', () => {
         background: true,
       },
     ]);
+
+    const inspect = await executeToolCall(backend, {
+      name: 'run_shell_command',
+      args: { command: `ls -R ${SITE_ROOT}` },
+    });
+    expect(inspect.error).toBeUndefined();
+    expect(backend.commands.at(-1)).toMatchObject({
+      command: `ls -R ${SITE_ROOT}`,
+      cwd: SITE_ROOT,
+      background: false,
+    });
+
+    const heredoc = "python3 - <<'PY'\nprint('ok')\nPY";
+    const python = await executeToolCall(backend, {
+      name: 'run_shell_command',
+      args: { command: heredoc },
+    });
+    expect(python.error).toBeUndefined();
+    expect(backend.commands.at(-1)).toMatchObject({
+      command: heredoc,
+      cwd: SITE_ROOT,
+      background: false,
+    });
   });
 });

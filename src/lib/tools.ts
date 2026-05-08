@@ -23,6 +23,7 @@ export interface ToolCall {
 export interface DirectoryEntry {
   path: string;
   type: 'file' | 'directory';
+  sizeBytes?: number;
 }
 
 export interface VmCommandResult {
@@ -37,7 +38,12 @@ export interface VmFileBackend {
   listDirectory(relativePath: string): Promise<DirectoryEntry[]>;
   runCommand(
     command: string,
-    options: { cwd: string; background?: boolean },
+    options: {
+      cwd: string;
+      background?: boolean;
+      stream?: boolean;
+      timeoutMs?: number;
+    },
   ): Promise<VmCommandResult>;
 }
 
@@ -265,15 +271,54 @@ function readLineRange(
   return lines.slice(startIndex, endIndex).join('\n');
 }
 
+function normalizeShellCommand(command: string): string {
+  return command.trim().replace(/\s+/g, ' ');
+}
+
+function shellCommandForExecution(command: string): string {
+  const trimmed = command.trim();
+  if (/^python3 - <<'PY'\n[\s\S]*\nPY$/.test(trimmed)) {
+    return trimmed;
+  }
+  return normalizeShellCommand(command);
+}
+
+const EXACT_SHELL_COMMANDS = new Set([
+  SERVER_COMMAND,
+  'pwd',
+  'ls',
+  'ls .',
+  `ls ${SITE_ROOT}`,
+  'ls -la',
+  'ls -la .',
+  `ls -la ${SITE_ROOT}`,
+  'ls -R',
+  'ls -R .',
+  `ls -R ${SITE_ROOT}`,
+  'find . -maxdepth 2 -type f',
+  'find . -maxdepth 3 -type f',
+  `find ${SITE_ROOT} -maxdepth 2 -type f`,
+  `find ${SITE_ROOT} -maxdepth 3 -type f`,
+  'cat .server.log',
+  'cat /workspace/site/.server.log',
+  'tail .server.log',
+  'tail -40 .server.log',
+  'tail -40 /workspace/site/.server.log',
+  'cat .server.pid',
+  'cat /workspace/site/.server.pid',
+  'ps',
+  'ps aux',
+  'ps -ef',
+  'netstat -ltn',
+  'ss -ltn',
+]);
+
 function isAllowedShellCommand(command: string): boolean {
-  const normalized = command.trim().replace(/\s+/g, ' ');
-  return [
-    SERVER_COMMAND,
-    'pwd',
-    'ls',
-    'ls -la',
-    'find . -maxdepth 2 -type f',
-  ].includes(normalized);
+  const normalized = normalizeShellCommand(command);
+  if (EXACT_SHELL_COMMANDS.has(normalized)) {
+    return true;
+  }
+  return /^python3 - <<'PY'\n[\s\S]*\nPY$/.test(command.trim());
 }
 
 export async function executeToolCall(
@@ -399,8 +444,9 @@ export async function executeToolCall(
         const relativeCwd = normalizeSitePath(
           typeof call.args.dir_path === 'string' ? call.args.dir_path : '',
         );
-        const normalizedCommand = command.trim().replace(/\s+/g, ' ');
-        const result = await backend.runCommand(normalizedCommand, {
+        const normalizedCommand = normalizeShellCommand(command);
+        const commandToRun = shellCommandForExecution(command);
+        const result = await backend.runCommand(commandToRun, {
           cwd: toVmPath(relativeCwd),
           background: normalizedCommand === SERVER_COMMAND,
         });
@@ -410,7 +456,7 @@ export async function executeToolCall(
           );
         }
         return {
-          llmContent: `Command completed: ${normalizedCommand}\n${result.output}`,
+          llmContent: `Command completed: ${commandToRun}\n${result.output}`,
           display: result.background
             ? `Started ${normalizedCommand}`
             : `Ran ${normalizedCommand}`,
@@ -432,8 +478,13 @@ export async function executeToolCall(
 
 export class MemoryVmFileBackend implements VmFileBackend {
   private readonly files = new Map<string, string>();
-  readonly commands: Array<{ command: string; cwd: string; background?: boolean }> =
-    [];
+  readonly commands: Array<{
+    command: string;
+    cwd: string;
+    background?: boolean;
+    stream?: boolean;
+    timeoutMs?: number;
+  }> = [];
 
   constructor(initialFiles: Record<string, string> = {}) {
     for (const [path, content] of Object.entries(initialFiles)) {
@@ -479,7 +530,12 @@ export class MemoryVmFileBackend implements VmFileBackend {
 
   async runCommand(
     command: string,
-    options: { cwd: string; background?: boolean },
+    options: {
+      cwd: string;
+      background?: boolean;
+      stream?: boolean;
+      timeoutMs?: number;
+    },
   ): Promise<VmCommandResult> {
     this.commands.push({ command, ...options });
     return {

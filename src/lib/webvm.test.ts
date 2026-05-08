@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { SERVER_PORT, SITE_ROOT } from './constants';
+import { SERVER_COMMAND, SERVER_PORT, SITE_ROOT } from './constants';
 
 type RunCall = {
   fileName: string;
@@ -100,6 +100,17 @@ vi.mock('@leaningtech/cheerpx', () => {
 
       if (command.includes('cat /workspace/site/.server.pid')) {
         emitConsole('4242\n');
+      }
+
+      if (command.includes('cat /workspace/site/.server.port')) {
+        emitConsole(`${SERVER_PORT + 1}\n`);
+      }
+
+      if (command.includes('http://127.0.0.1:')) {
+        emitConsole(`internal: HTTP 200 from http://127.0.0.1:${SERVER_PORT + 1}/\n`);
+        if (command.includes('http://100.64.0.10:')) {
+          emitConsole(`tailnet: HTTP 200 from http://100.64.0.10:${SERVER_PORT + 1}/\n`);
+        }
       }
 
       return { status: 0 };
@@ -207,7 +218,9 @@ describe('WebVM backend setup', () => {
 
     const backend = await WebVmBackend.create({});
 
-    expect(backend.getPreviewUrl()).toBe(`http://100.64.0.10:${SERVER_PORT}/`);
+    expect(backend.getPreviewUrl()).toBeNull();
+    await backend.startServer();
+    expect(backend.getPreviewUrl()).toBe(`http://100.64.0.10:${SERVER_PORT + 1}/`);
   });
 
   it('stages writes through DataDevice before copying into the VM workspace', async () => {
@@ -243,6 +256,35 @@ describe('WebVM backend setup', () => {
     ]);
   });
 
+  it('does not stream internal directory listings into the user terminal', async () => {
+    const terminal: string[] = [];
+    const backend = await WebVmBackend.create({
+      onConsole: (text) => terminal.push(text),
+    });
+    mockState.workspaceFiles.set('/site/index.html', '');
+
+    await backend.listDirectory('');
+
+    expect(terminal.join('')).not.toContain('f /workspace/site/index.html');
+    expect(terminal.join('')).not.toContain('mesg: ttyname failed');
+  });
+
+  it('checks the static server from inside the VM', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+
+    const result = await backend.checkServer();
+
+    expect(result).toMatchObject({
+      status: 0,
+      background: false,
+    });
+    expect(result.output).toContain(
+      `internal: server process is listening on port ${SERVER_PORT + 1}`,
+    );
+    expect(result.output).not.toContain('tailnet:');
+  });
+
   it('starts the real VM web server command without invalid shell composition', async () => {
     const statuses: string[] = [];
     const backend = await WebVmBackend.create({
@@ -251,22 +293,32 @@ describe('WebVM backend setup', () => {
 
     const result = await backend.startServer();
 
-    const command = mockState.runCalls.at(-1)?.args[1] ?? '';
+    const cleanupCommand =
+      mockState.runCalls.find((call) =>
+        call.args[1]?.includes('rm -f /workspace/site/.server.pid'),
+      )?.args[1] ?? '';
+    const serverLaunch = mockState.runCalls.find(
+      (call) => call.args[1]?.includes(`nohup ${SERVER_COMMAND}`),
+    );
     const stagedServerScript = Array.from(mockState.dataFiles.values()).find(
       (content) =>
         typeof content === 'string' &&
-        content.includes('Cross-Origin-Resource-Policy'),
+        content.includes('ThreadingHTTPServer'),
     );
     expect(result).toMatchObject({
       status: 0,
       background: true,
     });
-    expect(command).toContain('python3');
-    expect(command).toContain('/workspace/.sparkrun_static_server.py');
-    expect(command).not.toContain('& &&');
+    expect(serverLaunch?.args[1]).toContain(SERVER_COMMAND);
+    expect(cleanupCommand).toContain("pkill -f '[.]sparkrun_static_server.py'");
+    expect(cleanupCommand).toContain(`pkill -f '[h]ttp.server ${SERVER_PORT}'`);
+    expect(cleanupCommand).toContain('ps -eo pid,args');
+    expect(cleanupCommand).toContain('kill -9');
+    expect(cleanupCommand).not.toContain("pkill -f '/workspace/.sparkrun");
+    expect(cleanupCommand).not.toContain('& &&');
     expect(stagedServerScript).toContain('Cross-Origin-Embedder-Policy');
     expect(stagedServerScript).toContain('cross-origin');
-    expect(statuses).toContain('server-running');
+    expect(statuses).toContain('booting');
   });
 
   it('opens manual Tailscale login and converts netmap IP to preview URL', async () => {
@@ -281,6 +333,8 @@ describe('WebVM backend setup', () => {
 
     await expect(loginPromise).resolves.toBe('https://login.tailscale.com/a/123');
     expect(mockState.cx?.networkLogin).toHaveBeenCalledTimes(1);
-    expect(backend.getPreviewUrl()).toBe(`http://100.64.0.20:${SERVER_PORT}/`);
+    expect(backend.getPreviewUrl()).toBeNull();
+    await backend.startServer();
+    expect(backend.getPreviewUrl()).toBe(`http://100.64.0.20:${SERVER_PORT + 1}/`);
   });
 });

@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   ArrowLeft,
   ArrowRight,
@@ -26,7 +28,7 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import { runWebsiteAgent, type AgentEvent } from './lib/agent';
-import { MODEL_ID, SERVER_PORT } from './lib/constants';
+import { MODEL_ID, SITE_ROOT } from './lib/constants';
 import {
   clearDirectoryHandle,
   isLocalFolderSupported,
@@ -45,7 +47,11 @@ import {
   type SavedProject,
   type SavedProjectFile,
 } from './lib/projects';
-import { WebVmBackend, type WebVmStatus } from './lib/webvm';
+import {
+  WebVmBackend,
+  type WebVmDebugEntry,
+  type WebVmStatus,
+} from './lib/webvm';
 import type { DirectoryEntry, VmFileBackend } from './lib/tools';
 
 type Screen = 'setup' | 'chat';
@@ -59,6 +65,9 @@ type EventKind =
   | 'ready'
   | 'error';
 
+type ToolCategory = 'edit' | 'shell' | 'inspect';
+type EventTone = 'normal' | 'error';
+
 interface LogEvent {
   id: number;
   kind: EventKind;
@@ -66,6 +75,16 @@ interface LogEvent {
   text?: string;
   cmd?: string;
   lines?: string[];
+  toolCategory?: ToolCategory;
+  tone?: EventTone;
+  time: string;
+}
+
+interface ToolLogGroup {
+  type: 'tool-group';
+  id: number;
+  category: ToolCategory;
+  events: LogEvent[];
   time: string;
 }
 
@@ -79,6 +98,7 @@ const INITIAL_STATUS: WebVmStatus = {
   tailnetIp: null,
   loginUrl: null,
   previewUrl: null,
+  serverPort: null,
 };
 
 const MODELS = [
@@ -139,9 +159,30 @@ function entriesFromProjectFiles(files: SavedProjectFile[]): DirectoryEntry[] {
       prefix = prefix ? `${prefix}/${part}` : part;
       entries.set(prefix, { path: prefix, type: 'directory' });
     }
-    entries.set(file.path, { path: file.path, type: 'file' });
+    entries.set(file.path, {
+      path: file.path,
+      type: 'file',
+      sizeBytes: byteLength(file.content),
+    });
   }
   return mergeEntries(Array.from(entries.values()));
+}
+
+function byteLength(content: string): number {
+  return new TextEncoder().encode(content).byteLength;
+}
+
+function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined) {
+    return 'unknown';
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function readSavedKeys(): {
@@ -190,15 +231,26 @@ function clearSavedKeys(): void {
   }
 }
 
-function eventToLogKind(event: AgentEvent): EventKind {
-  if (event.type === 'done') return 'ready';
-  if (event.type === 'error') return 'error';
-  if (event.type === 'model') return 'thought';
-  return 'cmd';
-}
-
 function makeId(): number {
   return Date.now() + Math.floor(Math.random() * 1000);
+}
+
+function isRetryPrompt(text: string): boolean {
+  return /^(try again|retry|again|rerun|rebuild)$/i.test(text.trim());
+}
+
+function resolveBuildPrompt(
+  draft: string,
+  events: LogEvent[],
+  fallbackPrompt: string,
+): string {
+  if (!isRetryPrompt(draft)) {
+    return draft;
+  }
+  const previous = [...events]
+    .reverse()
+    .find((event) => event.kind === 'chat' && event.text && !isRetryPrompt(event.text));
+  return previous?.text?.trim() || fallbackPrompt.trim() || DEFAULT_PROMPT;
 }
 
 const BENIGN_TERMINAL_LINES = new Set([
@@ -206,13 +258,257 @@ const BENIGN_TERMINAL_LINES = new Set([
   'sg: ttyname failed: Success',
 ]);
 
+const ANSI_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
+const LOCAL_PREVIEW_URL_PATTERN =
+  /https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?\/?/gi;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function cleanTerminalLine(line: string): string {
+  return line
+    .replace(ANSI_PATTERN, '')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+    .trim();
+}
+
 function filterTerminalOutput(text: string): string {
-  const normalized = text.replace(/\r\n/g, '\n');
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = normalized.split('\n');
   const filtered = lines.filter(
-    (line) => !BENIGN_TERMINAL_LINES.has(line.trim()),
+    (line) => !BENIGN_TERMINAL_LINES.has(cleanTerminalLine(line)),
   );
   return filtered.join('\n');
+}
+
+function formatFinalSummary(text: string, previewUrl: string | null): string {
+  const replacement = previewUrl ?? 'the Tailnet preview URL';
+  const cleaned = text.trim().replace(LOCAL_PREVIEW_URL_PATTERN, replacement);
+  if (!previewUrl || cleaned.includes(previewUrl)) {
+    return cleaned;
+  }
+  return `${cleaned}\n\n**Preview:** ${previewUrl}`;
+}
+
+function portFromPreviewUrl(url: string | null): number | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    const port = Number(parsed.port);
+    return Number.isInteger(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+function hostFromPreviewUrl(url: string | null): string | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
+function cleanStatusOutput(text: string): string {
+  return filterTerminalOutput(text)
+    .split('\n')
+    .map((line) => cleanTerminalLine(line))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function stripSiteRoot(text: string): string {
+  return text
+    .replaceAll(`${SITE_ROOT}/`, '')
+    .replaceAll(SITE_ROOT, '.')
+    .trim();
+}
+
+function toolCategoryForMessage(message: string): ToolCategory | null {
+  const text = message.trim();
+  if (/^(write_file|replace|Wrote|Edited|Created)\b/i.test(text)) {
+    return 'edit';
+  }
+  if (/^(read_file|list_directory|Read|Listed)\b/i.test(text)) {
+    return 'inspect';
+  }
+  if (/^(run_shell_command|Started|Ran)\b/i.test(text)) {
+    return 'shell';
+  }
+  if (/^(write_file|replace)\s+failed:/i.test(text)) {
+    return 'edit';
+  }
+  if (/^(read_file|list_directory)\s+failed:/i.test(text)) {
+    return 'inspect';
+  }
+  if (/^run_shell_command\s+failed:/i.test(text)) {
+    return 'shell';
+  }
+  return null;
+}
+
+function toolCategoryLabel(category: ToolCategory): string {
+  if (category === 'edit') return 'Edit';
+  if (category === 'inspect') return 'Inspect';
+  return 'Shell';
+}
+
+function formatToolDetail(message: string): string {
+  const text = stripSiteRoot(cleanStatusOutput(message) || message.trim());
+  return text
+    .replace(/^write_file\s+/i, 'write ')
+    .replace(/^replace\s+/i, 'replace ')
+    .replace(/^read_file\s+/i, 'read ')
+    .replace(/^list_directory\s+/i, 'list ')
+    .replace(/^run_shell_command\s+/i, '$ ')
+    .replace(/^Wrote\s+/i, 'wrote ')
+    .replace(/^Edited\s+/i, 'edited ')
+    .replace(/^Created\s+/i, 'created ')
+    .replace(/^Read\s+/i, 'read ')
+    .replace(/^Listed\s+/i, 'listed ')
+    .replace(/^Started\s+/i, 'started ')
+    .replace(/^Ran\s+/i, '$ ')
+    .replace(/^run_shell_command failed:\s*/i, 'failed: ')
+    .replace(/^write_file failed:\s*/i, 'failed: ')
+    .replace(/^replace failed:\s*/i, 'failed: ')
+    .replace(/^read_file failed:\s*/i, 'failed: ')
+    .replace(/^list_directory failed:\s*/i, 'failed: ');
+}
+
+function eventFromAgentEvent(
+  event: AgentEvent,
+): Omit<LogEvent, 'id' | 'time'> | null {
+  if (event.type === 'model' || event.type === 'done') {
+    return null;
+  }
+
+  const category = toolCategoryForMessage(event.message);
+  if (event.type === 'tool' || category) {
+    return {
+      kind: 'cmd',
+      text: formatToolDetail(event.message),
+      toolCategory: category ?? 'shell',
+      tone: event.type === 'error' ? 'error' : 'normal',
+    };
+  }
+
+  return {
+    kind: 'error',
+    text: event.message,
+    tone: 'error',
+  };
+}
+
+function formatDebugEntry(entry: WebVmDebugEntry): string {
+  const parts = [`[${clock()}] ${entry.phase}`];
+  if (entry.cwd) {
+    parts.push(`cwd=${entry.cwd}`);
+  }
+  if (entry.status !== undefined) {
+    parts.push(`status=${entry.status}`);
+  }
+  if (entry.background) {
+    parts.push('background=true');
+  }
+  const header = parts.join(' ');
+  const command = entry.command ? `\n$ ${entry.command}` : '';
+  const output = entry.output ? `\n${cleanStatusOutput(entry.output)}` : '';
+  return `${header}${command}${output}`;
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    (typeof DOMException !== 'undefined' &&
+      error instanceof DOMException &&
+      error.name === 'AbortError') ||
+    (error instanceof Error && error.name === 'AbortError')
+  );
+}
+
+async function waitForPreviewUrl(
+  vm: VmFileBackend & { getPreviewUrl?: () => string | null },
+  timeoutMs: number,
+): Promise<string | null> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const url = vm.getPreviewUrl?.() ?? null;
+    if (url) {
+      return url;
+    }
+    await sleep(750);
+  }
+  return vm.getPreviewUrl?.() ?? null;
+}
+
+async function checkPreviewFromBrowser(url: string): Promise<{
+  status: number;
+  output: string;
+}> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 5_000);
+  try {
+    await fetch(url, {
+      cache: 'no-store',
+      mode: 'no-cors',
+      signal: controller.signal,
+    });
+    return {
+      status: 0,
+      output: `browser: reachable at ${url}`,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      status: 1,
+      output: `browser: Tailnet fetch failed for ${url}: ${message}`,
+    };
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+function buildTimelineItems(events: LogEvent[]): Array<LogEvent | ToolLogGroup> {
+  const items: Array<LogEvent | ToolLogGroup> = [];
+
+  for (const event of events) {
+    const category =
+      event.kind === 'cmd'
+        ? event.toolCategory ??
+          toolCategoryForMessage(event.text ?? event.cmd ?? '')
+        : null;
+
+    if (!category) {
+      items.push(event);
+      continue;
+    }
+
+    const previous = items[items.length - 1];
+    if (previous && isToolLogGroup(previous) && previous.category === category) {
+      previous.events.push(event);
+      previous.time = event.time;
+      continue;
+    }
+
+    items.push({
+      type: 'tool-group',
+      id: event.id,
+      category,
+      events: [event],
+      time: event.time,
+    });
+  }
+
+  return items;
+}
+
+function isToolLogGroup(item: LogEvent | ToolLogGroup): item is ToolLogGroup {
+  return 'type' in item && item.type === 'tool-group';
 }
 
 interface AppBarProps {
@@ -542,10 +838,12 @@ function SetupScreen(props: SetupScreenProps) {
 interface ChatScreenProps {
   cfg: { model: string; projectName: string };
   events: LogEvent[];
-  fileCount: number;
+  files: DirectoryEntry[];
   building: boolean;
   ready: boolean;
   tailnetIp: string | null;
+  previewUrl: string | null;
+  serverPort: number | null;
   vmStatus: WebVmStatus;
   hasStarted: boolean;
   draft: string;
@@ -553,6 +851,7 @@ interface ChatScreenProps {
   onSend: () => void;
   onCancel: () => void;
   onOpenWebsite: () => void;
+  onLogs: () => void;
   onTerminal: () => void;
   errorMessage: string | null;
 }
@@ -564,13 +863,32 @@ function StreamLine({ line }: { line: string }) {
   return <div className={cls}>{line}</div>;
 }
 
+function MarkdownMessage({ text }: { text?: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ children, ...props }) => (
+          <a {...props} target="_blank" rel="noreferrer">
+            {children}
+          </a>
+        ),
+      }}
+    >
+      {text ?? ''}
+    </ReactMarkdown>
+  );
+}
+
 function ChatScreen({
   cfg,
   events,
-  fileCount,
+  files,
   building,
   ready,
   tailnetIp,
+  previewUrl,
+  serverPort,
   vmStatus,
   hasStarted,
   draft,
@@ -578,10 +896,37 @@ function ChatScreen({
   onSend,
   onCancel,
   onOpenWebsite,
+  onLogs,
   onTerminal,
   errorMessage,
 }: ChatScreenProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const timelineItems = useMemo(() => buildTimelineItems(events), [events]);
+  const sourceFiles = useMemo(() => files.filter(isSourceFile), [files]);
+  const totalBytes = sourceFiles.reduce(
+    (total, file) => total + (file.sizeBytes ?? 0),
+    0,
+  );
+  const [highlightedFilePath, setHighlightedFilePath] = useState<string | null>(
+    null,
+  );
+
+  useEffect(() => {
+    if (sourceFiles.length === 0) {
+      setHighlightedFilePath(null);
+      return;
+    }
+    setHighlightedFilePath((current) =>
+      current && sourceFiles.some((file) => file.path === current)
+        ? current
+        : sourceFiles[0].path,
+    );
+  }, [sourceFiles]);
+
+  const highlightedFile =
+    sourceFiles.find((file) => file.path === highlightedFilePath) ??
+    sourceFiles[0] ??
+    null;
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -602,6 +947,8 @@ function ChatScreen({
         ? lifecycleLabel(vmStatus)
         : 'Ready to build';
   const statusTone = ready ? 'ok' : building ? 'run' : 'idle';
+  const portLabel = serverPort ? `:${serverPort}` : ':auto';
+  const previewHost = hostFromPreviewUrl(previewUrl);
 
   return (
     <div className="chat-frame">
@@ -622,12 +969,13 @@ function ChatScreen({
             {tailnetIp ?? 'No tailnet IP'}
           </span>
           <span className={`pill ${ready ? 'ok' : ''}`}>
-            <Monitor size={12} aria-hidden="true" />:{SERVER_PORT}
+            <Monitor size={12} aria-hidden="true" />
+            {portLabel}
           </span>
-          {fileCount > 0 ? (
+          {sourceFiles.length > 0 ? (
             <span className="pill">
               <Files size={12} aria-hidden="true" />
-              {fileCount} file{fileCount === 1 ? '' : 's'}
+              {sourceFiles.length} file{sourceFiles.length === 1 ? '' : 's'}
             </span>
           ) : null}
           <span style={{ flex: 1 }} />
@@ -640,8 +988,62 @@ function ChatScreen({
             <TerminalIcon size={12} aria-hidden="true" />
             Terminal
           </button>
+          <button
+            aria-label="Open logs"
+            className="terminal-toggle"
+            onClick={onLogs}
+            type="button"
+          >
+            <FileCode2 size={12} aria-hidden="true" />
+            Logs
+          </button>
         </div>
       </div>
+
+      {sourceFiles.length > 0 ? (
+        <div className="file-strip">
+          <div className="file-strip-inner">
+            <div className="file-total">
+              <Files size={13} aria-hidden="true" />
+              <span>{sourceFiles.length} generated</span>
+              <strong>{formatBytes(totalBytes)}</strong>
+            </div>
+            <div
+              aria-label="Generated files"
+              className="file-selector"
+              role="listbox"
+            >
+              {sourceFiles.map((file) => {
+                const active = highlightedFile?.path === file.path;
+                return (
+                  <button
+                    aria-selected={active}
+                    className={`file-chip ${active ? 'active' : ''}`}
+                    key={file.path}
+                    onClick={() => setHighlightedFilePath(file.path)}
+                    onFocus={() => setHighlightedFilePath(file.path)}
+                    onMouseEnter={() => setHighlightedFilePath(file.path)}
+                    role="option"
+                    type="button"
+                  >
+                    <FileCode2 size={13} aria-hidden="true" />
+                    <span className="file-path">{file.path}</span>
+                    <span className="file-size">
+                      {formatBytes(file.sizeBytes)}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {highlightedFile ? (
+              <div className="file-highlight">
+                <span>{highlightedFile.path}</span>
+                <strong>{formatBytes(highlightedFile.sizeBytes)}</strong>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       <div className="log-scroll" ref={scrollRef}>
         <div className="log-inner">
@@ -658,8 +1060,12 @@ function ChatScreen({
             </div>
           ) : null}
 
-          {events.map((event) => (
-            <LogRow key={event.id} event={event} />
+          {timelineItems.map((item) => (
+            isToolLogGroup(item) ? (
+              <ToolGroupRow group={item} key={`tool-${item.id}`} />
+            ) : (
+              <LogRow key={item.id} event={item} />
+            )
           ))}
 
           {building && events.length > 0 ? (
@@ -685,7 +1091,7 @@ function ChatScreen({
                 <span className="dot pulse" />
                 Open website
                 <span className="url">
-                  {tailnetIp ? `${tailnetIp}:${SERVER_PORT}` : 'preview'}
+                  {previewHost ?? (tailnetIp && serverPort ? `${tailnetIp}:${serverPort}` : 'preview')}
                 </span>
               </span>
               <ExternalLink size={15} />
@@ -779,7 +1185,7 @@ function LogRow({ event }: { event: LogEvent }) {
     chat: 'You',
     thought: 'gemini',
     status: event.label ?? 'Status',
-    cmd: 'Run',
+    cmd: event.toolCategory ? toolCategoryLabel(event.toolCategory) : 'Shell',
     stream: 'Output',
     ready: 'Live',
     error: 'Error',
@@ -790,10 +1196,14 @@ function LogRow({ event }: { event: LogEvent }) {
   if (event.kind === 'chat') {
     body = <div className="chat-bubble">{event.text}</div>;
   } else if (event.kind === 'thought' || event.kind === 'status') {
-    body = <div className="thought-text">{event.text}</div>;
+    body = (
+      <div className="thought-text markdown-message">
+        <MarkdownMessage text={event.text} />
+      </div>
+    );
   } else if (event.kind === 'cmd') {
     body = (
-      <div className="cmd-text">
+      <div className={`cmd-text ${event.tone === 'error' ? 'err' : ''}`}>
         <span className="prompt">$</span>
         <span className="body">{event.cmd ?? event.text}</span>
       </div>
@@ -810,14 +1220,18 @@ function LogRow({ event }: { event: LogEvent }) {
     body = (
       <div className="ready-banner">
         <Sparkles size={14} aria-hidden="true" />
-        {event.text}
+        <div className="markdown-message">
+          <MarkdownMessage text={event.text} />
+        </div>
       </div>
     );
   } else if (event.kind === 'error') {
     body = (
       <div className="error-banner">
         <TriangleAlert size={14} aria-hidden="true" />
-        {event.text}
+        <div className="markdown-message">
+          <MarkdownMessage text={event.text} />
+        </div>
       </div>
     );
   }
@@ -837,6 +1251,50 @@ function LogRow({ event }: { event: LogEvent }) {
       </div>
     </div>
   );
+}
+
+function ToolGroupRow({ group }: { group: ToolLogGroup }) {
+  const hasError = group.events.some((event) => event.tone === 'error');
+  return (
+    <div className="log-row fadeUp">
+      <div className="log-rail">
+        <div className={`log-icon cmd ${hasError ? 'err' : ''}`}>
+          {iconForToolCategory(group.category)}
+        </div>
+        <div className="line" />
+      </div>
+      <div className="log-body">
+        <div className="log-meta">
+          <span className="log-label">{toolCategoryLabel(group.category)}</span>
+          <span className="log-time">{group.time}</span>
+        </div>
+        <div className="tool-group">
+          {group.events.map((event) => (
+            <div
+              className={`tool-detail ${
+                event.tone === 'error' ? 'err' : ''
+              }`}
+              key={event.id}
+            >
+              <span className="tool-dot" aria-hidden="true" />
+              <span>{event.text ?? event.cmd}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function iconForToolCategory(category: ToolCategory) {
+  const size = 13;
+  if (category === 'edit') {
+    return <FileCode2 size={size} aria-hidden="true" />;
+  }
+  if (category === 'inspect') {
+    return <Files size={size} aria-hidden="true" />;
+  }
+  return <TerminalIcon size={size} aria-hidden="true" />;
 }
 
 function iconForKind(kind: EventKind) {
@@ -863,20 +1321,120 @@ interface TerminalDrawerProps {
   open: boolean;
   onClose: () => void;
   text: string;
+  command: string;
+  disabled: boolean;
+  running: boolean;
+  onCommand: (value: string) => void;
+  onRunCommand: (commandOverride?: string) => void;
 }
 
-function TerminalDrawer({ open, onClose, text }: TerminalDrawerProps) {
+interface LogDrawerProps {
+  open: boolean;
+  onClose: () => void;
+  text: string;
+}
+
+function LogDrawer({ open, onClose, text }: LogDrawerProps) {
   const lines = text ? text.split('\n') : [];
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [text, open]);
+
+  if (!open) {
+    return null;
+  }
+
   return (
     <>
       <div
-        className={`term-overlay ${open ? 'open' : ''}`}
+        className="term-overlay open"
         onClick={onClose}
       />
-      <div className={`term-drawer ${open ? 'open' : ''}`}>
+      <div className="term-drawer open">
         <div className="term-head">
           <div className="term-head-title">
-            <TerminalIcon size={14} aria-hidden="true" /> Terminal
+            <FileCode2 size={14} aria-hidden="true" /> Diagnostics log
+            <span className="term-head-meta">· {lines.length} lines</span>
+          </div>
+          <button
+            aria-label="Close logs"
+            className="term-close"
+            onClick={onClose}
+            type="button"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="term-body" ref={bodyRef}>
+          {!text ? (
+            <div className="empty">
+              Detailed VM commands, health checks, and server logs will appear here.
+            </div>
+          ) : (
+            lines.map((line, idx) => {
+              let cls = 'out';
+              if (line.startsWith('$')) cls = 'cmd';
+              else if (line.startsWith('[')) cls = 'vm';
+              else if (/error|fail|refused|exit/i.test(line)) cls = 'err';
+              return (
+                <div className={cls} key={idx}>
+                  {line}
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function TerminalDrawer({
+  open,
+  onClose,
+  text,
+  command,
+  disabled,
+  running,
+  onCommand,
+  onRunCommand,
+}: TerminalDrawerProps) {
+  const lines = text ? text.split('\n') : [];
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const presets = [
+    'pwd',
+    'ls -la',
+    'ps aux',
+    'cat .server.log',
+    "python3 - <<'PY'\nimport pathlib\nimport urllib.request\nport = pathlib.Path('.server.port').read_text().strip()\nurl = f'http://127.0.0.1:{port}/'\nwith urllib.request.urlopen(url, timeout=3) as response:\n    print(response.status, url)\nPY",
+  ];
+
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [text, open]);
+
+  if (!open) {
+    return null;
+  }
+
+  return (
+    <>
+      <div
+        className="term-overlay open"
+        onClick={onClose}
+      />
+      <div className="term-drawer open">
+        <div className="term-head">
+          <div className="term-head-title">
+            <TerminalIcon size={14} aria-hidden="true" /> VM terminal
             <span className="term-head-meta">· {lines.length} lines</span>
           </div>
           <button
@@ -888,9 +1446,11 @@ function TerminalDrawer({ open, onClose, text }: TerminalDrawerProps) {
             ✕
           </button>
         </div>
-        <div className="term-body">
+        <div className="term-body" ref={bodyRef}>
           {!text ? (
-            <div className="empty">$ VM output will stream here</div>
+            <div className="empty">
+              Run commands against /workspace/site after the VM boots.
+            </div>
           ) : (
             lines.map((line, idx) => {
               let cls = 'out';
@@ -905,6 +1465,45 @@ function TerminalDrawer({ open, onClose, text }: TerminalDrawerProps) {
             })
           )}
         </div>
+        <div className="term-presets" aria-label="VM diagnostics">
+          {presets.map((preset) => (
+            <button
+              disabled={disabled || running}
+              key={preset}
+              onClick={() => onRunCommand(preset)}
+              type="button"
+            >
+              {preset.split('\n')[0].replace("python3 - <<'PY'", 'health')}
+            </button>
+          ))}
+        </div>
+        <form
+          className="term-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!disabled && !running && command.trim()) {
+              onRunCommand();
+            }
+          }}
+        >
+          <span className="term-prompt">$</span>
+          <input
+            aria-label="VM command"
+            autoCapitalize="off"
+            autoCorrect="off"
+            disabled={disabled || running}
+            onChange={(event) => onCommand(event.target.value)}
+            placeholder={disabled ? 'Boot the VM first' : 'pwd, ls -la, cat .server.log'}
+            spellCheck={false}
+            value={command}
+          />
+          <button
+            disabled={disabled || running || !command.trim()}
+            type="submit"
+          >
+            {running ? 'Running' : 'Send'}
+          </button>
+        </form>
       </div>
     </>
   );
@@ -923,6 +1522,7 @@ export default function App() {
   const [draft, setDraft] = useState(DEFAULT_PROMPT);
   const [hasStarted, setHasStarted] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
 
   const [projects, setProjects] = useState<SavedProject[]>(() => loadProjects());
   const [activeProject, setActiveProject] = useState<SavedProject>(() =>
@@ -934,6 +1534,9 @@ export default function App() {
   const [files, setFiles] = useState<DirectoryEntry[]>([]);
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [terminal, setTerminal] = useState('');
+  const [debugLog, setDebugLog] = useState('');
+  const [terminalCommand, setTerminalCommand] = useState('');
+  const [terminalBusy, setTerminalBusy] = useState(false);
   const [building, setBuilding] = useState(false);
   const [ready, setReady] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -943,11 +1546,15 @@ export default function App() {
   const [sourceDirectoryName, setSourceDirectoryName] = useState('');
   const localFolderSupported = useMemo(() => isLocalFolderSupported(), []);
   const restoredProjectIdRef = useRef<string | null>(null);
+  const tailnetReadyLoggedRef = useRef<string | null>(null);
+  const buildAbortControllerRef = useRef<AbortController | null>(null);
 
   const previewUrl = useMemo(
     () => vmStatus.previewUrl ?? backend?.getPreviewUrl() ?? null,
     [backend, vmStatus],
   );
+  const activeServerPort =
+    vmStatus.serverPort ?? portFromPreviewUrl(previewUrl) ?? null;
 
   const appendEvent = (event: Omit<LogEvent, 'id' | 'time'>) => {
     setEvents((current) =>
@@ -956,11 +1563,14 @@ export default function App() {
   };
 
   const appendTerminal = (text: string) => {
-    const cleaned = filterTerminalOutput(text);
-    if (!cleaned) {
-      return;
-    }
-    setTerminal((current) => `${current}${cleaned}`.slice(-50_000));
+    setTerminal((current) => filterTerminalOutput(`${current}${text}`).slice(-50_000));
+  };
+
+  const appendDebug = (entry: WebVmDebugEntry) => {
+    setDebugLog((current) => {
+      const prefix = current ? `${current}\n` : '';
+      return filterTerminalOutput(`${prefix}${formatDebugEntry(entry)}`).slice(-80_000);
+    });
   };
 
   useEffect(() => {
@@ -987,6 +1597,14 @@ export default function App() {
     };
   }, [localFolderSupported]);
 
+  useEffect(() => {
+    return () => {
+      if (backend) {
+        void backend.stopServer();
+      }
+    };
+  }, [backend]);
+
   const saveKeysIfRemembered = (
     nextApiKey = apiKey,
     nextTailscaleAuthKey = tailscaleAuthKey,
@@ -1003,8 +1621,19 @@ export default function App() {
   };
 
   const updateTailscaleAuthKey = (value: string) => {
+    const changed = value.trim() !== tailscaleAuthKey.trim();
     setTailscaleAuthKey(value);
     saveKeysIfRemembered(apiKey, value);
+    if (changed && backend && !building) {
+      setBackend(null);
+      setVmStatus(INITIAL_STATUS);
+      tailnetReadyLoggedRef.current = null;
+      appendEvent({
+        kind: 'status',
+        label: 'Tailnet key changed',
+        text: 'The next build will boot a fresh VM with the updated Tailscale auth key.',
+      });
+    }
   };
 
   const updateRememberKeys = (enabled: boolean) => {
@@ -1063,7 +1692,23 @@ export default function App() {
       }
     };
     await visit('', 0);
-    setFiles(mergeEntries(collected));
+    const merged = mergeEntries(collected);
+    const withSizes = await Promise.all(
+      merged.map(async (entry) => {
+        if (entry.type !== 'file') {
+          return entry;
+        }
+        try {
+          return {
+            ...entry,
+            sizeBytes: byteLength(await vm.readText(entry.path)),
+          };
+        } catch {
+          return entry;
+        }
+      }),
+    );
+    setFiles(withSizes);
   };
 
   const collectSourceFiles = async (vm: VmFileBackend): Promise<SourceFile[]> => {
@@ -1130,6 +1775,7 @@ export default function App() {
     setReady(false);
     setBuilding(false);
     restoredProjectIdRef.current = null;
+    tailnetReadyLoggedRef.current = null;
   };
 
   const selectProject = async (project: SavedProject) => {
@@ -1197,7 +1843,13 @@ export default function App() {
 
   const bootVm = async (): Promise<WebVmBackend> => {
     if (backend) {
-      return backend;
+      appendEvent({
+        kind: 'status',
+        label: 'Fresh VM',
+        text: 'Starting a clean VM for this run.',
+      });
+      await backend.stopServer();
+      setBackend(null);
     }
     setVmStatus({
       lifecycle: 'booting',
@@ -1205,6 +1857,7 @@ export default function App() {
       tailnetIp: null,
       loginUrl: null,
       previewUrl: null,
+      serverPort: null,
     });
     appendEvent({
       kind: 'status',
@@ -1215,7 +1868,7 @@ export default function App() {
     try {
       const vm = await WebVmBackend.create({
         tailscaleAuthKey: tailscaleAuthKey.trim() || undefined,
-        onConsole: appendTerminal,
+        onDebug: appendDebug,
         onStatus: (status) => {
           setVmStatus(status);
           if (status.loginUrl) {
@@ -1224,8 +1877,22 @@ export default function App() {
               text: `Tailscale login URL ready: ${status.loginUrl}`,
             });
           }
+          if (
+            status.previewUrl &&
+            tailnetReadyLoggedRef.current !== status.previewUrl
+          ) {
+            tailnetReadyLoggedRef.current = status.previewUrl;
+            appendEvent({
+              kind: 'status',
+              label: 'Tailnet ready',
+              text: `Tailnet IP ready: ${
+                status.tailnetIp ?? status.previewUrl
+              }. Waiting for server health before opening.`,
+            });
+          }
         },
       });
+      await vm.resetWorkspace();
       setBackend(vm);
       await loadFiles(vm);
       return vm;
@@ -1237,6 +1904,7 @@ export default function App() {
         tailnetIp: null,
         loginUrl: null,
         previewUrl: null,
+        serverPort: null,
       });
       appendEvent({ kind: 'error', text: message });
       throw error;
@@ -1246,6 +1914,11 @@ export default function App() {
   const send = async () => {
     const trimmedDraft = draft.trim();
     if (!trimmedDraft) return;
+    const buildPrompt = resolveBuildPrompt(
+      trimmedDraft,
+      events,
+      activeProject.prompt,
+    );
 
     const trimmedApiKey = apiKey.trim();
     if (!trimmedApiKey) {
@@ -1257,7 +1930,20 @@ export default function App() {
     setHasStarted(true);
     setBuilding(true);
     setReady(false);
-    appendEvent({ kind: 'chat', text: trimmedDraft });
+    setTerminal('');
+    setDebugLog('');
+    tailnetReadyLoggedRef.current = null;
+    buildAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    buildAbortControllerRef.current = abortController;
+    appendEvent({ kind: 'chat', text: buildPrompt });
+    if (buildPrompt !== trimmedDraft) {
+      appendEvent({
+        kind: 'status',
+        label: 'Retry',
+        text: `Retrying previous brief instead of treating "${trimmedDraft}" as a new website.`,
+      });
+    }
     setDraft('');
 
     try {
@@ -1269,68 +1955,135 @@ export default function App() {
         await restoreProjectFiles(vm, activeProject);
       }
 
-      const tailnetPromise = vm.getPreviewUrl()
-        ? Promise.resolve()
-        : vm
-            .connectTailnet({ timeoutMs: 20_000 })
-            .then((loginUrl) => {
-              if (loginUrl) {
-                window.open(loginUrl, '_blank', 'noopener,noreferrer');
-                appendEvent({
-                  kind: 'status',
-                  label: 'Connecting Tailscale',
-                  text: 'Opened Tailscale login',
-                });
-              } else if (vm.getPreviewUrl()) {
-                appendEvent({
-                  kind: 'status',
-                  label: 'Connecting Tailscale',
-                  text: `Tailnet IP ready: ${vm.getPreviewUrl()}`,
-                });
-              }
-            })
-            .catch((error: unknown) => {
-              appendEvent({
-                kind: 'error',
-                text: error instanceof Error ? error.message : String(error),
-              });
+      if (!vm.getTailnetIp()) {
+        appendEvent({
+          kind: 'status',
+          label: 'Connecting Tailscale',
+          text: 'Connecting Tailnet before the website server starts.',
+        });
+        try {
+          const loginUrl = await vm.connectTailnet({ timeoutMs: 20_000 });
+          if (loginUrl) {
+            window.open(loginUrl, '_blank', 'noopener,noreferrer');
+            appendEvent({
+              kind: 'status',
+              label: 'Connecting Tailscale',
+              text: 'Opened Tailscale login. Waiting for the VM Tailnet address.',
             });
+            await vm.connectTailnet({ timeoutMs: 45_000 });
+          }
+          appendEvent({
+            kind: vm.getTailnetIp() ? 'status' : 'error',
+            label: vm.getTailnetIp() ? 'Tailnet ready' : 'Tailnet unavailable',
+            text: vm.getTailnetIp()
+              ? `Tailnet IP ready: ${vm.getTailnetIp()}.`
+              : 'No Tailnet IP is available yet; server startup may fail until Tailnet is connected.',
+          });
+        } catch (error: unknown) {
+          appendEvent({
+            kind: 'error',
+            text: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
 
-      appendEvent({ kind: 'thought', text: `Calling ${model}…` });
+      appendEvent({
+        kind: 'status',
+        label: 'Gemini',
+        text: `Building with ${model}`,
+      });
 
+      let agentFinalText = '';
       const result = await runWebsiteAgent({
         apiKey: trimmedApiKey,
-        prompt: trimmedDraft,
+        prompt: buildPrompt,
         backend: vm,
+        abortSignal: abortController.signal,
         onEvent: (event: AgentEvent) => {
-          appendEvent({ kind: eventToLogKind(event), text: event.message });
+          if (event.type === 'model') {
+            return;
+          }
+          if (event.type === 'done') {
+            agentFinalText = event.message;
+            return;
+          }
+          const logEvent = eventFromAgentEvent(event);
+          if (logEvent) {
+            appendEvent(logEvent);
+          }
         },
       });
 
-      await vm.startServer();
-      await tailnetPromise;
+      const startResult = await vm.startServer();
+      if (startResult.status !== 0) {
+        await loadFiles(vm);
+        appendEvent({
+          kind: 'error',
+          label: 'Server start failed',
+          text:
+            cleanStatusOutput(startResult.output) ||
+            `Server command exited with ${startResult.status}`,
+        });
+        return;
+      }
+      const health = await vm.checkServer();
+      const serverHealthy = health.status === 0;
+      appendEvent({
+        kind: serverHealthy ? 'status' : 'error',
+        label: serverHealthy ? 'Server health' : 'Server failed',
+        text:
+          cleanStatusOutput(health.output) ||
+          `Health check exited with ${health.status}`,
+      });
+
+      let url = vm.getPreviewUrl();
+      if (!url) {
+        appendEvent({
+          kind: 'status',
+          label: 'Tailnet',
+          text: 'Waiting for the VM Tailnet IP before marking the site live.',
+        });
+        url = await waitForPreviewUrl(vm, 45_000);
+      }
+      if (url && serverHealthy) {
+        const previewHealth = await checkPreviewFromBrowser(url);
+        const previewReachable = previewHealth.status === 0;
+        appendEvent({
+          kind: 'status',
+          label: previewReachable ? 'Tailnet health' : 'Tailnet check',
+          text:
+            cleanStatusOutput(previewHealth.output) ||
+            `Browser preview check exited with ${previewHealth.status}`,
+        });
+      }
       await loadFiles(vm);
       const sourceFiles = await collectSourceFiles(vm);
       if (sourceDirectory) {
         await syncSourceToFolder(vm, sourceDirectory);
       }
 
-      const url = vm.getPreviewUrl();
-      if (url) {
+      const finalText = formatFinalSummary(
+        result.finalText || agentFinalText || 'Website generation finished.',
+        url,
+      );
+      if (url && serverHealthy) {
         appendEvent({
           kind: 'ready',
-          text: `Site is live. Hosted page ready at ${url}`,
+          text: `**Site is live:** ${url}\n\n${finalText}`,
         });
         setReady(true);
       } else {
         appendEvent({
-          kind: 'thought',
-          text: 'Files are built and the VM server started, but no Tailnet IP is available yet.',
+          kind: 'error',
+          label: !serverHealthy ? 'Server unavailable' : 'Tailnet unavailable',
+          text: !serverHealthy
+            ? `Files were generated, but the VM web server did not start.\n\n${finalText}`
+            : `Files are built but no Tailnet preview URL is available yet.\n\n${finalText}`,
         });
       }
 
       saveActiveProject({
-        prompt: trimmedDraft,
+        prompt: buildPrompt,
         previewUrl: url,
         files: sourceFiles,
       });
@@ -1343,26 +2096,66 @@ export default function App() {
         });
       }
 
-      if (result.finalText) {
-        appendEvent({ kind: 'thought', text: result.finalText });
-      }
     } catch (error) {
+      if (abortController.signal.aborted || isAbortError(error)) {
+        return;
+      }
       appendEvent({
         kind: 'error',
         text: error instanceof Error ? error.message : String(error),
       });
     } finally {
+      if (buildAbortControllerRef.current === abortController) {
+        buildAbortControllerRef.current = null;
+      }
       setBuilding(false);
     }
   };
 
   const cancelBuild = () => {
+    buildAbortControllerRef.current?.abort();
+    buildAbortControllerRef.current = null;
     setBuilding(false);
     appendEvent({
       kind: 'status',
       label: 'Stopped',
       text: 'Stopped. Send another prompt to resume.',
     });
+  };
+
+  const runTerminalCommand = async (commandOverride?: string) => {
+    const command = (commandOverride ?? terminalCommand).trim();
+    if (!command) return;
+    setTerminalCommand('');
+    setShowTerminal(true);
+    appendTerminal(`${terminal.endsWith('\n') || !terminal ? '' : '\n'}$ ${command}\n`);
+
+    if (!backend) {
+      appendTerminal('No VM is running.\n');
+      return;
+    }
+
+    setTerminalBusy(true);
+    try {
+      const result = await backend.runCommand(command, {
+        cwd: SITE_ROOT,
+        stream: false,
+        timeoutMs: 8_000,
+      });
+      const output = cleanStatusOutput(result.output);
+      if (output) {
+        appendTerminal(`${output}\n`);
+      }
+      if (result.status !== 0) {
+        appendTerminal(`[exit ${result.status}]\n`);
+      }
+    } catch (error) {
+      appendTerminal(
+        `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    } finally {
+      setTerminalBusy(false);
+    }
   };
 
   const openWebsite = () => {
@@ -1390,7 +2183,7 @@ export default function App() {
     screen === 'setup'
       ? 'browser-built website prototype'
       : ready
-        ? `live · ${vmStatus.tailnetIp ?? '—'}:${SERVER_PORT}`
+        ? `live · ${hostFromPreviewUrl(previewUrl) ?? `${vmStatus.tailnetIp ?? '—'}:${activeServerPort ?? 'auto'}`}`
         : building
           ? 'vm building…'
           : `ready · ${model}`;
@@ -1456,10 +2249,12 @@ export default function App() {
         <ChatScreen
           cfg={{ model, projectName: activeProject.name }}
           events={events}
-          fileCount={files.length}
+          files={files}
           building={building}
           ready={ready}
           tailnetIp={vmStatus.tailnetIp ?? null}
+          previewUrl={previewUrl}
+          serverPort={activeServerPort}
           vmStatus={vmStatus}
           hasStarted={hasStarted}
           draft={draft}
@@ -1467,14 +2262,25 @@ export default function App() {
           onSend={() => void send()}
           onCancel={cancelBuild}
           onOpenWebsite={openWebsite}
+          onLogs={() => setShowLogs(true)}
           onTerminal={() => setShowTerminal(true)}
           errorMessage={errorMessage}
         />
       )}
+      <LogDrawer
+        open={showLogs}
+        onClose={() => setShowLogs(false)}
+        text={debugLog}
+      />
       <TerminalDrawer
         open={showTerminal}
         onClose={() => setShowTerminal(false)}
         text={terminal}
+        command={terminalCommand}
+        disabled={!backend}
+        running={terminalBusy}
+        onCommand={setTerminalCommand}
+        onRunCommand={(commandOverride) => void runTerminalCommand(commandOverride)}
       />
     </>
   );

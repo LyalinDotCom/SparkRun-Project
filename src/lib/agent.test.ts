@@ -88,7 +88,7 @@ describe('website agent loop', () => {
     });
 
     expect(result).toEqual({
-      finalText: 'Done.',
+      finalText: 'Website files were created and the VM web server was started.',
       changedFiles: ['index.html'],
     });
     expect(backend.snapshot()['index.html']).toContain('Hello world');
@@ -96,8 +96,9 @@ describe('website agent loop', () => {
       command: SERVER_COMMAND,
       background: true,
     });
-    expect(events.some((event) => event.includes('write_file'))).toBe(true);
+    expect(events.some((event) => event.includes('Wrote'))).toBe(true);
 
+    expect(generateContent).toHaveBeenCalledTimes(1);
     for (const call of generateContent.mock.calls) {
       expect(call[0].model).toBe(MODEL_ID);
     }

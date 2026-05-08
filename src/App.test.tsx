@@ -27,6 +27,7 @@ function fakeBackend() {
   ]);
   return {
     connectTailnet: vi.fn(async () => 'https://login.tailscale.com/a/abc'),
+    getTailnetIp: vi.fn(() => '100.64.0.25'),
     getPreviewUrl: vi.fn(() => 'http://100.64.0.25:8080/'),
     listDirectory: vi.fn(async (path: string) => {
       if (!path) {
@@ -47,6 +48,21 @@ function fakeBackend() {
       output: '4242',
       background: true,
     })),
+    checkServer: vi.fn(async () => ({
+      status: 0,
+      output: 'internal: server process is listening on port 8081',
+      background: false,
+    })),
+    stopServer: vi.fn(async () => ({
+      status: 0,
+      output: 'stopped',
+      background: false,
+    })),
+    runCommand: vi.fn(async (command: string) => ({
+      status: 0,
+      output: command === 'pwd' ? '/workspace/site' : 'ok',
+      background: false,
+    })),
   };
 }
 
@@ -59,6 +75,10 @@ describe('SparkRun setup screen', () => {
     vi.clearAllMocks();
     window.localStorage.clear();
     vi.stubGlobal('open', vi.fn());
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200 })),
+    );
     appMocks.runWebsiteAgent.mockResolvedValue({
       finalText: 'Website generation finished.',
       changedFiles: ['index.html'],
@@ -192,7 +212,7 @@ describe('SparkRun chat screen', () => {
         loginUrl: null,
         previewUrl: 'http://100.64.0.25:8080/',
       });
-      options.onConsole(
+      options.onConsole?.(
         'mesg: ttyname failed: Success\nboot ok\nsg: ttyname failed: Success\n',
       );
       return backend;
@@ -213,16 +233,82 @@ describe('SparkRun chat screen', () => {
       }),
     );
     expect(backend.startServer).toHaveBeenCalledTimes(1);
-    expect(
-      await screen.findByText(/Hosted page ready/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/Site is live/i)).toBeInTheDocument();
+    expect(screen.getByText(/server process is listening on port 8081/i)).toBeInTheDocument();
+    expect(screen.getByText(/browser: reachable at/i)).toBeInTheDocument();
+    expect(screen.getByRole('listbox', { name: /Generated files/i })).toBeInTheDocument();
+    expect(screen.getByText('index.html')).toBeInTheDocument();
+    expect(screen.getAllByText('14 B').length).toBeGreaterThan(0);
     expect(screen.getByText(/Website generation finished/i)).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: /Open website/i }),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
-    expect(screen.getByText('boot ok')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/VM command/i), {
+      target: { value: 'pwd' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
+    expect(await screen.findByText('/workspace/site')).toBeInTheDocument();
     expect(screen.queryByText(/ttyname failed/i)).not.toBeInTheDocument();
+  });
+
+  it('groups tool updates and keeps VM diagnostics in the logs drawer', async () => {
+    const backend = fakeBackend();
+    appMocks.createBackend.mockImplementation(async (options) => {
+      options.onDebug?.({
+        phase: 'exec',
+        command: 'pwd',
+        cwd: '/workspace/site',
+        output: '/workspace/site',
+        status: 0,
+      });
+      return backend;
+    });
+    appMocks.runWebsiteAgent.mockImplementation(async (options) => {
+      options.onEvent?.({
+        type: 'tool',
+        message: 'write_file index.html',
+      });
+      options.onEvent?.({
+        type: 'tool',
+        message: 'Wrote /workspace/site/index.html',
+      });
+      options.onEvent?.({
+        type: 'tool',
+        message: 'run_shell_command ls -R /workspace/site',
+      });
+      options.onEvent?.({
+        type: 'error',
+        message:
+          'run_shell_command failed: Command is not allowed in this prototype: ls -R /workspace/site',
+      });
+      return {
+        finalText: 'Done.',
+        changedFiles: ['index.html'],
+      };
+    });
+
+    const { container } = render(<App />);
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    gotoChat();
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+
+    expect(await screen.findByText('Edit')).toBeInTheDocument();
+    expect(screen.getByText('write index.html')).toBeInTheDocument();
+    expect(screen.getByText('wrote index.html')).toBeInTheDocument();
+    expect(screen.getByText('Shell')).toBeInTheDocument();
+    expect(
+      Array.from(container.querySelectorAll('.log-label')).map((node) =>
+        node.textContent?.trim(),
+      ),
+    ).not.toContain('Run');
+
+    fireEvent.click(screen.getByRole('button', { name: /Open logs/i }));
+    expect(await screen.findByText(/Diagnostics log/i)).toBeInTheDocument();
+    expect(screen.getByText('$ pwd')).toBeInTheDocument();
+    expect(screen.getByText('/workspace/site')).toBeInTheDocument();
   });
 
   it('keeps a successful build live when a generated file disappears during project snapshotting', async () => {
@@ -251,7 +337,7 @@ describe('SparkRun chat screen', () => {
     gotoChat();
     fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
 
-    expect(await screen.findByText(/Hosted page ready/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Site is live/i)).toBeInTheDocument();
     expect(screen.getByText(/Could not snapshot ghost.js/i)).toBeInTheDocument();
 
     const rawProjects = window.localStorage.getItem('sparkrun.projects.v1') ?? '';
@@ -279,6 +365,42 @@ describe('SparkRun chat screen', () => {
         tailscaleAuthKey: 'tskey-auth-test',
       }),
     );
+  });
+
+  it('renders markdown summaries, hides model turns, and rewrites localhost preview URLs', async () => {
+    const backend = fakeBackend();
+    appMocks.createBackend.mockImplementation(async () => backend);
+    appMocks.runWebsiteAgent.mockImplementation(async (options) => {
+      options.onEvent?.({
+        type: 'model',
+        message: 'Calling gemini-3-flash-preview, turn 1',
+      });
+      options.onEvent?.({
+        type: 'done',
+        message:
+          '### Features\n\n- **Interactive physics**\n\nThe server is running at `http://localhost:8080`.',
+      });
+      return {
+        finalText:
+          '### Features\n\n- **Interactive physics**\n\nThe server is running at `http://localhost:8080`.',
+        changedFiles: ['index.html'],
+      };
+    });
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    gotoChat();
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+
+    expect(
+      await screen.findByRole('heading', { name: /Features/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Interactive physics')).toBeInTheDocument();
+    expect(screen.queryByText(/turn 1/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/localhost:8080/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/100\.64\.0\.25:8080/i).length).toBeGreaterThan(0);
   });
 
   it('restores saved project files into the VM before continuing a project', async () => {

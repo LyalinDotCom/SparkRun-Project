@@ -594,6 +594,84 @@ select {
   align-items: center;
 }
 
+.file-strip {
+  border-top: 1px solid rgba(255, 255, 255, 0.035);
+  background: color-mix(in oklab, var(--bg) 94%, var(--bg-2));
+}
+.file-strip-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 8px 16px 10px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+.file-total,
+.file-highlight,
+.file-chip {
+  min-height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-3);
+  color: var(--ink-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.file-total,
+.file-highlight {
+  padding: 6px 9px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.file-total strong,
+.file-highlight strong,
+.file-size {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--ink);
+}
+.file-selector {
+  min-width: 0;
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  padding-bottom: 1px;
+}
+.file-chip {
+  max-width: 220px;
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  font-size: 12px;
+  text-align: left;
+}
+.file-chip:hover,
+.file-chip:focus-visible,
+.file-chip.active {
+  color: var(--ink);
+  border-color: rgba(103, 211, 156, 0.38);
+  background: rgba(103, 211, 156, 0.08);
+}
+.file-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-size {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.file-highlight {
+  max-width: 220px;
+}
+.file-highlight span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -642,6 +720,20 @@ select {
 .terminal-toggle:hover {
   border-color: var(--line-2);
   color: var(--ink);
+}
+
+@media (max-width: 720px) {
+  .file-strip-inner {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+  .file-total,
+  .file-highlight {
+    justify-content: space-between;
+  }
+  .file-highlight {
+    max-width: none;
+  }
 }
 
 .log-scroll {
@@ -698,6 +790,11 @@ select {
   background: rgba(248, 107, 80, 0.1);
   color: var(--accent-2);
   border-color: rgba(248, 107, 80, 0.32);
+}
+.log-icon.cmd.err {
+  background: rgba(248, 107, 80, 0.14);
+  color: var(--accent-2);
+  border-color: rgba(248, 107, 80, 0.45);
 }
 .log-icon.stream {
   background: rgba(103, 211, 156, 0.1);
@@ -756,8 +853,71 @@ select {
   color: var(--ink-dim);
   font-size: 13.5px;
   line-height: 1.55;
-  white-space: pre-wrap;
   word-wrap: break-word;
+}
+.markdown-message {
+  color: inherit;
+  overflow-wrap: anywhere;
+}
+.markdown-message > :first-child {
+  margin-top: 0;
+}
+.markdown-message > :last-child {
+  margin-bottom: 0;
+}
+.markdown-message p {
+  margin: 0 0 0.7em;
+}
+.markdown-message h1,
+.markdown-message h2,
+.markdown-message h3 {
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.25;
+  margin: 0.2em 0 0.55em;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+.markdown-message ul,
+.markdown-message ol {
+  margin: 0.35em 0 0.8em;
+  padding-left: 1.35em;
+}
+.markdown-message li {
+  margin: 0.22em 0;
+}
+.markdown-message strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+.markdown-message code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.08em 0.34em;
+}
+.markdown-message pre {
+  margin: 0.6em 0;
+  max-width: 100%;
+  overflow: auto;
+  background: #08090b;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.markdown-message pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+.markdown-message a {
+  color: var(--blue);
+  text-decoration: none;
+}
+.markdown-message a:hover {
+  text-decoration: underline;
 }
 .cmd-text {
   background: #08090b;
@@ -779,6 +939,42 @@ select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.cmd-text.err {
+  border-color: rgba(248, 107, 80, 0.32);
+  color: var(--accent-2);
+  background: rgba(248, 107, 80, 0.08);
+}
+
+.tool-group {
+  display: grid;
+  gap: 6px;
+  background: #08090b;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.tool-detail {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  color: #cfd6cf;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.tool-detail.err {
+  color: var(--accent-2);
+}
+.tool-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.65;
+  margin-top: 8px;
 }
 
 .stream-block {
@@ -807,11 +1003,22 @@ select {
   background: rgba(103, 211, 156, 0.08);
   border-radius: 12px;
   padding: 12px 14px;
-  color: var(--green);
+  color: #b8f6d4;
   font-size: 13.5px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
+}
+.ready-banner svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--green);
+}
+.ready-banner .markdown-message h1,
+.ready-banner .markdown-message h2,
+.ready-banner .markdown-message h3,
+.ready-banner .markdown-message strong {
+  color: #e3ffef;
 }
 
 .error-banner {
@@ -822,8 +1029,12 @@ select {
   color: var(--accent-2);
   font-size: 13.5px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
+}
+.error-banner svg {
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
 .gen-row {
@@ -1072,6 +1283,155 @@ select {
 }
 .term-body .out {
   color: #9be3a8;
+}
+
+.term-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 18px 12px;
+}
+.term-presets button {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--ink-dim);
+  padding: 0 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.term-presets button:hover:not(:disabled) {
+  border-color: var(--line-2);
+  color: var(--ink);
+}
+.term-presets button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.term-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+}
+.term-prompt {
+  font-family: var(--mono);
+  color: var(--accent);
+}
+.term-form input {
+  flex: 1;
+  min-width: 0;
+  height: 38px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #050608;
+  color: var(--ink);
+  padding: 0 11px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.term-form input:focus {
+  border-color: rgba(118, 160, 255, 0.45);
+  box-shadow: 0 0 0 3px rgba(118, 160, 255, 0.12);
+  outline: none;
+}
+.term-form input:disabled {
+  color: var(--muted);
+}
+.term-form button {
+  height: 38px;
+  border: 1px solid rgba(118, 160, 255, 0.28);
+  border-radius: 8px;
+  background: rgba(118, 160, 255, 0.12);
+  color: var(--ink);
+  padding: 0 14px;
+  font-size: 12px;
+}
+.term-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ----- VM smoke harness ----- */
+.smoke-page {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+}
+.smoke-card {
+  width: min(980px, 100%);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 20px;
+}
+.smoke-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+.smoke-head h1 {
+  margin: 8px 0 6px;
+  font-size: 24px;
+  line-height: 1.15;
+  letter-spacing: 0;
+}
+.smoke-head p:last-child {
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: 13.5px;
+}
+.smoke-head button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(103, 211, 156, 0.35);
+  color: var(--green);
+  background: rgba(103, 211, 156, 0.08);
+  padding: 9px 12px;
+  white-space: nowrap;
+}
+.smoke-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.smoke-log {
+  min-height: 420px;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #050608;
+  color: #a7efbb;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+.smoke-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.smoke-foot code {
+  font-family: var(--mono);
+  color: var(--ink-dim);
 }
 
 /* ----- Source folder ----- */

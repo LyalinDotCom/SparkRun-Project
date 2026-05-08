@@ -26,6 +26,8 @@ export interface AgentRunOptions {
   backend: VmFileBackend;
   ai?: GenAiLike;
   maxTurns?: number;
+  abortSignal?: AbortSignal;
+  turnTimeoutMs?: number;
   onEvent?: (event: AgentEvent) => void;
 }
 
@@ -36,6 +38,7 @@ export interface AgentRunResult {
 }
 
 export const DEFAULT_AGENT_MAX_TURNS = 40;
+const DEFAULT_TURN_TIMEOUT_MS = 60_000;
 
 const SYSTEM_PROMPT = `
 You are a website-building agent running inside a browser-hosted Linux VM.
@@ -47,11 +50,13 @@ Rules:
 - Always create ${SITE_ROOT}/index.html.
 - Write complete file contents. Never use placeholders or omitted sections.
 - Do not call any model other than ${MODEL_ID}.
-- When the site files are ready, you may start the server with: ${SERVER_COMMAND}
+- Start the server with ${SERVER_COMMAND} exactly once, only after index.html and any referenced CSS/JS files exist.
+- Inspect files with list_directory/read_file. If you need shell inspection, only use safe commands like pwd, ls, ls -R ${SITE_ROOT}, or find . -maxdepth 2 -type f.
+- Never tell the user to open localhost. The host app will provide the real Tailnet preview URL.
 - Prefer write_file for complete small static files. Use replace for targeted follow-up edits.
-- After the server is started, stop refining unless you are fixing a clear broken requirement.
-- Finish with a concise final summary instead of continuing to make cosmetic edits.
-- Keep the result runnable without npm install or build steps.
+- After the server is started, immediately return a concise final summary. Do not inspect, list files, or make cosmetic edits after starting the server.
+- Finish with a concise final summary instead of continuing to polish.
+- Keep the result runnable without npm install or build steps. Use browser-native HTML, CSS, and JavaScript.
 `;
 
 function emit(options: AgentRunOptions, event: AgentEvent): void {
@@ -161,6 +166,59 @@ function isServerStartCall(call: ToolCall): boolean {
   );
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    const error = new Error('Website generation was stopped.');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+async function withAbortableTurn<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: AgentRunOptions,
+): Promise<T> {
+  throwIfAborted(options.abortSignal);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timeout = globalThis.setTimeout(
+    abort,
+    options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+  );
+  options.abortSignal?.addEventListener('abort', abort, { once: true });
+  try {
+    return await operation(controller.signal);
+  } finally {
+    globalThis.clearTimeout(timeout);
+    options.abortSignal?.removeEventListener('abort', abort);
+  }
+}
+
+function summarizeToolCall(call: ToolCall): string {
+  const path =
+    typeof call.args.file_path === 'string'
+      ? call.args.file_path
+      : typeof call.args.dir_path === 'string'
+        ? call.args.dir_path || SITE_ROOT
+        : '';
+  switch (call.name) {
+    case 'write_file':
+      return `write_file ${path}`;
+    case 'replace':
+      return `replace ${path}`;
+    case 'read_file':
+      return `read_file ${path}`;
+    case 'list_directory':
+      return `list_directory ${path || SITE_ROOT}`;
+    case SHELL_TOOL_NAME:
+      return `run_shell_command ${
+        typeof call.args.command === 'string' ? call.args.command : ''
+      }`;
+    default:
+      return call.name;
+  }
+}
+
 export async function runWebsiteAgent(
   options: AgentRunOptions,
 ): Promise<AgentRunResult> {
@@ -190,6 +248,7 @@ export async function runWebsiteAgent(
   let serverStartRequested = false;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
+    throwIfAborted(options.abortSignal);
     if (shouldNudgeToFinish(turn, maxTurns)) {
       contents.push({
         role: 'user',
@@ -207,15 +266,23 @@ export async function runWebsiteAgent(
       message: `Calling ${MODEL_ID}, turn ${turn}`,
     });
 
-    const response = await ai.models.generateContent({
-      model: MODEL_ID,
-      contents,
-      config: {
-        systemInstruction: SYSTEM_PROMPT,
-        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
-        temperature: 0.35,
-      },
-    });
+    const response = await withAbortableTurn(
+      (abortSignal) =>
+        ai.models.generateContent({
+          model: MODEL_ID,
+          contents,
+          config: {
+            systemInstruction: SYSTEM_PROMPT,
+            tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+            temperature: 0.35,
+            abortSignal,
+            httpOptions: {
+              timeout: options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+            },
+          },
+        }),
+      options,
+    );
 
     const modelContent = responseContent(response);
     if (modelContent) {
@@ -230,15 +297,17 @@ export async function runWebsiteAgent(
     }
 
     const functionResponses: Content[] = [];
+    let serverStartError: string | null = null;
     for (const call of calls) {
-      emit(options, {
-        type: 'tool',
-        message: `${call.name} ${JSON.stringify(call.args)}`,
-      });
+      throwIfAborted(options.abortSignal);
       const result = await executeToolCall(options.backend, call);
       result.changedFiles?.forEach((file) => changedFiles.add(file));
-      if (!result.error && isServerStartCall(call)) {
-        serverStartRequested = true;
+      if (isServerStartCall(call)) {
+        if (result.error) {
+          serverStartError = result.error;
+        } else {
+          serverStartRequested = true;
+        }
       }
       emit(options, {
         type: result.error ? 'error' : 'tool',
@@ -250,6 +319,20 @@ export async function runWebsiteAgent(
     }
 
     contents.push(...functionResponses);
+
+    if (serverStartRequested && changedFiles.size > 0) {
+      const finalText =
+        'Website files were created and the VM web server was started.';
+      emit(options, { type: 'done', message: finalText });
+      return {
+        finalText,
+        changedFiles: Array.from(changedFiles).sort(),
+      };
+    }
+
+    if (serverStartError) {
+      throw new Error(`Server start failed: ${serverStartError}`);
+    }
   }
 
   if (changedFiles.size > 0) {
