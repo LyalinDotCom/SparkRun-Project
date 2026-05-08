@@ -249,6 +249,9 @@ export class WebVmBackend implements VmFileBackend {
   private serverRunPromise: Promise<{ status: number }> | null = null;
   private serverLastExit: VmCommandResult | null = null;
   private commandRunnerTimedOut = false;
+  private consoleInput: ((charCode: number) => void) | null = null;
+  private interactiveShellRunning = false;
+  private interactiveShellPromise: Promise<{ status: number }> | null = null;
   private tailnetLoginStarted = false;
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
@@ -521,6 +524,89 @@ export class WebVmBackend implements VmFileBackend {
     );
   }
 
+  startInteractiveShell(): VmCommandResult {
+    if (this.interactiveShellRunning) {
+      return {
+        status: 0,
+        output: 'Interactive shell is already running.',
+        background: true,
+      };
+    }
+    if (this.commandRunnerTimedOut) {
+      return {
+        status: 124,
+        output:
+          'The VM command runner is recovering from a previous timeout. Start a fresh VM run before opening an interactive shell.',
+        background: true,
+      };
+    }
+
+    this.interactiveShellRunning = true;
+    this.onConsole?.('\n[vm] interactive shell started in /workspace/site\n');
+    this.publishDebug({
+      phase: 'terminal',
+      command: '/bin/bash -l',
+      cwd: SITE_ROOT,
+      background: true,
+    });
+    this.interactiveShellPromise = this.cx
+      .run('/bin/bash', ['-l'], this.runOptions(SITE_ROOT))
+      .then((result) => {
+        this.interactiveShellRunning = false;
+        this.onConsole?.(`\n[vm] interactive shell exited with ${result.status}\n`);
+        this.publishDebug({
+          phase: 'terminal-exit',
+          command: '/bin/bash -l',
+          cwd: SITE_ROOT,
+          status: result.status,
+        });
+        return result;
+      })
+      .catch((error: unknown) => {
+        this.interactiveShellRunning = false;
+        const message = error instanceof Error ? error.message : String(error);
+        this.onConsole?.(`\n[vm] interactive shell failed: ${message}\n`);
+        this.publishDebug({
+          phase: 'terminal-exit',
+          command: '/bin/bash -l',
+          cwd: SITE_ROOT,
+          status: 1,
+          output: message,
+        });
+        return { status: 1 };
+      });
+
+    return {
+      status: 0,
+      output: 'Interactive shell started.',
+      background: true,
+    };
+  }
+
+  writeTerminalInput(input: string): VmCommandResult {
+    if (!this.interactiveShellRunning) {
+      const started = this.startInteractiveShell();
+      if (started.status !== 0) {
+        return started;
+      }
+    }
+    if (!this.consoleInput) {
+      return {
+        status: 1,
+        output: 'The VM console input stream is not available.',
+        background: false,
+      };
+    }
+    for (const char of input) {
+      this.consoleInput(char.charCodeAt(0));
+    }
+    return {
+      status: 0,
+      output: '',
+      background: false,
+    };
+  }
+
   async startServer(): Promise<VmCommandResult> {
     if (this.serverStarted && this.serverPort) {
       return {
@@ -746,7 +832,7 @@ export class WebVmBackend implements VmFileBackend {
 
   private attachConsole(): void {
     const decoder = new TextDecoder();
-    this.cx.setCustomConsole((buf, vt) => {
+    this.consoleInput = this.cx.setCustomConsole((buf, vt) => {
       if (vt !== undefined && vt !== 1) {
         return;
       }

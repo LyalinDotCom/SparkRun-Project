@@ -852,6 +852,7 @@ interface ChatScreenProps {
   onCancel: () => void;
   onOpenWebsite: () => void;
   onRetryTailnet: () => void;
+  onFiles: () => void;
   onLogs: () => void;
   onTerminal: () => void;
   errorMessage: string | null;
@@ -898,6 +899,7 @@ function ChatScreen({
   onCancel,
   onOpenWebsite,
   onRetryTailnet,
+  onFiles,
   onLogs,
   onTerminal,
   errorMessage,
@@ -909,26 +911,6 @@ function ChatScreen({
     (total, file) => total + (file.sizeBytes ?? 0),
     0,
   );
-  const [highlightedFilePath, setHighlightedFilePath] = useState<string | null>(
-    null,
-  );
-
-  useEffect(() => {
-    if (sourceFiles.length === 0) {
-      setHighlightedFilePath(null);
-      return;
-    }
-    setHighlightedFilePath((current) =>
-      current && sourceFiles.some((file) => file.path === current)
-        ? current
-        : sourceFiles[0].path,
-    );
-  }, [sourceFiles]);
-
-  const highlightedFile =
-    sourceFiles.find((file) => file.path === highlightedFilePath) ??
-    sourceFiles[0] ??
-    null;
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -976,10 +958,16 @@ function ChatScreen({
             {portLabel}
           </span>
           {sourceFiles.length > 0 ? (
-            <span className="pill">
+            <button
+              aria-label="Open generated files"
+              className="terminal-toggle file-toggle"
+              onClick={onFiles}
+              type="button"
+            >
               <Files size={12} aria-hidden="true" />
               {sourceFiles.length} file{sourceFiles.length === 1 ? '' : 's'}
-            </span>
+              <span className="file-toggle-size">{formatBytes(totalBytes)}</span>
+            </button>
           ) : null}
           <span style={{ flex: 1 }} />
           {canRetryTailnet ? (
@@ -1013,51 +1001,6 @@ function ChatScreen({
           </button>
         </div>
       </div>
-
-      {sourceFiles.length > 0 ? (
-        <div className="file-strip">
-          <div className="file-strip-inner">
-            <div className="file-total">
-              <Files size={13} aria-hidden="true" />
-              <span>{sourceFiles.length} generated</span>
-              <strong>{formatBytes(totalBytes)}</strong>
-            </div>
-            <div
-              aria-label="Generated files"
-              className="file-selector"
-              role="listbox"
-            >
-              {sourceFiles.map((file) => {
-                const active = highlightedFile?.path === file.path;
-                return (
-                  <button
-                    aria-selected={active}
-                    className={`file-chip ${active ? 'active' : ''}`}
-                    key={file.path}
-                    onClick={() => setHighlightedFilePath(file.path)}
-                    onFocus={() => setHighlightedFilePath(file.path)}
-                    onMouseEnter={() => setHighlightedFilePath(file.path)}
-                    role="option"
-                    type="button"
-                  >
-                    <FileCode2 size={13} aria-hidden="true" />
-                    <span className="file-path">{file.path}</span>
-                    <span className="file-size">
-                      {formatBytes(file.sizeBytes)}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-            {highlightedFile ? (
-              <div className="file-highlight">
-                <span>{highlightedFile.path}</span>
-                <strong>{formatBytes(highlightedFile.sizeBytes)}</strong>
-              </div>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
 
       <div className="log-scroll" ref={scrollRef}>
         <div className="log-inner">
@@ -1335,11 +1278,16 @@ interface TerminalDrawerProps {
   open: boolean;
   onClose: () => void;
   text: string;
-  command: string;
+  input: string;
   disabled: boolean;
-  running: boolean;
-  onCommand: (value: string) => void;
-  onRunCommand: (commandOverride?: string) => void;
+  onInput: (value: string) => void;
+  onSendInput: (inputOverride?: string) => void;
+}
+
+interface FileDrawerProps {
+  open: boolean;
+  onClose: () => void;
+  files: DirectoryEntry[];
 }
 
 interface LogDrawerProps {
@@ -1408,15 +1356,103 @@ function LogDrawer({ open, onClose, text }: LogDrawerProps) {
   );
 }
 
+function FileDrawer({ open, onClose, files }: FileDrawerProps) {
+  const sourceFiles = useMemo(() => files.filter(isSourceFile), [files]);
+  const totalBytes = sourceFiles.reduce(
+    (total, file) => total + (file.sizeBytes ?? 0),
+    0,
+  );
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setSelectedPath((current) =>
+      current && sourceFiles.some((file) => file.path === current)
+        ? current
+        : sourceFiles[0]?.path ?? null,
+    );
+  }, [open, sourceFiles]);
+
+  if (!open) {
+    return null;
+  }
+
+  const selectedFile =
+    sourceFiles.find((file) => file.path === selectedPath) ??
+    sourceFiles[0] ??
+    null;
+
+  return (
+    <>
+      <div className="side-overlay open" onClick={onClose} />
+      <aside className="side-panel open" aria-label="Generated files panel">
+        <div className="side-head">
+          <div className="term-head-title">
+            <Files size={14} aria-hidden="true" /> Generated files
+            <span className="term-head-meta">
+              · {sourceFiles.length} files · {formatBytes(totalBytes)}
+            </span>
+          </div>
+          <button
+            aria-label="Close files"
+            className="term-close"
+            onClick={onClose}
+            type="button"
+          >
+            ✕
+          </button>
+        </div>
+        {sourceFiles.length === 0 ? (
+          <div className="file-panel-empty">No generated files yet.</div>
+        ) : (
+          <>
+            <div
+              aria-label="Generated files"
+              className="file-panel-list"
+              role="listbox"
+            >
+              {sourceFiles.map((file) => {
+                const active = selectedFile?.path === file.path;
+                return (
+                  <button
+                    aria-selected={active}
+                    className={`file-panel-row ${active ? 'active' : ''}`}
+                    key={file.path}
+                    onClick={() => setSelectedPath(file.path)}
+                    role="option"
+                    type="button"
+                  >
+                    <FileCode2 size={15} aria-hidden="true" />
+                    <span className="file-panel-path">{file.path}</span>
+                    <span className="file-panel-size">
+                      {formatBytes(file.sizeBytes)}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {selectedFile ? (
+              <div className="file-panel-detail">
+                <span>Selected</span>
+                <strong>{selectedFile.path}</strong>
+                <code>{formatBytes(selectedFile.sizeBytes)}</code>
+              </div>
+            ) : null}
+          </>
+        )}
+      </aside>
+    </>
+  );
+}
+
 function TerminalDrawer({
   open,
   onClose,
   text,
-  command,
+  input,
   disabled,
-  running,
-  onCommand,
-  onRunCommand,
+  onInput,
+  onSendInput,
 }: TerminalDrawerProps) {
   const lines = text ? text.split('\n') : [];
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -1448,7 +1484,7 @@ function TerminalDrawer({
       <div className="term-drawer open">
         <div className="term-head">
           <div className="term-head-title">
-            <TerminalIcon size={14} aria-hidden="true" /> VM terminal
+            <TerminalIcon size={14} aria-hidden="true" /> Interactive VM terminal
             <span className="term-head-meta">· {lines.length} lines</span>
           </div>
           <button
@@ -1463,7 +1499,7 @@ function TerminalDrawer({
         <div className="term-body" ref={bodyRef}>
           {!text ? (
             <div className="empty">
-              Run commands against /workspace/site after the VM boots.
+              Open after the VM boots. Commands are sent to a live shell in /workspace/site.
             </div>
           ) : (
             lines.map((line, idx) => {
@@ -1482,9 +1518,9 @@ function TerminalDrawer({
         <div className="term-presets" aria-label="VM diagnostics">
           {presets.map((preset) => (
             <button
-              disabled={disabled || running}
+              disabled={disabled}
               key={preset}
-              onClick={() => onRunCommand(preset)}
+              onClick={() => onSendInput(preset)}
               type="button"
             >
               {preset.split('\n')[0].replace("python3 - <<'PY'", 'health')}
@@ -1495,8 +1531,8 @@ function TerminalDrawer({
           className="term-form"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!disabled && !running && command.trim()) {
-              onRunCommand();
+            if (!disabled && input.trim()) {
+              onSendInput();
             }
           }}
         >
@@ -1505,17 +1541,17 @@ function TerminalDrawer({
             aria-label="VM command"
             autoCapitalize="off"
             autoCorrect="off"
-            disabled={disabled || running}
-            onChange={(event) => onCommand(event.target.value)}
+            disabled={disabled}
+            onChange={(event) => onInput(event.target.value)}
             placeholder={disabled ? 'Boot the VM first' : 'pwd, ls -la, cat .server.log'}
             spellCheck={false}
-            value={command}
+            value={input}
           />
           <button
-            disabled={disabled || running || !command.trim()}
+            disabled={disabled || !input.trim()}
             type="submit"
           >
-            {running ? 'Running' : 'Send'}
+            Send
           </button>
         </form>
       </div>
@@ -1537,6 +1573,7 @@ export default function App() {
   const [hasStarted, setHasStarted] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [showFiles, setShowFiles] = useState(false);
 
   const [projects, setProjects] = useState<SavedProject[]>(() => loadProjects());
   const [activeProject, setActiveProject] = useState<SavedProject>(() =>
@@ -1550,7 +1587,6 @@ export default function App() {
   const [terminal, setTerminal] = useState('');
   const [debugLog, setDebugLog] = useState('');
   const [terminalCommand, setTerminalCommand] = useState('');
-  const [terminalBusy, setTerminalBusy] = useState(false);
   const [building, setBuilding] = useState(false);
   const [ready, setReady] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -1882,6 +1918,7 @@ export default function App() {
     try {
       const vm = await WebVmBackend.create({
         tailscaleAuthKey: tailscaleAuthKey.trim() || undefined,
+        onConsole: appendTerminal,
         onDebug: appendDebug,
         onStatus: (status) => {
           setVmStatus(status);
@@ -2257,38 +2294,36 @@ export default function App() {
     }
   };
 
-  const runTerminalCommand = async (commandOverride?: string) => {
+  const openTerminal = () => {
+    setShowTerminal(true);
+    if (!backend) {
+      return;
+    }
+    const result = backend.startInteractiveShell();
+    const output = cleanStatusOutput(result.output);
+    if (result.status !== 0 && output) {
+      appendTerminal(`${output}\n`);
+    }
+  };
+
+  const sendTerminalInput = (commandOverride?: string) => {
     const command = (commandOverride ?? terminalCommand).trim();
     if (!command) return;
     setTerminalCommand('');
     setShowTerminal(true);
-    appendTerminal(`${terminal.endsWith('\n') || !terminal ? '' : '\n'}$ ${command}\n`);
 
     if (!backend) {
       appendTerminal('No VM is running.\n');
       return;
     }
 
-    setTerminalBusy(true);
-    try {
-      const result = await backend.runCommand(command, {
-        cwd: SITE_ROOT,
-        stream: false,
-        timeoutMs: 8_000,
-      });
-      const output = cleanStatusOutput(result.output);
-      if (output) {
-        appendTerminal(`${output}\n`);
-      }
-      if (result.status !== 0) {
-        appendTerminal(`[exit ${result.status}]\n`);
-      }
-    } catch (error) {
-      appendTerminal(
-        `${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    } finally {
-      setTerminalBusy(false);
+    const result = backend.writeTerminalInput(`${command}\n`);
+    const output = cleanStatusOutput(result.output);
+    if (output) {
+      appendTerminal(`${output}\n`);
+    }
+    if (result.status !== 0) {
+      appendTerminal(`[exit ${result.status}]\n`);
     }
   };
 
@@ -2397,11 +2432,17 @@ export default function App() {
           onCancel={cancelBuild}
           onOpenWebsite={openWebsite}
           onRetryTailnet={() => void retryTailnet()}
+          onFiles={() => setShowFiles(true)}
           onLogs={() => setShowLogs(true)}
-          onTerminal={() => setShowTerminal(true)}
+          onTerminal={openTerminal}
           errorMessage={errorMessage}
         />
       )}
+      <FileDrawer
+        open={showFiles}
+        onClose={() => setShowFiles(false)}
+        files={files}
+      />
       <LogDrawer
         open={showLogs}
         onClose={() => setShowLogs(false)}
@@ -2411,11 +2452,10 @@ export default function App() {
         open={showTerminal}
         onClose={() => setShowTerminal(false)}
         text={terminal}
-        command={terminalCommand}
+        input={terminalCommand}
         disabled={!backend}
-        running={terminalBusy}
-        onCommand={setTerminalCommand}
-        onRunCommand={(commandOverride) => void runTerminalCommand(commandOverride)}
+        onInput={setTerminalCommand}
+        onSendInput={sendTerminalInput}
       />
     </>
   );

@@ -48,6 +48,16 @@ function fakeBackend() {
       output: '4242',
       background: true,
     })),
+    startInteractiveShell: vi.fn(() => ({
+      status: 0,
+      output: 'Interactive shell started.',
+      background: true,
+    })),
+    writeTerminalInput: vi.fn(() => ({
+      status: 0,
+      output: '',
+      background: false,
+    })),
     checkServer: vi.fn(async () => ({
       status: 0,
       output: 'internal: server process is listening on port 8081',
@@ -236,6 +246,7 @@ describe('SparkRun chat screen', () => {
     expect(await screen.findByText(/Site is live/i)).toBeInTheDocument();
     expect(screen.getByText(/server process is listening on port 8081/i)).toBeInTheDocument();
     expect(screen.getByText(/browser: reachable at/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Open generated files/i }));
     expect(screen.getByRole('listbox', { name: /Generated files/i })).toBeInTheDocument();
     expect(screen.getByText('index.html')).toBeInTheDocument();
     expect(screen.getAllByText('14 B').length).toBeGreaterThan(0);
@@ -248,7 +259,8 @@ describe('SparkRun chat screen', () => {
       target: { value: 'pwd' },
     });
     fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
-    expect(await screen.findByText('/workspace/site')).toBeInTheDocument();
+    expect(backend.startInteractiveShell).toHaveBeenCalledTimes(1);
+    expect(backend.writeTerminalInput).toHaveBeenCalledWith('pwd\n');
     expect(screen.queryByText(/ttyname failed/i)).not.toBeInTheDocument();
   });
 
