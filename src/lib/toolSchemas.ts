@@ -102,7 +102,7 @@ export const TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: SHELL_TOOL_NAME,
-    description: `Runs safe commands in /workspace/site. Allowed commands include "${SERVER_COMMAND}", pwd, ls, ls -R /workspace/site, and find . -maxdepth 2 -type f. The server command starts the Python static server on the next available VM port. Use list_directory or read_file for normal inspection.`,
+    description: `Runs an arbitrary shell command in the in-browser micro-VM (Debian, /workspace/site by default). Anything bash can run is fair game: pwd, ls, find, cat, grep, sed, awk, mkdir, mv, rm, chmod, ps, kill, python3, node, npm, etc. The static web server is started with "${SERVER_COMMAND}". Prefer list_directory / read_file / write_file / replace for routine file ops; use run_shell_command for anything else.`,
     parametersJsonSchema: {
       type: 'object',
       properties: {

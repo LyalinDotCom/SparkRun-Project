@@ -112,6 +112,26 @@ const MODELS = [
   { id: MODEL_ID, label: 'Flash preview', sub: 'Only model enabled' },
 ];
 
+function formatBuildTimeLocal(iso: string): string {
+  if (!iso || iso === 'dev' || iso === 'unknown') return iso;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const local = date.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  });
+  const tz =
+    Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+      .formatToParts(date)
+      .find((part) => part.type === 'timeZoneName')?.value ?? '';
+  return tz ? `${local} ${tz}` : local;
+}
+
 function clock(): string {
   return new Date().toLocaleTimeString([], {
     hour: '2-digit',
@@ -935,7 +955,7 @@ function SetupScreen(props: SetupScreenProps) {
         <div className="diag-row">
           <span className="diag-label">SparkRun build</span>
           <span className="diag-value">
-            {SPARKRUN_BUILD_SHA} · {SPARKRUN_BUILD_TIME}
+            {SPARKRUN_BUILD_SHA} · {formatBuildTimeLocal(SPARKRUN_BUILD_TIME)}
           </span>
         </div>
         <div className="diag-row">

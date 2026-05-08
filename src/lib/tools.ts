@@ -283,44 +283,6 @@ function shellCommandForExecution(command: string): string {
   return normalizeShellCommand(command);
 }
 
-const EXACT_SHELL_COMMANDS = new Set([
-  SERVER_COMMAND,
-  'pwd',
-  'ls',
-  'ls .',
-  `ls ${SITE_ROOT}`,
-  'ls -la',
-  'ls -la .',
-  `ls -la ${SITE_ROOT}`,
-  'ls -R',
-  'ls -R .',
-  `ls -R ${SITE_ROOT}`,
-  'find . -maxdepth 2 -type f',
-  'find . -maxdepth 3 -type f',
-  `find ${SITE_ROOT} -maxdepth 2 -type f`,
-  `find ${SITE_ROOT} -maxdepth 3 -type f`,
-  'cat .server.log',
-  'cat /workspace/site/.server.log',
-  'tail .server.log',
-  'tail -40 .server.log',
-  'tail -40 /workspace/site/.server.log',
-  'cat .server.pid',
-  'cat /workspace/site/.server.pid',
-  'ps',
-  'ps aux',
-  'ps -ef',
-  'netstat -ltn',
-  'ss -ltn',
-]);
-
-function isAllowedShellCommand(command: string): boolean {
-  const normalized = normalizeShellCommand(command);
-  if (EXACT_SHELL_COMMANDS.has(normalized)) {
-    return true;
-  }
-  return /^python3 - <<'PY'\n[\s\S]*\nPY$/.test(command.trim());
-}
-
 export async function executeToolCall(
   backend: VmFileBackend,
   call: ToolCall,
@@ -436,11 +398,6 @@ export async function executeToolCall(
 
       case SHELL_TOOL_NAME: {
         const command = expectString(call.args.command, 'command');
-        if (!isAllowedShellCommand(command)) {
-          throw new Error(
-            `Command is not allowed in this prototype: ${command}`,
-          );
-        }
         const relativeCwd = normalizeSitePath(
           typeof call.args.dir_path === 'string' ? call.args.dir_path : '',
         );

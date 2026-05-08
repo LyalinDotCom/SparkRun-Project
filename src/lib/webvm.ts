@@ -581,11 +581,14 @@ export class WebVmBackend implements VmFileBackend {
     );
     backend.attachConsole();
     await backend.prepareWorkspace();
-    const probe = await backend.probeWorkspaceWritable();
-    if (!probe.writable) {
-      backend.workspaceCorrupt = true;
-      backend.publishStatus('error', 'Workspace IndexedDB is corrupt');
-    }
+    // Note: we deliberately do NOT run probeWorkspaceWritable here at boot.
+    // On some machines, the probe's write+rm cycle (`printf > .probe; cat; rm`)
+    // leaves the IDB workspace in a half-committed state where the next
+    // unrelated cp immediately fails with "Read-only file system" — even
+    // though the probe itself succeeded. The probe was useful diagnostically
+    // but it became the cause of what it was trying to detect. The agent's
+    // first cp serves as the implicit probe; if it fails we surface the
+    // failure with a clear message at that point.
     if (pendingTailnetIp) {
       backend.setTailnetIp(pendingTailnetIp);
     }
@@ -1280,7 +1283,20 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private async prepareWorkspace(): Promise<void> {
-    await this.execBash(`mkdir -p ${shellQuote(SITE_ROOT)}`, '/', false, false);
+    // Recreate the SITE_ROOT directory from scratch on every boot. The IDB
+    // workspace persists across reloads, and prior interrupted sessions can
+    // leave per-directory corruption: the directory entry survives but its
+    // inode contents are half-committed, so writes inside it return EROFS
+    // ("Read-only file system") while reads still work and `mount` reports
+    // rw. The corruption is confined to the subdir; the parent /workspace
+    // mount itself is fine. Nuking the dir and recreating it clears the
+    // corrupt entries and gives us a clean inode. User project files are
+    // restored from localStorage (App.tsx restoreProjectFiles) after this.
+    const cmd = [
+      `rm -rf ${shellQuote(SITE_ROOT)}`,
+      `mkdir -p ${shellQuote(SITE_ROOT)}`,
+    ].join(' && ');
+    await this.execBash(cmd, '/', false, false);
   }
 
   private runOptions(cwd: string): NonNullable<Parameters<CheerpXLinux['run']>[2]> {

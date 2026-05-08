@@ -173,28 +173,31 @@ describe('browser VM tool executor', () => {
     expect(assets.llmContent).not.toContain('index.html');
   });
 
-  it('allows only the static server and read-only shell commands', async () => {
+  it('runs arbitrary shell commands without an allowlist', async () => {
     const backend = new MemoryVmFileBackend();
 
-    const blocked = await executeToolCall(backend, {
+    // Previously blocked — now passes through
+    const arbitrary = await executeToolCall(backend, {
       name: 'run_shell_command',
       args: { command: 'npm install anything' },
     });
-    expect(blocked.error).toContain('not allowed');
-    expect(backend.commands).toHaveLength(0);
+    expect(arbitrary.error).toBeUndefined();
+    expect(backend.commands.at(-1)).toMatchObject({
+      command: 'npm install anything',
+      cwd: SITE_ROOT,
+      background: false,
+    });
 
     const server = await executeToolCall(backend, {
       name: 'run_shell_command',
       args: { command: SERVER_COMMAND },
     });
     expect(server.error).toBeUndefined();
-    expect(backend.commands).toEqual([
-      {
-        command: SERVER_COMMAND,
-        cwd: SITE_ROOT,
-        background: true,
-      },
-    ]);
+    expect(backend.commands.at(-1)).toMatchObject({
+      command: SERVER_COMMAND,
+      cwd: SITE_ROOT,
+      background: true,
+    });
 
     const inspect = await executeToolCall(backend, {
       name: 'run_shell_command',
