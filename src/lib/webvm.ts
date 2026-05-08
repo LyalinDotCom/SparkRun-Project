@@ -239,6 +239,44 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
+let globalErrorListenersInstalled = false;
+let lastWindowErrorSink: DebugCallback | null = null;
+
+const TAILSCALE_AUTH_KEY_PATTERN = /^tskey-(auth|client)-[A-Za-z0-9_-]+$/;
+
+export function validateTailscaleAuthKey(rawValue: string): string | null {
+  const value = rawValue.trim();
+  if (!value) {
+    return 'Tailscale auth key is required.';
+  }
+  if (!value.startsWith('tskey-')) {
+    return 'Tailscale auth keys start with "tskey-". Generate one in the Tailscale admin console under Settings → Keys.';
+  }
+  if (!TAILSCALE_AUTH_KEY_PATTERN.test(value)) {
+    return 'This does not look like a Tailscale auth key. It should look like "tskey-auth-..." with no spaces.';
+  }
+  if (value.length < 30) {
+    return 'This auth key looks too short. Reusable keys are typically 40+ characters.';
+  }
+  return null;
+}
+
+const GOOGLE_API_KEY_PATTERN = /^AIza[A-Za-z0-9_-]{30,}$/;
+
+export function validateGoogleApiKey(rawValue: string): string | null {
+  const value = rawValue.trim();
+  if (!value) {
+    return 'Google AI Studio API key is required.';
+  }
+  if (!value.startsWith('AIza')) {
+    return 'Google AI Studio API keys start with "AIza". Get one at aistudio.google.com → Get API key.';
+  }
+  if (!GOOGLE_API_KEY_PATTERN.test(value)) {
+    return 'This does not look like a Google API key. It should look like "AIza..." with no spaces.';
+  }
+  return null;
+}
+
 export class WebVmBackend implements VmFileBackend {
   private activeCapture: ActiveCapture | null = null;
   private queue: Promise<unknown> = Promise.resolve();
@@ -255,6 +293,7 @@ export class WebVmBackend implements VmFileBackend {
   private tailnetLoginStarted = false;
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
+  private highestTailnetState: number | null = null;
 
   private constructor(
     private readonly cx: CheerpXLinux,
@@ -272,6 +311,35 @@ export class WebVmBackend implements VmFileBackend {
       message: 'Loading CheerpX and disk image',
     });
 
+    if (typeof window !== 'undefined' && !globalErrorListenersInstalled) {
+      globalErrorListenersInstalled = true;
+      window.addEventListener('error', (event) => {
+        const message = event.error
+          ? event.error instanceof Error
+            ? `${event.error.message} @ ${event.filename}:${event.lineno}:${event.colno}\n${event.error.stack ?? ''}`
+            : String(event.error)
+          : `${event.message} @ ${event.filename}:${event.lineno}:${event.colno}`;
+        console.error('[webvm] window.onerror', event);
+        lastWindowErrorSink?.({
+          phase: 'window-error',
+          status: 1,
+          output: message,
+        });
+      });
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event.reason;
+        const message =
+          reason instanceof Error ? `${reason.message}\n${reason.stack ?? ''}` : String(reason);
+        console.error('[webvm] unhandledrejection', event);
+        lastWindowErrorSink?.({
+          phase: 'unhandled-rejection',
+          status: 1,
+          output: message,
+        });
+      });
+    }
+    lastWindowErrorSink = options.onDebug ?? null;
+
     const imported = await import('@leaningtech/cheerpx');
     const CheerpX = (
       'default' in imported ? imported.default : imported
@@ -281,10 +349,38 @@ export class WebVmBackend implements VmFileBackend {
     try {
       rootDevice = await CheerpX.CloudDevice.create(WEBVM_DISK_URL);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[webvm] CloudDevice.create failed for', WEBVM_DISK_URL, error);
+      options.onDebug?.({
+        phase: 'disk',
+        status: 1,
+        output: `CloudDevice.create failed for ${WEBVM_DISK_URL}: ${message}`,
+      });
       if (WEBVM_DISK_URL.startsWith('wss:')) {
-        rootDevice = await CheerpX.CloudDevice.create(
-          `https:${WEBVM_DISK_URL.slice('wss:'.length)}`,
-        );
+        const fallbackUrl = `https:${WEBVM_DISK_URL.slice('wss:'.length)}`;
+        options.onDebug?.({
+          phase: 'disk',
+          output: `Retrying disk load over HTTPS fallback: ${fallbackUrl}`,
+        });
+        try {
+          rootDevice = await CheerpX.CloudDevice.create(fallbackUrl);
+        } catch (fallbackError) {
+          const fallbackMessage =
+            fallbackError instanceof Error
+              ? fallbackError.message
+              : String(fallbackError);
+          console.error(
+            '[webvm] CloudDevice HTTPS fallback failed for',
+            fallbackUrl,
+            fallbackError,
+          );
+          options.onDebug?.({
+            phase: 'disk',
+            status: 1,
+            output: `CloudDevice HTTPS fallback failed for ${fallbackUrl}: ${fallbackMessage}`,
+          });
+          throw fallbackError;
+        }
       } else {
         throw error;
       }
@@ -296,14 +392,58 @@ export class WebVmBackend implements VmFileBackend {
     const dataDevice = await CheerpX.DataDevice.create();
     const webDevice = await CheerpX.WebDevice.create('');
 
+    const trimmedAuthKey = options.tailscaleAuthKey?.trim() || undefined;
+    const authKeyValidationError = trimmedAuthKey
+      ? validateTailscaleAuthKey(trimmedAuthKey)
+      : null;
+    options.onDebug?.({
+      phase: 'tailnet-init',
+      status: authKeyValidationError ? 1 : 0,
+      output: trimmedAuthKey
+        ? authKeyValidationError
+          ? `Tailscale auth key looks malformed: ${authKeyValidationError}`
+          : `Tailscale auth key present (length=${trimmedAuthKey.length})`
+        : 'Tailscale auth key NOT provided — networkLogin will be skipped or fail',
+    });
+
     let backend: WebVmBackend | null = null;
     let pendingTailnetIp: string | null = null;
+    const TAILNET_STATE_NAMES: Record<number, string> = {
+      0: 'NoState',
+      1: 'InUseOtherUser',
+      2: 'NeedsLogin',
+      3: 'NeedsMachineAuth',
+      4: 'Stopped',
+      5: 'Starting',
+      6: 'Running',
+    };
     const networkInterface = {
-      authKey: options.tailscaleAuthKey?.trim() || undefined,
+      authKey: trimmedAuthKey,
       loginUrlCb: (url: string) => {
-        backend?.handleLoginUrl(url);
+        options.onDebug?.({
+          phase: 'tailnet-login-url',
+          output: `Tailscale loginUrlCb fired: ${url}`,
+        });
+        try {
+          backend?.handleLoginUrl(url);
+        } catch (error) {
+          console.error('[webvm] handleLoginUrl threw', error);
+          options.onDebug?.({
+            phase: 'tailnet-login-url',
+            status: 1,
+            output: `handleLoginUrl threw: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          });
+        }
       },
       stateUpdateCb: (state: number) => {
+        const name = TAILNET_STATE_NAMES[state] ?? `Unknown(${state})`;
+        options.onDebug?.({
+          phase: 'tailnet-state',
+          output: `stateUpdateCb: state=${state} (${name})`,
+        });
+        backend?.recordTailnetState(state);
         if (state === 6) {
           backend?.publishTailnetState();
         }
@@ -311,7 +451,17 @@ export class WebVmBackend implements VmFileBackend {
       netmapUpdateCb: (map: {
         self?: { addresses?: string[] };
       }) => {
-        const ip = map.self?.addresses?.[0] ?? null;
+        const addresses = map.self?.addresses ?? [];
+        const ip = addresses[0] ?? null;
+        options.onDebug?.({
+          phase: 'tailnet-netmap',
+          output: `netmapUpdateCb: addresses=[${addresses.join(', ')}] selectedIp=${
+            ip ?? 'null'
+          }`,
+        });
+        if (!ip) {
+          console.warn('[webvm] netmapUpdateCb received empty self.addresses', map);
+        }
         if (backend) {
           backend.setTailnetIp(ip);
         } else {
@@ -395,23 +545,64 @@ export class WebVmBackend implements VmFileBackend {
     this.publishStatus('booting', 'Starting Tailscale login');
     if (!this.tailnetLoginStarted) {
       this.tailnetLoginStarted = true;
-      try {
-        void Promise.resolve(this.cx.networkLogin()).catch((error: unknown) => {
-          this.rejectTailnetSignal?.(
-            error instanceof Error ? error : new Error(String(error)),
-          );
+      const reportLoginFailure = (error: unknown): void => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[webvm] cx.networkLogin() rejected', error);
+        this.publishDebug({
+          phase: 'tailnet-login',
+          status: 1,
+          output: `networkLogin() rejected: ${message}`,
         });
-      } catch (error) {
         this.rejectTailnetSignal?.(
           error instanceof Error ? error : new Error(String(error)),
         );
+      };
+      try {
+        void Promise.resolve(this.cx.networkLogin()).catch(reportLoginFailure);
+      } catch (error) {
+        reportLoginFailure(error);
       }
     }
 
     try {
-      const result = await Promise.race([signalPromise, timeoutPromise]);
+      const result = await Promise.race([
+        signalPromise.catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[webvm] tailnet signal rejected', error);
+          this.publishDebug({
+            phase: 'tailnet',
+            status: 1,
+            output: `Tailnet signal rejected: ${message}`,
+          });
+          return null;
+        }),
+        timeoutPromise,
+      ]);
       if (result === null && !this.tailnetIp && !this.loginUrl) {
-        this.publishStatus('booting', 'Tailnet connection started; waiting for IP');
+        const stuckAtNoState =
+          this.highestTailnetState === null || this.highestTailnetState <= 0;
+        if (stuckAtNoState) {
+          this.publishStatus(
+            'error',
+            'Tailscale auth key rejected — generate a fresh reusable key',
+          );
+          this.publishDebug({
+            phase: 'tailnet',
+            status: 1,
+            output:
+              'Tailnet stuck at NoState. The Tailscale auth key was almost certainly rejected — it may be expired, single-use and already consumed, or for a different tailnet. Generate a new reusable, ephemeral auth key in the Tailscale admin console (Settings → Keys) and try again.',
+          });
+        } else {
+          this.publishStatus('booting', 'Tailnet connection started; waiting for IP');
+          this.publishDebug({
+            phase: 'tailnet',
+            output: `connectTailnet timed out after ${
+              options.timeoutMs ?? 15_000
+            }ms; highest state seen: ${
+              this.highestTailnetState ?? 'none'
+            }. Check DevTools console for COEP/CORP errors.`,
+          });
+        }
       }
       return result;
     } finally {
@@ -565,6 +756,7 @@ export class WebVmBackend implements VmFileBackend {
       .catch((error: unknown) => {
         this.interactiveShellRunning = false;
         const message = error instanceof Error ? error.message : String(error);
+        console.error('[webvm] interactive shell threw', error);
         this.onConsole?.(`\n[vm] interactive shell failed: ${message}\n`);
         this.publishDebug({
           phase: 'terminal-exit',
@@ -729,6 +921,7 @@ export class WebVmBackend implements VmFileBackend {
         background: false,
       });
     } catch (error) {
+      console.error('[webvm] prepareTailnetForServer threw', error);
       this.publishDebug({
         phase: 'tailnet',
         status: 1,
@@ -740,6 +933,7 @@ export class WebVmBackend implements VmFileBackend {
 
   private async waitForServerPort(timeoutMs: number): Promise<number | null> {
     const started = Date.now();
+    let lastLogSize = 0;
     while (Date.now() - started < timeoutMs) {
       const result = await this.execBash(
         'if [ -f /workspace/site/.server.port ]; then cat /workspace/site/.server.port; fi',
@@ -754,6 +948,35 @@ export class WebVmBackend implements VmFileBackend {
         this.serverPort = port;
         return port;
       }
+
+      const sizeResult = await this.execBash(
+        "if [ -f /workspace/site/.server.log ]; then wc -c < /workspace/site/.server.log; else echo 0; fi",
+        SITE_ROOT,
+        false,
+        false,
+        2_000,
+        false,
+      );
+      const currentSize = Number(sizeResult.output.trim());
+      if (Number.isFinite(currentSize) && currentSize > lastLogSize) {
+        const tail = await this.execBash(
+          `tail -c +${lastLogSize + 1} /workspace/site/.server.log`,
+          SITE_ROOT,
+          false,
+          false,
+          2_000,
+          false,
+        );
+        if (tail.output.trim().length > 0) {
+          this.publishDebug({
+            phase: 'server-log',
+            output: tail.output,
+            background: true,
+          });
+        }
+        lastLogSize = currentSize;
+      }
+
       await sleep(300);
     }
     return null;
@@ -833,11 +1056,17 @@ export class WebVmBackend implements VmFileBackend {
   private attachConsole(): void {
     const decoder = new TextDecoder();
     this.consoleInput = this.cx.setCustomConsole((buf, vt) => {
-      if (vt !== undefined && vt !== 1) {
-        return;
-      }
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
       const text = decoder.decode(bytes);
+      if (vt !== undefined && vt !== 1) {
+        if (text.trim().length > 0) {
+          this.publishDebug({
+            phase: 'console-vt',
+            output: `vt=${vt}: ${text}`,
+          });
+        }
+        return;
+      }
       if (this.activeCapture !== null) {
         this.activeCapture.output += text;
         if (this.activeCapture.streamToConsole) {
@@ -932,6 +1161,24 @@ export class WebVmBackend implements VmFileBackend {
           });
         }
         return { ...commandResult, output: finalOutput };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[webvm] cx.run threw for command:', command, error);
+        const captured = this.activeCapture?.output.trim() ?? '';
+        const finalOutput = [captured, `cx.run threw: ${message}`]
+          .filter(Boolean)
+          .join('\n');
+        if (debug) {
+          this.publishDebug({
+            phase: 'exec-result',
+            command,
+            cwd,
+            status: 1,
+            output: finalOutput,
+            background,
+          });
+        }
+        return { status: 1, output: finalOutput, background };
       } finally {
         if (timeoutId) {
           globalThis.clearTimeout(timeoutId);
@@ -949,11 +1196,23 @@ export class WebVmBackend implements VmFileBackend {
     let parsed: URL;
     try {
       parsed = new URL(url);
-    } catch {
+    } catch (error) {
+      console.error('[webvm] handleLoginUrl: invalid URL', url, error);
+      this.publishDebug({
+        phase: 'tailnet-login-url',
+        status: 1,
+        output: `Invalid Tailscale login URL: ${url}`,
+      });
       this.rejectTailnetSignal?.(new Error('Invalid Tailscale login URL.'));
       return;
     }
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      console.error('[webvm] handleLoginUrl: bad scheme', parsed.protocol, url);
+      this.publishDebug({
+        phase: 'tailnet-login-url',
+        status: 1,
+        output: `Invalid Tailscale login URL scheme: ${parsed.protocol}`,
+      });
       this.rejectTailnetSignal?.(new Error('Invalid Tailscale login URL scheme.'));
       return;
     }
@@ -962,6 +1221,16 @@ export class WebVmBackend implements VmFileBackend {
     this.resolveTailnetSignal = null;
     this.rejectTailnetSignal = null;
     this.publishStatus('tailnet-login-ready', 'Tailscale login ready');
+  }
+
+  recordTailnetState(state: number): void {
+    if (this.highestTailnetState === null || state > this.highestTailnetState) {
+      this.highestTailnetState = state;
+    }
+  }
+
+  getHighestTailnetState(): number | null {
+    return this.highestTailnetState;
   }
 
   private setTailnetIp(ip: string | null): void {

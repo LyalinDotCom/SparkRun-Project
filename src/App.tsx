@@ -48,6 +48,8 @@ import {
   type SavedProjectFile,
 } from './lib/projects';
 import {
+  validateGoogleApiKey,
+  validateTailscaleAuthKey,
   WebVmBackend,
   type WebVmDebugEntry,
   type WebVmStatus,
@@ -580,6 +582,30 @@ interface SetupScreenProps {
   onDetachFolder: () => void;
 }
 
+function KeyValidationStatus({
+  value,
+  validate,
+}: {
+  value: string;
+  validate: (input: string) => string | null;
+}) {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  const error = validate(value);
+  if (error) {
+    return (
+      <p className="field-status is-invalid">
+        <TriangleAlert size={12} aria-hidden="true" /> {error}
+      </p>
+    );
+  }
+  return (
+    <p className="field-status is-valid">
+      <CheckCircle2 size={12} aria-hidden="true" /> Looks valid.
+    </p>
+  );
+}
+
 function SetupScreen(props: SetupScreenProps) {
   const [showKey1, setShowKey1] = useState(false);
   const [showKey2, setShowKey2] = useState(false);
@@ -648,7 +674,13 @@ function SetupScreen(props: SetupScreenProps) {
           <div className="input-wrap">
             <input
               id="setup-google-key"
-              className="text-input has-suffix"
+              className={`text-input has-suffix ${
+                props.cfg.apiKey.trim().length === 0
+                  ? ''
+                  : validateGoogleApiKey(props.cfg.apiKey)
+                    ? 'is-invalid'
+                    : 'is-valid'
+              }`}
               autoComplete="off"
               onChange={(event) => props.onApiKey(event.target.value)}
               placeholder="AIza..."
@@ -664,8 +696,21 @@ function SetupScreen(props: SetupScreenProps) {
               {showKey1 ? <EyeOff size={15} /> : <Eye size={15} />}
             </button>
           </div>
+          <KeyValidationStatus
+            value={props.cfg.apiKey}
+            validate={validateGoogleApiKey}
+          />
           <p className="field-hint">
-            Found at aistudio.google.com → Get API key.
+            Used to call Gemini for code generation.{' '}
+            <a
+              className="field-link"
+              href="https://aistudio.google.com/api-keys"
+              rel="noreferrer"
+              target="_blank"
+            >
+              Create one in AI Studio
+            </a>
+            .
           </p>
         </div>
 
@@ -676,7 +721,13 @@ function SetupScreen(props: SetupScreenProps) {
           <div className="input-wrap">
             <input
               id="setup-tail-key"
-              className="text-input has-suffix"
+              className={`text-input has-suffix ${
+                props.cfg.tailKey.trim().length === 0
+                  ? ''
+                  : validateTailscaleAuthKey(props.cfg.tailKey)
+                    ? 'is-invalid'
+                    : 'is-valid'
+              }`}
               autoComplete="off"
               onChange={(event) => props.onTailKey(event.target.value)}
               placeholder="tskey-auth-..."
@@ -692,9 +743,32 @@ function SetupScreen(props: SetupScreenProps) {
               {showKey2 ? <EyeOff size={15} /> : <Eye size={15} />}
             </button>
           </div>
+          <KeyValidationStatus
+            value={props.cfg.tailKey}
+            validate={validateTailscaleAuthKey}
+          />
           <p className="field-hint">
-            Reusable auth key. Your VM joins your tailnet so the preview opens
-            at a stable hostname.
+            Used so the in-browser VM can join your tailnet and serve a preview
+            URL. Use a <strong>reusable</strong>, <strong>ephemeral</strong>,{' '}
+            <strong>pre-approved</strong> key.
+            <br />
+            <a
+              className="field-link"
+              href="https://login.tailscale.com/admin/settings/keys"
+              rel="noreferrer"
+              target="_blank"
+            >
+              Create a key
+            </a>{' '}
+            ·{' '}
+            <a
+              className="field-link"
+              href="https://tailscale.com/docs/features/access-control/auth-keys"
+              rel="noreferrer"
+              target="_blank"
+            >
+              How auth keys work
+            </a>
           </p>
         </div>
       </div>
@@ -2023,12 +2097,22 @@ export default function App() {
             });
             await vm.connectTailnet({ timeoutMs: 45_000 });
           }
+          const stuckAtNoState =
+            !vm.getTailnetIp() &&
+            (vm.getHighestTailnetState() === null ||
+              (vm.getHighestTailnetState() ?? 0) <= 0);
           appendEvent({
             kind: vm.getTailnetIp() ? 'status' : 'error',
-            label: vm.getTailnetIp() ? 'Tailnet ready' : 'Tailnet unavailable',
+            label: vm.getTailnetIp()
+              ? 'Tailnet ready'
+              : stuckAtNoState
+                ? 'Tailscale auth key rejected'
+                : 'Tailnet unavailable',
             text: vm.getTailnetIp()
               ? `Tailnet IP ready: ${vm.getTailnetIp()}.`
-              : 'No Tailnet IP is available yet. The generated files will be kept, and the server will wait for Tailnet before binding.',
+              : stuckAtNoState
+                ? 'Your Tailscale auth key was almost certainly rejected (expired, single-use already consumed, or for a different tailnet). Generate a new reusable, ephemeral key in the Tailscale admin console (Settings → Keys) and paste it into setup.'
+                : 'No Tailnet IP is available yet. The generated files will be kept, and the server will wait for Tailnet before binding.',
           });
         } catch (error: unknown) {
           appendEvent({

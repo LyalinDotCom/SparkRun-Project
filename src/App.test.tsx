@@ -12,6 +12,16 @@ vi.mock('./lib/webvm', () => ({
   WebVmBackend: {
     create: appMocks.createBackend,
   },
+  validateTailscaleAuthKey: (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return 'Tailscale auth key is required.';
+    return null;
+  },
+  validateGoogleApiKey: (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return 'Google AI Studio API key is required.';
+    return null;
+  },
 }));
 
 vi.mock('./lib/agent', () => ({
@@ -28,6 +38,7 @@ function fakeBackend() {
   return {
     connectTailnet: vi.fn(async () => 'https://login.tailscale.com/a/abc'),
     getTailnetIp: vi.fn(() => '100.64.0.25'),
+    getHighestTailnetState: vi.fn(() => 6),
     getPreviewUrl: vi.fn(() => 'http://100.64.0.25:8080/'),
     listDirectory: vi.fn(async (path: string) => {
       if (!path) {

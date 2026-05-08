@@ -337,6 +337,44 @@ select {
   color: var(--ink-dim);
 }
 
+.text-input.is-valid {
+  border-color: color-mix(in oklab, var(--green) 50%, var(--line));
+}
+.text-input.is-invalid {
+  border-color: color-mix(in oklab, var(--warn) 60%, var(--line));
+}
+.text-input.is-valid:focus,
+.text-input.is-invalid:focus {
+  border-color: color-mix(in oklab, currentColor, var(--line-2));
+}
+
+.field-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+.field-status.is-valid {
+  color: var(--green);
+}
+.field-status.is-invalid {
+  color: var(--warn);
+}
+.field-status svg {
+  flex-shrink: 0;
+}
+
+.field-link {
+  color: var(--accent-2);
+  text-decoration: none;
+  border-bottom: 1px dotted color-mix(in oklab, var(--accent-2) 40%, transparent);
+}
+.field-link:hover {
+  border-bottom-color: var(--accent-2);
+}
+
 .model-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
