@@ -224,7 +224,7 @@ select {
 .screen {
   max-width: 760px;
   margin: 0 auto;
-  padding: 20px 16px 140px;
+  padding: 20px 16px 32px;
   animation: fadeUp 0.32s ease-out both;
 }
 
@@ -506,19 +506,10 @@ select {
 }
 
 .sticky-bottom {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 25;
-  background: linear-gradient(180deg, transparent 0%, var(--bg) 35%);
-  padding-top: 24px;
-  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  margin-top: 8px;
+  padding-bottom: max(0px, env(safe-area-inset-bottom));
 }
 .sticky-bottom-inner {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 0 16px;
   display: flex;
   gap: 10px;
 }
@@ -543,8 +534,11 @@ select {
   transition: transform 0.12s ease;
 }
 .primary-btn:disabled {
-  background: rgba(248, 107, 80, 0.35);
+  background: rgba(248, 107, 80, 0.25);
+  border-color: rgba(255, 138, 110, 0.2);
+  color: rgba(255, 255, 255, 0.6);
   box-shadow: none;
+  cursor: not-allowed;
 }
 
 .ghost-btn {
