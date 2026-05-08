@@ -851,6 +851,7 @@ interface ChatScreenProps {
   onSend: () => void;
   onCancel: () => void;
   onOpenWebsite: () => void;
+  onRetryTailnet: () => void;
   onLogs: () => void;
   onTerminal: () => void;
   errorMessage: string | null;
@@ -896,6 +897,7 @@ function ChatScreen({
   onSend,
   onCancel,
   onOpenWebsite,
+  onRetryTailnet,
   onLogs,
   onTerminal,
   errorMessage,
@@ -949,6 +951,7 @@ function ChatScreen({
   const statusTone = ready ? 'ok' : building ? 'run' : 'idle';
   const portLabel = serverPort ? `:${serverPort}` : ':auto';
   const previewHost = hostFromPreviewUrl(previewUrl);
+  const canRetryTailnet = hasStarted && !ready && !building && !tailnetIp;
 
   return (
     <div className="chat-frame">
@@ -979,6 +982,17 @@ function ChatScreen({
             </span>
           ) : null}
           <span style={{ flex: 1 }} />
+          {canRetryTailnet ? (
+            <button
+              aria-label="Retry Tailnet"
+              className="terminal-toggle warn"
+              onClick={onRetryTailnet}
+              type="button"
+            >
+              <Cable size={12} aria-hidden="true" />
+              Retry Tailnet
+            </button>
+          ) : null}
           <button
             aria-label="Open terminal"
             className="terminal-toggle"
@@ -1977,7 +1991,7 @@ export default function App() {
             label: vm.getTailnetIp() ? 'Tailnet ready' : 'Tailnet unavailable',
             text: vm.getTailnetIp()
               ? `Tailnet IP ready: ${vm.getTailnetIp()}.`
-              : 'No Tailnet IP is available yet; server startup may fail until Tailnet is connected.',
+              : 'No Tailnet IP is available yet. The generated files will be kept, and the server will wait for Tailnet before binding.',
           });
         } catch (error: unknown) {
           appendEvent({
@@ -2017,6 +2031,12 @@ export default function App() {
       const startResult = await vm.startServer();
       if (startResult.status !== 0) {
         await loadFiles(vm);
+        const sourceFiles = await collectSourceFiles(vm);
+        saveActiveProject({
+          prompt: buildPrompt,
+          previewUrl: null,
+          files: sourceFiles,
+        });
         appendEvent({
           kind: 'error',
           label: 'Server start failed',
@@ -2121,6 +2141,120 @@ export default function App() {
       label: 'Stopped',
       text: 'Stopped. Send another prompt to resume.',
     });
+  };
+
+  const retryTailnet = async () => {
+    if (!backend) {
+      appendEvent({
+        kind: 'error',
+        label: 'Retry Tailnet',
+        text: 'No VM is running yet. Start a build first.',
+      });
+      return;
+    }
+
+    setBuilding(true);
+    setReady(false);
+    setErrorMessage(null);
+    try {
+      appendEvent({
+        kind: 'status',
+        label: 'Retry Tailnet',
+        text: 'Restarting the browser-side Tailnet login and waiting for a VM address.',
+      });
+      const loginUrl = await backend.connectTailnet({
+        timeoutMs: 60_000,
+        forceLogin: true,
+      });
+      if (loginUrl) {
+        window.open(loginUrl, '_blank', 'noopener,noreferrer');
+        appendEvent({
+          kind: 'status',
+          label: 'Retry Tailnet',
+          text: 'Opened Tailscale login. Waiting for the VM Tailnet address.',
+        });
+        await backend.connectTailnet({ timeoutMs: 60_000 });
+      }
+
+      if (!backend.getTailnetIp()) {
+        appendEvent({
+          kind: 'error',
+          label: 'Tailnet unavailable',
+          text: 'Tailnet still has not provided a VM IP. The generated files are still saved; try again once the Tailnet device appears.',
+        });
+        return;
+      }
+
+      appendEvent({
+        kind: 'status',
+        label: 'Tailnet ready',
+        text: `Tailnet IP ready: ${backend.getTailnetIp()}. Starting the VM web server.`,
+      });
+
+      const startResult = await backend.startServer();
+      if (startResult.status !== 0) {
+        appendEvent({
+          kind: 'error',
+          label: 'Server start failed',
+          text:
+            cleanStatusOutput(startResult.output) ||
+            `Server command exited with ${startResult.status}`,
+        });
+        return;
+      }
+
+      const health = await backend.checkServer();
+      const serverHealthy = health.status === 0;
+      appendEvent({
+        kind: serverHealthy ? 'status' : 'error',
+        label: serverHealthy ? 'Server health' : 'Server failed',
+        text:
+          cleanStatusOutput(health.output) ||
+          `Health check exited with ${health.status}`,
+      });
+      if (!serverHealthy) {
+        return;
+      }
+
+      const url = backend.getPreviewUrl() ?? (await waitForPreviewUrl(backend, 20_000));
+      if (!url) {
+        appendEvent({
+          kind: 'error',
+          label: 'Tailnet unavailable',
+          text: 'The server is healthy internally, but no Tailnet preview URL is available yet.',
+        });
+        return;
+      }
+
+      const previewHealth = await checkPreviewFromBrowser(url);
+      appendEvent({
+        kind: 'status',
+        label: previewHealth.status === 0 ? 'Tailnet health' : 'Tailnet check',
+        text:
+          cleanStatusOutput(previewHealth.output) ||
+          `Browser preview check exited with ${previewHealth.status}`,
+      });
+
+      await loadFiles(backend);
+      const sourceFiles = await collectSourceFiles(backend);
+      saveActiveProject({
+        previewUrl: url,
+        files: sourceFiles,
+      });
+      appendEvent({
+        kind: 'ready',
+        text: `**Site is live:** ${url}`,
+      });
+      setReady(true);
+    } catch (error) {
+      appendEvent({
+        kind: 'error',
+        label: 'Retry Tailnet',
+        text: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setBuilding(false);
+    }
   };
 
   const runTerminalCommand = async (commandOverride?: string) => {
@@ -2262,6 +2396,7 @@ export default function App() {
           onSend={() => void send()}
           onCancel={cancelBuild}
           onOpenWebsite={openWebsite}
+          onRetryTailnet={() => void retryTailnet()}
           onLogs={() => setShowLogs(true)}
           onTerminal={() => setShowTerminal(true)}
           errorMessage={errorMessage}

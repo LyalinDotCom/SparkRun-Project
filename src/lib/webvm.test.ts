@@ -286,6 +286,7 @@ describe('WebVM backend setup', () => {
   });
 
   it('starts the real VM web server command without invalid shell composition', async () => {
+    mockState.emitEarlyIp = true;
     const statuses: string[] = [];
     const backend = await WebVmBackend.create({
       onStatus: (status) => statuses.push(status.lifecycle),
@@ -310,10 +311,12 @@ describe('WebVM backend setup', () => {
       background: true,
     });
     expect(serverLaunch?.args[1]).toContain(SERVER_COMMAND);
-    expect(cleanupCommand).toContain("pkill -f '[.]sparkrun_static_server.py'");
-    expect(cleanupCommand).toContain(`pkill -f '[h]ttp.server ${SERVER_PORT}'`);
+    expect(cleanupCommand).toContain('/workspace/site/.server.pid');
+    expect(cleanupCommand).toContain('/workspace/site/.server.launch.pid');
+    expect(cleanupCommand).toContain('[.]sparkrun_static_server.py');
     expect(cleanupCommand).toContain('ps -eo pid,args');
     expect(cleanupCommand).toContain('kill -9');
+    expect(cleanupCommand).not.toContain('pkill');
     expect(cleanupCommand).not.toContain("pkill -f '/workspace/.sparkrun");
     expect(cleanupCommand).not.toContain('& &&');
     expect(stagedServerScript).toContain('Cross-Origin-Embedder-Policy');

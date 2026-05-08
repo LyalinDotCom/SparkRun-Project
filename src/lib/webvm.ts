@@ -105,6 +105,7 @@ export interface CreateWebVmBackendOptions {
 
 export interface ConnectTailnetOptions {
   timeoutMs?: number;
+  forceLogin?: boolean;
 }
 
 type ActiveCapture = {
@@ -218,12 +219,13 @@ server.serve_forever()
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
 const SERVER_CLEANUP_COMMAND = [
-  `if command -v pkill >/dev/null 2>&1; then pkill -f '[.]sparkrun_static_server.py' 2>/dev/null || true; pkill -f '[h]ttp.server ${SERVER_PORT}' 2>/dev/null || true; fi`,
-  `for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py|[h]ttp.server ${SERVER_PORT}/ {print $1}'); do kill "$pid" 2>/dev/null || true; done`,
-  'sleep 1',
-  `for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py|[h]ttp.server ${SERVER_PORT}/ {print $1}'); do kill -9 "$pid" 2>/dev/null || true; done`,
-  'rm -f /workspace/site/.server.pid /workspace/site/.server.port /workspace/site/.server.host /workspace/site/.server.url',
-].join(' && ');
+  'if [ -f /workspace/site/.server.pid ]; then kill "$(cat /workspace/site/.server.pid)" 2>/dev/null || true; fi',
+  'if [ -f /workspace/site/.server.launch.pid ]; then kill "$(cat /workspace/site/.server.launch.pid)" 2>/dev/null || true; fi',
+  "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill \"$pid\" 2>/dev/null || true; done",
+  'sleep 0.2',
+  "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill -9 \"$pid\" 2>/dev/null || true; done",
+  'rm -f /workspace/site/.server.pid /workspace/site/.server.port /workspace/site/.server.host /workspace/site/.server.url /workspace/site/.server.launch.pid',
+].join(' ; ');
 
 function formatPreviewUrl(ip: string | null, port: number | null): string | null {
   if (!ip || !port) {
@@ -246,6 +248,7 @@ export class WebVmBackend implements VmFileBackend {
   private serverStarted = false;
   private serverRunPromise: Promise<{ status: number }> | null = null;
   private serverLastExit: VmCommandResult | null = null;
+  private commandRunnerTimedOut = false;
   private tailnetLoginStarted = false;
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
@@ -369,6 +372,12 @@ export class WebVmBackend implements VmFileBackend {
     }
     if (!this.cx.networkLogin) {
       throw new Error('This CheerpX build does not expose networkLogin.');
+    }
+    if (options.forceLogin) {
+      this.resolveTailnetSignal = null;
+      this.rejectTailnetSignal = null;
+      this.loginUrl = null;
+      this.tailnetLoginStarted = false;
     }
 
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -522,6 +531,25 @@ export class WebVmBackend implements VmFileBackend {
     }
 
     await this.prepareTailnetForServer();
+    if (!this.tailnetIp) {
+      const output =
+        'Tailnet IP is not available yet. Skipping VM web server start because CheerpX cannot bind 0.0.0.0 until the browser-side Tailnet network is connected.';
+      this.publishStatus('error', 'Tailnet unavailable');
+      this.publishDebug({
+        phase: 'server',
+        command: SERVER_COMMAND,
+        cwd: SITE_ROOT,
+        status: 1,
+        output,
+        background: true,
+      });
+      return {
+        status: 1,
+        output,
+        background: true,
+      };
+    }
+
     await this.copyTextToVm(SERVER_SCRIPT_PATH, SERVER_SCRIPT, SITE_ROOT);
     this.serverStarted = false;
     this.serverLastExit = null;
@@ -591,7 +619,11 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private async prepareTailnetForServer(): Promise<void> {
-    if (this.tailnetIp || !this.cx.networkLogin || !this.autoConnectTailnetForServer) {
+    if (
+      this.tailnetIp ||
+      !this.cx.networkLogin ||
+      !this.autoConnectTailnetForServer
+    ) {
       return;
     }
     this.publishDebug({
@@ -600,7 +632,7 @@ export class WebVmBackend implements VmFileBackend {
       background: false,
     });
     try {
-      const loginUrl = await this.connectTailnet({ timeoutMs: 20_000 });
+      const loginUrl = await this.connectTailnet({ timeoutMs: 45_000 });
       this.publishDebug({
         phase: 'tailnet',
         output: this.tailnetIp
@@ -663,7 +695,7 @@ export class WebVmBackend implements VmFileBackend {
       SITE_ROOT,
       false,
       false,
-      4_000,
+      10_000,
     );
     this.serverStarted = false;
     this.serverRunPromise = null;
@@ -761,6 +793,14 @@ export class WebVmBackend implements VmFileBackend {
     debug: boolean = true,
   ): Promise<VmCommandResult> {
     const run = async (): Promise<VmCommandResult> => {
+      if (this.commandRunnerTimedOut) {
+        return {
+          status: 124,
+          output:
+            'The VM command runner is recovering from a previous timeout. Start a fresh VM run before executing more commands.',
+          background,
+        };
+      }
       if (debug) {
         this.publishDebug({
           phase: 'exec',
@@ -786,6 +826,9 @@ export class WebVmBackend implements VmFileBackend {
         ]);
         const output = this.activeCapture.output.trim();
         const timedOut = result.status === 124;
+        if (timedOut) {
+          this.commandRunnerTimedOut = true;
+        }
         const finalOutput = timedOut
           ? [output, `Command timed out after ${timeoutMs}ms.`]
               .filter(Boolean)

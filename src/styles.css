@@ -721,6 +721,15 @@ select {
   border-color: var(--line-2);
   color: var(--ink);
 }
+.terminal-toggle.warn {
+  color: var(--warn);
+  border-color: rgba(243, 197, 119, 0.34);
+  background: rgba(243, 197, 119, 0.08);
+}
+.terminal-toggle.warn:hover {
+  border-color: rgba(243, 197, 119, 0.55);
+  color: #ffd893;
+}
 
 @media (max-width: 720px) {
   .file-strip-inner {
