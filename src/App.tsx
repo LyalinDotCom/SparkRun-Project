@@ -48,6 +48,11 @@ import {
   type SavedProjectFile,
 } from './lib/projects';
 import {
+  CHEERPX_PINNED_VERSION,
+  detectCheerpxRuntimeVersion,
+  hardResetSparkrunCaches,
+  SPARKRUN_BUILD_SHA,
+  SPARKRUN_BUILD_TIME,
   validateGoogleApiKey,
   validateTailscaleAuthKey,
   WebVmBackend,
@@ -609,6 +614,45 @@ function KeyValidationStatus({
 function SetupScreen(props: SetupScreenProps) {
   const [showKey1, setShowKey1] = useState(false);
   const [showKey2, setShowKey2] = useState(false);
+  const [runtimeCheerpxVersion, setRuntimeCheerpxVersion] = useState<
+    string | null
+  >(() => detectCheerpxRuntimeVersion());
+  const [verifying, setVerifying] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const verifyCheerpxVersion = async () => {
+    setVerifying(true);
+    try {
+      await import('@leaningtech/cheerpx');
+      for (let i = 0; i < 20; i += 1) {
+        const detected = detectCheerpxRuntimeVersion();
+        if (detected) {
+          setRuntimeCheerpxVersion(detected);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    } finally {
+      setVerifying(false);
+    }
+  };
+  const resetWorkspace = async (includeDiskCache: boolean) => {
+    const message = includeDiskCache
+      ? 'Wipe BOTH the workspace and the cached Debian disk image, then reload? The disk will re-download (~30s slower next boot).'
+      : 'Wipe the in-browser workspace IndexedDB and reload? Your generated files will be lost.';
+    if (!window.confirm(message)) return;
+    setResetting(true);
+    try {
+      await hardResetSparkrunCaches({ includeDiskCache });
+      window.location.reload();
+    } catch (error) {
+      setResetting(false);
+      window.alert(
+        `Failed to reset caches: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
 
   const ready = props.cfg.projectName.trim().length > 0;
 
@@ -882,6 +926,66 @@ function SetupScreen(props: SetupScreenProps) {
             Detach
           </button>
         </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div className="field-label" style={{ marginBottom: 10 }}>
+          <Cpu size={13} aria-hidden="true" /> Diagnostics
+        </div>
+        <div className="diag-row">
+          <span className="diag-label">SparkRun build</span>
+          <span className="diag-value">
+            {SPARKRUN_BUILD_SHA} · {SPARKRUN_BUILD_TIME}
+          </span>
+        </div>
+        <div className="diag-row">
+          <span className="diag-label">CheerpX (pinned in package.json)</span>
+          <span className="diag-value">{CHEERPX_PINNED_VERSION}</span>
+        </div>
+        <div className="diag-row">
+          <span className="diag-label">CheerpX (loaded at runtime)</span>
+          <span className="diag-value">
+            {runtimeCheerpxVersion ?? 'not loaded yet'}
+          </span>
+        </div>
+        <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button
+            className="ghost-btn"
+            onClick={verifyCheerpxVersion}
+            type="button"
+            disabled={verifying || resetting}
+          >
+            {verifying ? 'Checking…' : 'Verify CheerpX version'}
+          </button>
+          <button
+            className="ghost-btn"
+            onClick={() => resetWorkspace(false)}
+            type="button"
+            disabled={resetting}
+          >
+            {resetting ? 'Resetting…' : 'Reset workspace'}
+          </button>
+          <button
+            className="ghost-btn"
+            onClick={() => resetWorkspace(true)}
+            type="button"
+            disabled={resetting}
+          >
+            {resetting ? 'Resetting…' : 'Reset everything'}
+          </button>
+        </div>
+        <p className="field-hint" style={{ marginTop: 10 }}>
+          Pinned is the version npm installed. Loaded is parsed from the actual{' '}
+          <code>cxrtnc.leaningtech.com/&lt;version&gt;/</code> URL the browser
+          fetched. Click Verify to fetch CheerpX and confirm — or boot the VM
+          and they'll match in the Logs.
+        </p>
+        <p className="field-hint" style={{ marginTop: 6 }}>
+          <strong>Reset workspace</strong> wipes the in-browser workspace
+          IndexedDB and reloads — fixes a half-mounted "Read-only file system"
+          state. <strong>Reset everything</strong> also wipes the cached Debian
+          disk image (slower next boot, but a true clean slate).
+        </p>
       </div>
 
       <div className="warn-strip">
@@ -2080,47 +2184,11 @@ export default function App() {
         await restoreProjectFiles(vm, activeProject);
       }
 
-      if (!vm.getTailnetIp()) {
-        appendEvent({
-          kind: 'status',
-          label: 'Connecting Tailscale',
-          text: 'Connecting Tailnet before the website server starts.',
-        });
-        try {
-          const loginUrl = await vm.connectTailnet({ timeoutMs: 20_000 });
-          if (loginUrl) {
-            window.open(loginUrl, '_blank', 'noopener,noreferrer');
-            appendEvent({
-              kind: 'status',
-              label: 'Connecting Tailscale',
-              text: 'Opened Tailscale login. Waiting for the VM Tailnet address.',
-            });
-            await vm.connectTailnet({ timeoutMs: 45_000 });
-          }
-          const stuckAtNoState =
-            !vm.getTailnetIp() &&
-            (vm.getHighestTailnetState() === null ||
-              (vm.getHighestTailnetState() ?? 0) <= 0);
-          appendEvent({
-            kind: vm.getTailnetIp() ? 'status' : 'error',
-            label: vm.getTailnetIp()
-              ? 'Tailnet ready'
-              : stuckAtNoState
-                ? 'Tailscale auth key rejected'
-                : 'Tailnet unavailable',
-            text: vm.getTailnetIp()
-              ? `Tailnet IP ready: ${vm.getTailnetIp()}.`
-              : stuckAtNoState
-                ? 'Your Tailscale auth key was almost certainly rejected (expired, single-use already consumed, or for a different tailnet). Generate a new reusable, ephemeral key in the Tailscale admin console (Settings → Keys) and paste it into setup.'
-                : 'No Tailnet IP is available yet. The generated files will be kept, and the server will wait for Tailnet before binding.',
-          });
-        } catch (error: unknown) {
-          appendEvent({
-            kind: 'error',
-            text: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
+      // Tailnet activation is deferred until after agent writes complete.
+      // On some machines, activating CheerpX's userspace Tailscale flips the
+      // workspace IDB mount to read-only, which would break every cp from
+      // the agent. We let writes finish on a clean (no-Tailnet) workspace,
+      // then startServer() activates Tailnet right before launching python.
 
       appendEvent({
         kind: 'status',

@@ -375,6 +375,27 @@ select {
   border-bottom-color: var(--accent-2);
 }
 
+.diag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 12.5px;
+  border-bottom: 1px solid color-mix(in oklab, var(--line) 50%, transparent);
+}
+.diag-row:last-of-type {
+  border-bottom: 0;
+}
+.diag-label {
+  color: var(--muted);
+}
+.diag-value {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 .model-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

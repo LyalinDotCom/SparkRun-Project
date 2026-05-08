@@ -22,6 +22,11 @@ vi.mock('./lib/webvm', () => ({
     if (!trimmed) return 'Google AI Studio API key is required.';
     return null;
   },
+  CHEERPX_PINNED_VERSION: '1.3.1',
+  SPARKRUN_BUILD_SHA: 'test',
+  SPARKRUN_BUILD_TIME: 'test',
+  detectCheerpxRuntimeVersion: () => null,
+  hardResetSparkrunCaches: vi.fn(async () => undefined),
 }));
 
 vi.mock('./lib/agent', () => ({

@@ -4,6 +4,7 @@ import {
   SERVER_PORT_RANGE_END,
   SITE_ROOT,
   WEBVM_DISK_URL,
+  WORKSPACE_ROOT,
 } from './constants';
 import {
   normalizeSitePath,
@@ -26,9 +27,6 @@ type CheerpXModule = {
   };
   OverlayDevice: {
     create(baseDevice: unknown, overlayDevice: unknown): Promise<unknown>;
-  };
-  WebDevice: {
-    create(path: string): Promise<unknown>;
   };
   DataDevice: {
     create(): Promise<DataDevice>;
@@ -125,7 +123,7 @@ function stageName(): string {
   return `stage-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
 }
 
-const SERVER_SCRIPT_PATH = '/workspace/.sparkrun_static_server.py';
+const SERVER_SCRIPT_PATH = `${WORKSPACE_ROOT}/.sparkrun_static_server.py`;
 const SERVER_SCRIPT = `
 import argparse
 import errno
@@ -136,11 +134,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 SITE_ROOT = "${SITE_ROOT}"
 BASE_PORT = ${SERVER_PORT}
 MAX_PORT = ${SERVER_PORT_RANGE_END}
-LOG_PATH = "/workspace/site/.server.log"
-PID_PATH = "/workspace/site/.server.pid"
-PORT_PATH = "/workspace/site/.server.port"
-HOST_PATH = "/workspace/site/.server.host"
-URL_PATH = "/workspace/site/.server.url"
+STATE_DIR = "/tmp/sparkrun"
+LOG_PATH = STATE_DIR + "/server.log"
+PID_PATH = STATE_DIR + "/server.pid"
+PORT_PATH = STATE_DIR + "/server.port"
+HOST_PATH = STATE_DIR + "/server.host"
+URL_PATH = STATE_DIR + "/server.url"
+os.makedirs(STATE_DIR, exist_ok=True)
 
 def write_log(message):
     with open(LOG_PATH, "a", encoding="utf-8") as log:
@@ -218,13 +218,22 @@ server.serve_forever()
 `.trimStart();
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
+const SERVER_STATE_DIR = '/tmp/sparkrun';
+const SERVER_LOG_PATH = `${SERVER_STATE_DIR}/server.log`;
+const SERVER_PORT_PATH = `${SERVER_STATE_DIR}/server.port`;
+const SERVER_PID_PATH = `${SERVER_STATE_DIR}/server.pid`;
+const SERVER_HOST_PATH = `${SERVER_STATE_DIR}/server.host`;
+const SERVER_URL_PATH = `${SERVER_STATE_DIR}/server.url`;
+const SERVER_LAUNCH_PID_PATH = `${SERVER_STATE_DIR}/server.launch.pid`;
+
 const SERVER_CLEANUP_COMMAND = [
-  'if [ -f /workspace/site/.server.pid ]; then kill "$(cat /workspace/site/.server.pid)" 2>/dev/null || true; fi',
-  'if [ -f /workspace/site/.server.launch.pid ]; then kill "$(cat /workspace/site/.server.launch.pid)" 2>/dev/null || true; fi',
+  `mkdir -p ${SERVER_STATE_DIR}`,
+  `if [ -f ${SERVER_PID_PATH} ]; then kill "$(cat ${SERVER_PID_PATH})" 2>/dev/null || true; fi`,
+  `if [ -f ${SERVER_LAUNCH_PID_PATH} ]; then kill "$(cat ${SERVER_LAUNCH_PID_PATH})" 2>/dev/null || true; fi`,
   "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill \"$pid\" 2>/dev/null || true; done",
   'sleep 0.2',
   "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill -9 \"$pid\" 2>/dev/null || true; done",
-  'rm -f /workspace/site/.server.pid /workspace/site/.server.port /workspace/site/.server.host /workspace/site/.server.url /workspace/site/.server.launch.pid',
+  `rm -f ${SERVER_PID_PATH} ${SERVER_PORT_PATH} ${SERVER_HOST_PATH} ${SERVER_URL_PATH} ${SERVER_LAUNCH_PID_PATH}`,
 ].join(' ; ');
 
 function formatPreviewUrl(ip: string | null, port: number | null): string | null {
@@ -241,6 +250,73 @@ function sleep(ms: number): Promise<void> {
 
 let globalErrorListenersInstalled = false;
 let lastWindowErrorSink: DebugCallback | null = null;
+
+declare const __CHEERPX_PINNED_VERSION__: string;
+declare const __SPARKRUN_BUILD_SHA__: string;
+declare const __SPARKRUN_BUILD_TIME__: string;
+
+export const CHEERPX_PINNED_VERSION: string =
+  typeof __CHEERPX_PINNED_VERSION__ === 'string'
+    ? __CHEERPX_PINNED_VERSION__
+    : 'unknown';
+
+export const SPARKRUN_BUILD_SHA: string =
+  typeof __SPARKRUN_BUILD_SHA__ === 'string' ? __SPARKRUN_BUILD_SHA__ : 'dev';
+
+export const SPARKRUN_BUILD_TIME: string =
+  typeof __SPARKRUN_BUILD_TIME__ === 'string'
+    ? __SPARKRUN_BUILD_TIME__
+    : 'dev';
+
+export const SPARKRUN_IDB_DATABASES = [
+  'sparkrun-workspace',
+  'sparkrun-root-cache',
+] as const;
+
+export async function hardResetSparkrunCaches(options: {
+  includeDiskCache?: boolean;
+} = {}): Promise<void> {
+  if (typeof indexedDB === 'undefined') {
+    throw new Error('IndexedDB is not available in this environment.');
+  }
+  const targets: string[] = ['sparkrun-workspace'];
+  if (options.includeDiskCache) {
+    targets.push('sparkrun-root-cache');
+  }
+  await Promise.all(
+    targets.map(
+      (name) =>
+        new Promise<void>((resolve, reject) => {
+          const request = indexedDB.deleteDatabase(name);
+          request.onsuccess = () => resolve();
+          request.onerror = () => reject(request.error);
+          request.onblocked = () => {
+            // Another tab still holds it open. Resolve anyway so caller can
+            // reload the page, which releases the connection.
+            resolve();
+          };
+        }),
+    ),
+  );
+}
+
+export function detectCheerpxRuntimeVersion(): string | null {
+  if (typeof performance === 'undefined' || !performance.getEntriesByType) {
+    return null;
+  }
+  const entries = performance.getEntriesByType('resource') as Array<{
+    name: string;
+  }>;
+  for (const entry of entries) {
+    const match = entry.name.match(
+      /cxrtnc\.leaningtech\.com\/(\d+\.\d+\.\d+)\//,
+    );
+    if (match) {
+      return match[1] ?? null;
+    }
+  }
+  return null;
+}
 
 const TAILSCALE_AUTH_KEY_PATTERN = /^tskey-(auth|client)-[A-Za-z0-9_-]+$/;
 
@@ -294,6 +370,7 @@ export class WebVmBackend implements VmFileBackend {
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
   private highestTailnetState: number | null = null;
+  workspaceCorrupt: boolean = false;
 
   private constructor(
     private readonly cx: CheerpXLinux,
@@ -340,10 +417,21 @@ export class WebVmBackend implements VmFileBackend {
     }
     lastWindowErrorSink = options.onDebug ?? null;
 
+    options.onDebug?.({
+      phase: 'sparkrun-build',
+      output: `SparkRun build sha=${SPARKRUN_BUILD_SHA} time=${SPARKRUN_BUILD_TIME}`,
+    });
+
     const imported = await import('@leaningtech/cheerpx');
     const CheerpX = (
       'default' in imported ? imported.default : imported
     ) as unknown as CheerpXModule;
+    options.onDebug?.({
+      phase: 'cheerpx-version',
+      output: `CheerpX pinned=${CHEERPX_PINNED_VERSION} runtime=${
+        detectCheerpxRuntimeVersion() ?? 'unknown (no resource entries yet)'
+      }`,
+    });
 
     let rootDevice: unknown;
     try {
@@ -390,7 +478,6 @@ export class WebVmBackend implements VmFileBackend {
     const overlayDevice = await CheerpX.OverlayDevice.create(rootDevice, rootCache);
     const workspaceDevice = await CheerpX.IDBDevice.create('sparkrun-workspace');
     const dataDevice = await CheerpX.DataDevice.create();
-    const webDevice = await CheerpX.WebDevice.create('');
 
     const trimmedAuthKey = options.tailscaleAuthKey?.trim() || undefined;
     const authKeyValidationError = trimmedAuthKey
@@ -473,9 +560,8 @@ export class WebVmBackend implements VmFileBackend {
     const cx = await CheerpX.Linux.create({
       mounts: [
         { type: 'ext2', dev: overlayDevice, path: '/' },
-        { type: 'dir', dev: workspaceDevice, path: '/workspace' },
+        { type: 'dir', dev: workspaceDevice, path: WORKSPACE_ROOT },
         { type: 'dir', dev: dataDevice, path: '/data' },
-        { type: 'dir', dev: webDevice, path: '/web' },
         { type: 'devs', path: '/dev' },
         { type: 'devpts', path: '/dev/pts' },
         { type: 'proc', path: '/proc' },
@@ -495,10 +581,15 @@ export class WebVmBackend implements VmFileBackend {
     );
     backend.attachConsole();
     await backend.prepareWorkspace();
+    const probe = await backend.probeWorkspaceWritable();
+    if (!probe.writable) {
+      backend.workspaceCorrupt = true;
+      backend.publishStatus('error', 'Workspace IndexedDB is corrupt');
+    }
     if (pendingTailnetIp) {
       backend.setTailnetIp(pendingTailnetIp);
     }
-    if (!backend.tailnetIp) {
+    if (!backend.tailnetIp && !backend.workspaceCorrupt) {
       backend.publishStatus('ready', 'VM ready');
     }
     return backend;
@@ -647,7 +738,7 @@ export class WebVmBackend implements VmFileBackend {
     const staged = stageName();
     await this.dataDevice.writeFile(`/${staged}`, content);
     const directory = destination.slice(0, destination.lastIndexOf('/')) || SITE_ROOT;
-    await this.execBash(
+    const result = await this.execBash(
       `mkdir -p ${shellQuote(directory)} && cp ${shellQuote(
         `/data/${staged}`,
       )} ${shellQuote(destination)}`,
@@ -655,6 +746,17 @@ export class WebVmBackend implements VmFileBackend {
       false,
       false,
     );
+    if (result.status !== 0) {
+      const message = `Failed to write ${destination}: ${
+        result.output || `cp exited with status ${result.status}`
+      }`;
+      this.publishDebug({
+        phase: 'write',
+        status: result.status,
+        output: message,
+      });
+      throw new Error(message);
+    }
   }
 
   async listDirectory(relativePath: string): Promise<DirectoryEntry[]> {
@@ -733,7 +835,7 @@ export class WebVmBackend implements VmFileBackend {
     }
 
     this.interactiveShellRunning = true;
-    this.onConsole?.('\n[vm] interactive shell started in /workspace/site\n');
+    this.onConsole?.(`\n[vm] interactive shell started in ${SITE_ROOT}\n`);
     this.publishDebug({
       phase: 'terminal',
       command: '/bin/bash -l',
@@ -808,6 +910,58 @@ export class WebVmBackend implements VmFileBackend {
       };
     }
 
+    if (this.commandRunnerTimedOut) {
+      this.publishDebug({
+        phase: 'server',
+        output:
+          'Clearing stale commandRunnerTimedOut flag from a prior hiccup; retrying.',
+      });
+      this.commandRunnerTimedOut = false;
+    }
+
+    // PHASE 1: All filesystem writes happen FIRST, before Tailnet activation.
+    // On some machines, activating CheerpX's userspace Tailscale flips the
+    // workspace IDB mount to read-only. So we stage everything beforehand.
+
+    await this.copyTextToVm(SERVER_SCRIPT_PATH, SERVER_SCRIPT, SITE_ROOT);
+    this.serverStarted = false;
+    this.serverLastExit = null;
+    this.serverPort = null;
+    this.publishStatus('booting', 'Staging server files before Tailnet activation');
+    this.publishDebug({
+      phase: 'server',
+      output: `Staging Python static server (writes happen before Tailnet activation)`,
+      background: true,
+    });
+
+    await this.execBash(SERVER_CLEANUP_COMMAND, SITE_ROOT, false, false);
+
+    const pythonCheck = await this.execBash(
+      'command -v python3',
+      SITE_ROOT,
+      false,
+      false,
+    );
+    if (pythonCheck.status === 124) {
+      const output = `Could not check for python3 — the command runner timed out. Try Retry, or boot a fresh VM.\n${pythonCheck.output}`;
+      this.publishDebug({
+        phase: 'server',
+        status: 124,
+        output,
+        background: true,
+      });
+      return { status: 124, output, background: true };
+    }
+    if (pythonCheck.status !== 0) {
+      return {
+        status: pythonCheck.status,
+        output: `python3 is not available in this WebVM image.\n${pythonCheck.output}`,
+        background: true,
+      };
+    }
+
+    // PHASE 2: Now activate Tailnet. After this point, /workspace may go
+    // read-only on some machines, but /tmp (rootCache overlay) stays writable.
     await this.prepareTailnetForServer();
     if (!this.tailnetIp) {
       const output =
@@ -828,42 +982,10 @@ export class WebVmBackend implements VmFileBackend {
       };
     }
 
-    await this.copyTextToVm(SERVER_SCRIPT_PATH, SERVER_SCRIPT, SITE_ROOT);
-    this.serverStarted = false;
-    this.serverLastExit = null;
-    this.serverPort = null;
-    this.publishStatus('booting', 'Starting VM web server');
-    this.publishDebug({
-      phase: 'server',
-      output: `Preparing Python static server with automatic host/port binding`,
-      background: true,
-    });
-
-    await this.execBash(
-      [
-        SERVER_CLEANUP_COMMAND,
-        'rm -f /workspace/site/.server.log /workspace/site/.server.port /workspace/site/.server.host /workspace/site/.server.url',
-      ].join(' && '),
-      SITE_ROOT,
-      false,
-      false,
-    );
-
-    const pythonCheck = await this.execBash(
-      'command -v python3',
-      SITE_ROOT,
-      false,
-      false,
-    );
-    if (pythonCheck.status !== 0) {
-      return {
-        status: pythonCheck.status,
-        output: `python3 is not available in this WebVM image.\n${pythonCheck.output}`,
-        background: true,
-      };
-    }
-
-    const command = `(nohup ${SERVER_COMMAND} > /workspace/site/.server.log 2>&1 &)`;
+    // PHASE 3: Launch. Output goes to /tmp/sparkrun/server.log on the
+    // rootCache overlay, NOT the workspace IDB, so the redirect works
+    // even if the workspace is now read-only.
+    const command = `mkdir -p ${SERVER_STATE_DIR} && (nohup ${SERVER_COMMAND} > ${SERVER_LOG_PATH} 2>&1 &)`;
     const launch = await this.execBash(command, SITE_ROOT, true, false);
     if (launch.status !== 0) {
       return launch;
@@ -879,7 +1001,13 @@ export class WebVmBackend implements VmFileBackend {
         }
       : {
           status: 1,
-          output: [`Server port was not written.`, log].filter(Boolean).join('\n'),
+          output: [
+            `Server port was not written.`,
+            log,
+            'Hint: this usually means the workspace mount is half-broken — the directory entry exists but writes inside it fail. Try Reset workspace and retry.',
+          ]
+            .filter(Boolean)
+            .join('\n'),
           background: true,
         };
     this.publishDebug({
@@ -931,12 +1059,85 @@ export class WebVmBackend implements VmFileBackend {
     }
   }
 
+  isWorkspaceCorrupt(): boolean {
+    return this.workspaceCorrupt;
+  }
+
+  async dumpMountDiagnostics(): Promise<void> {
+    const cmd = [
+      `echo '== /proc/mounts =='`,
+      `cat /proc/mounts 2>&1 || true`,
+      `echo '== ls -la / =='`,
+      `ls -la / 2>&1 || true`,
+      `echo '== ls -la ${WORKSPACE_ROOT} =='`,
+      `ls -la ${WORKSPACE_ROOT} 2>&1 || true`,
+      `echo '== ls -la ${SITE_ROOT} =='`,
+      `ls -la ${SITE_ROOT} 2>&1 || true`,
+      `echo '== stat ${WORKSPACE_ROOT} =='`,
+      `stat ${WORKSPACE_ROOT} 2>&1 || true`,
+      `echo '== stat ${SITE_ROOT} =='`,
+      `stat ${SITE_ROOT} 2>&1 || true`,
+    ].join(' ; ');
+    const result = await this.execBash(cmd, '/', false, false);
+    this.publishDebug({
+      phase: 'mount-diag',
+      output: result.output,
+    });
+  }
+
+  async probeWorkspaceWritable(): Promise<{
+    writable: boolean;
+    message: string;
+  }> {
+    const probePath = `${SITE_ROOT}/.sparkrun-write-probe`;
+    const stamp = `probe-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const probeCmd = [
+      `mkdir -p ${shellQuote(SITE_ROOT)}`,
+      `printf '%s' ${shellQuote(stamp)} > ${shellQuote(probePath)}`,
+      `cat ${shellQuote(probePath)}`,
+      `rm -f ${shellQuote(probePath)}`,
+    ].join(' && ');
+    const result = await this.execBash(probeCmd, SITE_ROOT, false, false);
+    if (result.status !== 0) {
+      const message = [
+        `Workspace at ${SITE_ROOT} is not writable.`,
+        `The probe failed with status ${result.status}:`,
+        result.output || '(no output)',
+        'This usually means the in-browser IndexedDB workspace is half-mounted — the directory entry exists but writes fail. Try the Reset workspace button, or wipe the sparkrun-workspace IndexedDB in DevTools → Application.',
+      ].join('\n');
+      this.publishDebug({
+        phase: 'workspace-probe',
+        status: 1,
+        output: message,
+      });
+      return { writable: false, message };
+    }
+    if (!result.output.includes(stamp)) {
+      const message = [
+        `Workspace at ${SITE_ROOT} accepted the write but did not return the expected content.`,
+        `Wrote stamp "${stamp}" but read back "${result.output}".`,
+        'The IndexedDB workspace is in a corrupt state. Try the Reset workspace button.',
+      ].join('\n');
+      this.publishDebug({
+        phase: 'workspace-probe',
+        status: 1,
+        output: message,
+      });
+      return { writable: false, message };
+    }
+    this.publishDebug({
+      phase: 'workspace-probe',
+      output: `Workspace ${SITE_ROOT} is writable (stamp round-tripped).`,
+    });
+    return { writable: true, message: 'ok' };
+  }
+
   private async waitForServerPort(timeoutMs: number): Promise<number | null> {
     const started = Date.now();
     let lastLogSize = 0;
     while (Date.now() - started < timeoutMs) {
       const result = await this.execBash(
-        'if [ -f /workspace/site/.server.port ]; then cat /workspace/site/.server.port; fi',
+        `if [ -f ${SERVER_PORT_PATH} ]; then cat ${SERVER_PORT_PATH}; fi`,
         SITE_ROOT,
         false,
         false,
@@ -950,7 +1151,7 @@ export class WebVmBackend implements VmFileBackend {
       }
 
       const sizeResult = await this.execBash(
-        "if [ -f /workspace/site/.server.log ]; then wc -c < /workspace/site/.server.log; else echo 0; fi",
+        `if [ -f ${SERVER_LOG_PATH} ]; then wc -c < ${SERVER_LOG_PATH}; else echo 0; fi`,
         SITE_ROOT,
         false,
         false,
@@ -960,7 +1161,7 @@ export class WebVmBackend implements VmFileBackend {
       const currentSize = Number(sizeResult.output.trim());
       if (Number.isFinite(currentSize) && currentSize > lastLogSize) {
         const tail = await this.execBash(
-          `tail -c +${lastLogSize + 1} /workspace/site/.server.log`,
+          `tail -c +${lastLogSize + 1} ${SERVER_LOG_PATH}`,
           SITE_ROOT,
           false,
           false,
@@ -984,7 +1185,7 @@ export class WebVmBackend implements VmFileBackend {
 
   private async readServerLog(lines: number): Promise<string> {
     const result = await this.execBash(
-      `if [ -f /workspace/site/.server.log ]; then tail -${lines} /workspace/site/.server.log; else echo "No server log found."; fi`,
+      `if [ -f ${SERVER_LOG_PATH} ]; then tail -${lines} ${SERVER_LOG_PATH}; else echo "No server log found."; fi`,
       SITE_ROOT,
       false,
       false,

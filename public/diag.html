@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CheerpX 1.3.1 Isolation Test</title>
+    <style>
+      body {
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          'Segoe UI',
+          Roboto,
+          Helvetica,
+          Arial,
+          sans-serif;
+        background: #0e0e10;
+        color: #e8e8ea;
+        margin: 0;
+        padding: 24px;
+        line-height: 1.5;
+      }
+      h1 {
+        font-size: 18px;
+        margin: 0 0 8px;
+      }
+      .lede {
+        color: #a8a8ad;
+        margin: 0 0 18px;
+        max-width: 720px;
+      }
+      button {
+        background: #f86b50;
+        color: #fff;
+        border: 0;
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-size: 13px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button:disabled {
+        background: #444;
+        cursor: not-allowed;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 28px 220px 1fr;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-size: 13px;
+        align-items: start;
+        border-bottom: 1px solid #232328;
+      }
+      .row pre {
+        margin: 0;
+        font-family:
+          'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+        font-size: 11.5px;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #b8b8be;
+      }
+      .pass {
+        color: #67d39c;
+      }
+      .fail {
+        color: #f86b50;
+      }
+      .pending {
+        color: #a8a8ad;
+      }
+      .meta {
+        font-family:
+          'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+        font-size: 11.5px;
+        color: #a8a8ad;
+        background: #18181b;
+        border: 1px solid #232328;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin: 16px 0;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>CheerpX 1.3.1 — isolation test</h1>
+    <p class="lede">
+      No agent. No Tailscale. No Gemini. Just CheerpX with one IDB device
+      mounted at <code>/test</code>. Click run and tell us what passes / fails
+      on each machine.
+    </p>
+    <button id="run">Run tests</button>
+    <button id="run-app">Run app-config tests</button>
+    <button id="run-ts">Run Tailscale-key tests</button>
+    <button id="run-race">Run race-condition test</button>
+    <button id="run-noweb">Run app-config WITHOUT WebDevice</button>
+    <button id="wipe">Wipe diag IDB</button>
+    <div style="margin-top: 10px">
+      <label for="ts-key" style="font-size: 12.5px; color: #a8a8ad">
+        Tailscale auth key (only used by "Run Tailscale-key tests"):
+      </label>
+      <input
+        id="ts-key"
+        type="password"
+        placeholder="tskey-auth-…"
+        style="
+          margin-top: 4px;
+          width: 420px;
+          background: #18181b;
+          border: 1px solid #232328;
+          border-radius: 6px;
+          color: #e8e8ea;
+          padding: 6px 8px;
+          font-family: 'JetBrains Mono', ui-monospace, monospace;
+          font-size: 12px;
+        "
+      />
+    </div>
+    <div class="meta" id="meta">Click "Run tests" to start.</div>
+    <div id="results"></div>
+
+    <script type="module">
+      const meta = document.getElementById('meta');
+      const results = document.getElementById('results');
+      const runBtn = document.getElementById('run');
+      const wipeBtn = document.getElementById('wipe');
+
+      const ua = navigator.userAgent;
+      const platform = navigator.platform;
+      const cores = navigator.hardwareConcurrency ?? 'unknown';
+      const dateStr = new Date().toISOString();
+      meta.textContent = `User-Agent: ${ua}\nPlatform: ${platform}\nCores: ${cores}\nNow: ${dateStr}`;
+
+      const tests = [];
+      function addRow(label) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML = `
+          <span class="pending" data-icon>·</span>
+          <strong>${label}</strong>
+          <pre data-detail></pre>`;
+        results.appendChild(row);
+        return {
+          pass: (detail) => {
+            row.querySelector('[data-icon]').textContent = '✓';
+            row.querySelector('[data-icon]').className = 'pass';
+            row.querySelector('[data-detail]').textContent = detail ?? '';
+          },
+          fail: (detail) => {
+            row.querySelector('[data-icon]').textContent = '✗';
+            row.querySelector('[data-icon]').className = 'fail';
+            row.querySelector('[data-detail]').textContent = detail ?? '';
+          },
+          run: (detail) => {
+            row.querySelector('[data-icon]').textContent = '…';
+            row.querySelector('[data-detail]').textContent = detail ?? '';
+          },
+        };
+      }
+
+      const errorBuffer = [];
+      window.addEventListener('error', (ev) => {
+        const msg = ev.error
+          ? `${ev.error.message}\n${ev.error.stack ?? ''}`
+          : `${ev.message} @ ${ev.filename}:${ev.lineno}:${ev.colno}`;
+        errorBuffer.push(`window.onerror: ${msg}`);
+      });
+      window.addEventListener('unhandledrejection', (ev) => {
+        const r = ev.reason;
+        const msg =
+          r instanceof Error ? `${r.message}\n${r.stack ?? ''}` : String(r);
+        errorBuffer.push(`unhandledrejection: ${msg}`);
+      });
+
+      wipeBtn.addEventListener('click', async () => {
+        wipeBtn.disabled = true;
+        await new Promise((resolve, reject) => {
+          const r = indexedDB.deleteDatabase('sparkrun-diag-cache');
+          r.onsuccess = () => resolve();
+          r.onerror = () => reject(r.error);
+          r.onblocked = () => resolve();
+        });
+        await new Promise((resolve, reject) => {
+          const r = indexedDB.deleteDatabase('sparkrun-diag-workspace');
+          r.onsuccess = () => resolve();
+          r.onerror = () => reject(r.error);
+          r.onblocked = () => resolve();
+        });
+        wipeBtn.disabled = false;
+        wipeBtn.textContent = 'Wiped — reload to start fresh';
+      });
+
+      const runNoWebBtn = document.getElementById('run-noweb');
+      runNoWebBtn.addEventListener('click', async () => {
+        runBtn.disabled = true;
+        runNoWebBtn.disabled = true;
+        wipeBtn.disabled = true;
+        results.innerHTML = '';
+        errorBuffer.length = 0;
+
+        const r1 = addRow('Import CheerpX');
+        const r2 = addRow('Create devices (NO WebDevice)');
+        const r3 = addRow(
+          'Linux.create with /workspace + networkInterface (no /web mount)',
+        );
+        const r4 = addRow('mkdir -p /workspace/site (probe)');
+        const r5 = addRow('cp /data/X to /workspace/site/index.html');
+        const r6 = addRow('cp /data/X to /workspace/.script.py (top-level)');
+        const r7 = addRow(
+          '(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &)',
+        );
+        const r8 = addRow('Read /workspace/site/log within 6s');
+        const r9 = addRow('Final ls -la /workspace/site');
+
+        let cx;
+        let captureBuf = '';
+        let runShell;
+
+        try {
+          r1.run('importing…');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          r1.pass('ok');
+
+          r2.run('creating…');
+          const rootDevice = await CheerpX.CloudDevice.create(
+            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+          );
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const overlayDevice = await CheerpX.OverlayDevice.create(
+            rootDevice,
+            rootCache,
+          );
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-noweb-ws');
+          const dataDevice = await CheerpX.DataDevice.create();
+          r2.pass('all devices created (WebDevice intentionally skipped)');
+
+          r3.run('mounting…');
+          const networkInterface = {
+            authKey: undefined,
+            loginUrlCb: () => {},
+            stateUpdateCb: () => {},
+            netmapUpdateCb: () => {},
+          };
+          cx = await CheerpX.Linux.create({
+            mounts: [
+              { type: 'ext2', dev: overlayDevice, path: '/' },
+              { type: 'dir', dev: wsDevice, path: '/workspace' },
+              { type: 'dir', dev: dataDevice, path: '/data' },
+              { type: 'devs', path: '/dev' },
+              { type: 'devpts', path: '/dev/pts' },
+              { type: 'proc', path: '/proc' },
+              { type: 'sys', path: '/sys' },
+            ],
+            networkInterface,
+          });
+          r3.pass('Linux.create returned');
+
+          cx.setCustomConsole(
+            (buf) => {
+              const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+              captureBuf += new TextDecoder().decode(bytes);
+            },
+            120,
+            40,
+          );
+
+          runShell = async (cmd, ms = 6000) => {
+            captureBuf = '';
+            const result = await Promise.race([
+              cx.run('/bin/bash', ['-lc', cmd], {
+                cwd: '/',
+                uid: 0,
+                gid: 0,
+                env: ['HOME=/root', 'TERM=xterm', 'USER=root', 'SHELL=/bin/bash'],
+              }),
+              new Promise((res) =>
+                setTimeout(() => res({ status: 124 }), ms),
+              ),
+            ]);
+            await new Promise((x) => setTimeout(x, 50));
+            return { status: result.status, output: captureBuf.trim() };
+          };
+
+          let r;
+          r = await runShell(
+            "mkdir -p /workspace/site && printf '%s' 'probe' > /workspace/site/.probe && cat /workspace/site/.probe && rm /workspace/site/.probe && echo OK",
+          );
+          ((r.status === 0 && r.output.includes('probe') && r.output.includes('OK')) ? r4.pass : r4.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          await dataDevice.writeFile('/site-html', '<h1>noweb</h1>');
+          r = await runShell(
+            "cp /data/site-html /workspace/site/index.html && cat /workspace/site/index.html",
+          );
+          ((r.status === 0 && r.output.includes('noweb')) ? r5.pass : r5.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          await dataDevice.writeFile(
+            '/script-py',
+            "open('/workspace/site/log','w').write('python wrote noweb\\n')\nimport time\ntime.sleep(10)\n",
+          );
+          r = await runShell(
+            "cp /data/script-py /workspace/.script.py && head -1 /workspace/.script.py && echo CP_OK",
+          );
+          ((r.status === 0 && r.output.includes('CP_OK')) ? r6.pass : r6.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &) ; echo LAUNCHED",
+          );
+          (r.status === 0 ? r7.pass : r7.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          let logFound = false;
+          let logRead = '';
+          for (let i = 0; i < 60; i++) {
+            const probe = await runShell(
+              'if [ -f /workspace/site/log ]; then cat /workspace/site/log; else echo MISSING; fi',
+            );
+            logRead = probe.output;
+            if (probe.output.includes('python wrote')) {
+              logFound = true;
+              break;
+            }
+            await new Promise((x) => setTimeout(x, 100));
+          }
+          (logFound ? r8.pass : r8.fail)(`final read: ${logRead}`);
+
+          r = await runShell('ls -la /workspace/site');
+          r9.pass(`status=${r.status}\n${r.output}`);
+        } catch (e) {
+          const failedRow = addRow('FATAL during no-web run');
+          failedRow.fail(e.stack ?? e.message ?? String(e));
+        } finally {
+          if (errorBuffer.length > 0) {
+            const errRow = addRow('Window-level errors captured');
+            errRow.fail(errorBuffer.slice(0, 5).join('\n\n'));
+          }
+          runBtn.disabled = false;
+          runNoWebBtn.disabled = false;
+          wipeBtn.disabled = false;
+        }
+      });
+
+      const runRaceBtn = document.getElementById('run-race');
+      runRaceBtn.addEventListener('click', async () => {
+        const key = (document.getElementById('ts-key').value || '').trim();
+        if (!key) {
+          alert('Paste a Tailscale auth key first.');
+          return;
+        }
+        runBtn.disabled = true;
+        runRaceBtn.disabled = true;
+        wipeBtn.disabled = true;
+        results.innerHTML = '';
+        errorBuffer.length = 0;
+
+        const t1 = addRow('Linux.create with real Tailscale key');
+        const t2 = addRow('IMMEDIATELY: mkdir -p /workspace/site (no wait)');
+        const t3 = addRow('IMMEDIATELY: find /workspace/site (no wait)');
+        const t4 = addRow('IMMEDIATELY: probe write /workspace/site (no wait)');
+        const t5 = addRow('IMMEDIATELY: cp /data/X /workspace/site/index.html');
+        const t6 = addRow('Wait for state=6');
+        const t7 = addRow('After state=6: probe write again');
+        const t8 = addRow('After state=6: cp /data/Y /workspace/site/style.css');
+        const t9 = addRow(
+          'After state=6: (nohup python3 ... > /workspace/site/log &)',
+        );
+        const t10 = addRow('After state=6: Read /workspace/site/log within 6s');
+        const t11 = addRow('Final ls /workspace/site');
+        const t12 = addRow('Tailscale state timeline');
+
+        let cx;
+        let captureBuf = '';
+        let runShell;
+
+        try {
+          t1.run('mounting…');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const rootDevice = await CheerpX.CloudDevice.create(
+            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+          );
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const overlayDevice = await CheerpX.OverlayDevice.create(
+            rootDevice,
+            rootCache,
+          );
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-race-ws');
+          const dataDevice = await CheerpX.DataDevice.create();
+          const webDevice = await CheerpX.WebDevice.create('');
+
+          const stateLog = [];
+          let resolveRunning;
+          const runningPromise = new Promise((res) => {
+            resolveRunning = res;
+          });
+          const startedAt = Date.now();
+          const networkInterface = {
+            authKey: key,
+            loginUrlCb: (url) =>
+              stateLog.push(`+${Date.now() - startedAt}ms loginUrl=${url}`),
+            stateUpdateCb: (s) => {
+              stateLog.push(`+${Date.now() - startedAt}ms state=${s}`);
+              if (s === 6) resolveRunning(true);
+            },
+            netmapUpdateCb: (m) => {
+              const ip = m?.self?.addresses?.[0] ?? null;
+              stateLog.push(`+${Date.now() - startedAt}ms netmap=${ip}`);
+            },
+          };
+
+          cx = await CheerpX.Linux.create({
+            mounts: [
+              { type: 'ext2', dev: overlayDevice, path: '/' },
+              { type: 'dir', dev: wsDevice, path: '/workspace' },
+              { type: 'dir', dev: dataDevice, path: '/data' },
+              { type: 'dir', dev: webDevice, path: '/web' },
+              { type: 'devs', path: '/dev' },
+              { type: 'devpts', path: '/dev/pts' },
+              { type: 'proc', path: '/proc' },
+              { type: 'sys', path: '/sys' },
+            ],
+            networkInterface,
+          });
+          if (typeof cx.networkLogin === 'function') {
+            cx.networkLogin().catch(() => {});
+          }
+          t1.pass(`Linux.create returned at +${Date.now() - startedAt}ms`);
+
+          cx.setCustomConsole(
+            (buf) => {
+              const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+              captureBuf += new TextDecoder().decode(bytes);
+            },
+            120,
+            40,
+          );
+
+          runShell = async (cmd, ms = 6000) => {
+            captureBuf = '';
+            const result = await Promise.race([
+              cx.run('/bin/bash', ['-lc', cmd], {
+                cwd: '/',
+                uid: 0,
+                gid: 0,
+                env: ['HOME=/root', 'TERM=xterm', 'USER=root', 'SHELL=/bin/bash'],
+              }),
+              new Promise((res) =>
+                setTimeout(() => res({ status: 124 }), ms),
+              ),
+            ]);
+            await new Promise((x) => setTimeout(x, 50));
+            return { status: result.status, output: captureBuf.trim() };
+          };
+
+          // Stage data files BEFORE shell ops, so cp targets exist
+          await dataDevice.writeFile('/race-html', '<h1>race</h1>');
+          await dataDevice.writeFile('/race-css', 'body{color:red}');
+          await dataDevice.writeFile(
+            '/race-py',
+            "open('/workspace/site/log','w').write('python wrote race\\n')\nimport time\ntime.sleep(10)\n",
+          );
+
+          // SLAM shell commands NOW, before Tailscale finishes
+          let r;
+          r = await runShell('mkdir -p /workspace/site && echo M_OK');
+          ((r.status === 0 && r.output.includes('M_OK')) ? t2.pass : t2.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "if [ -d /workspace/site ]; then find /workspace/site -mindepth 1 -maxdepth 1 -printf '%y %p\\n'; fi ; echo F_OK",
+          );
+          ((r.status === 0 && r.output.includes('F_OK')) ? t3.pass : t3.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "printf '%s' 'p1' > /workspace/site/.p1 && cat /workspace/site/.p1 && rm /workspace/site/.p1 && echo P_OK",
+          );
+          ((r.status === 0 && r.output.includes('p1') && r.output.includes('P_OK')) ? t4.pass : t4.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "cp /data/race-html /workspace/site/index.html && cat /workspace/site/index.html",
+          );
+          ((r.status === 0 && r.output.includes('race')) ? t5.pass : t5.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          // Now actually wait for Tailscale
+          const won = await Promise.race([
+            runningPromise,
+            new Promise((res) => setTimeout(() => res(false), 30_000)),
+          ]);
+          if (!won) {
+            t6.fail(
+              `state=6 not reached. Last: ${stateLog.slice(-3).join(' | ')}`,
+            );
+            throw new Error('Tailscale never reached Running');
+          }
+          t6.pass(
+            `state=6 at +${Date.now() - startedAt}ms. ${stateLog.length} events.`,
+          );
+
+          r = await runShell(
+            "printf '%s' 'p2' > /workspace/site/.p2 && cat /workspace/site/.p2 && rm /workspace/site/.p2 && echo P2_OK",
+          );
+          ((r.status === 0 && r.output.includes('p2') && r.output.includes('P2_OK')) ? t7.pass : t7.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "cp /data/race-css /workspace/site/style.css && cat /workspace/site/style.css",
+          );
+          ((r.status === 0 && r.output.includes('color')) ? t8.pass : t8.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          await runShell('cp /data/race-py /workspace/.script.py');
+          r = await runShell(
+            "(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &) ; echo LAUNCHED",
+          );
+          (r.status === 0 ? t9.pass : t9.fail)(
+            `at +${Date.now() - startedAt}ms status=${r.status}\n${r.output}`,
+          );
+
+          let logFound = false;
+          let logRead = '';
+          for (let i = 0; i < 60; i++) {
+            const probe = await runShell(
+              'if [ -f /workspace/site/log ]; then cat /workspace/site/log; else echo MISSING; fi',
+            );
+            logRead = probe.output;
+            if (probe.output.includes('python wrote')) {
+              logFound = true;
+              break;
+            }
+            await new Promise((x) => setTimeout(x, 100));
+          }
+          (logFound ? t10.pass : t10.fail)(`final read: ${logRead}`);
+
+          r = await runShell('ls -la /workspace/site');
+          t11.pass(`status=${r.status}\n${r.output}`);
+
+          t12.pass(stateLog.join('\n'));
+        } catch (e) {
+          const failedRow = addRow('FATAL during race run');
+          failedRow.fail(e.stack ?? e.message ?? String(e));
+        } finally {
+          if (errorBuffer.length > 0) {
+            const errRow = addRow('Window-level errors captured');
+            errRow.fail(errorBuffer.slice(0, 5).join('\n\n'));
+          }
+          runBtn.disabled = false;
+          runRaceBtn.disabled = false;
+          wipeBtn.disabled = false;
+        }
+      });
+
+      const runTsBtn = document.getElementById('run-ts');
+      runTsBtn.addEventListener('click', async () => {
+        const key = (document.getElementById('ts-key').value || '').trim();
+        if (!key) {
+          alert('Paste a Tailscale auth key first.');
+          return;
+        }
+        runBtn.disabled = true;
+        runTsBtn.disabled = true;
+        wipeBtn.disabled = true;
+        results.innerHTML = '';
+        errorBuffer.length = 0;
+
+        const t1 = addRow('Import CheerpX');
+        const t2 = addRow('Create devices');
+        const t3 = addRow(
+          'Linux.create with /workspace + networkInterface (REAL authKey)',
+        );
+        const t4 = addRow('Wait up to 30s for Tailscale state=6 (Running)');
+        const t5 = addRow('Probe writability AFTER Tailscale activation');
+        const t6 = addRow('cp /data/X to /workspace/site/index.html');
+        const t7 = addRow(
+          '(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &)',
+        );
+        const t8 = addRow('Read /workspace/site/log within 6s');
+        const t9 = addRow('Final ls /workspace/site');
+        const t10 = addRow('State + netmap timeline');
+
+        let cx;
+        let captureBuf = '';
+        let runShell;
+
+        try {
+          t1.run('importing…');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          t1.pass(`Named exports: ${Object.keys(CheerpX).join(', ')}`);
+
+          t2.run('creating…');
+          const rootDevice = await CheerpX.CloudDevice.create(
+            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+          );
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const overlayDevice = await CheerpX.OverlayDevice.create(
+            rootDevice,
+            rootCache,
+          );
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-ts-ws');
+          const dataDevice = await CheerpX.DataDevice.create();
+          const webDevice = await CheerpX.WebDevice.create('');
+          t2.pass('all devices created');
+
+          t3.run('mounting + activating Tailscale…');
+          const stateLog = [];
+          const netmapLog = [];
+          let tailnetIp = null;
+          let resolveRunning;
+          const runningPromise = new Promise((res) => {
+            resolveRunning = res;
+          });
+          const networkInterface = {
+            authKey: key,
+            loginUrlCb: (url) =>
+              stateLog.push(`@${Date.now()} loginUrl=${url}`),
+            stateUpdateCb: (s) => {
+              stateLog.push(`@${Date.now()} state=${s}`);
+              if (s === 6) resolveRunning(true);
+            },
+            netmapUpdateCb: (m) => {
+              const ip = m?.self?.addresses?.[0] ?? null;
+              netmapLog.push(`@${Date.now()} ip=${ip}`);
+              if (ip) tailnetIp = ip;
+            },
+          };
+          cx = await CheerpX.Linux.create({
+            mounts: [
+              { type: 'ext2', dev: overlayDevice, path: '/' },
+              { type: 'dir', dev: wsDevice, path: '/workspace' },
+              { type: 'dir', dev: dataDevice, path: '/data' },
+              { type: 'dir', dev: webDevice, path: '/web' },
+              { type: 'devs', path: '/dev' },
+              { type: 'devpts', path: '/dev/pts' },
+              { type: 'proc', path: '/proc' },
+              { type: 'sys', path: '/sys' },
+            ],
+            networkInterface,
+          });
+          t3.pass('Linux.create returned');
+
+          cx.setCustomConsole(
+            (buf) => {
+              const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+              captureBuf += new TextDecoder().decode(bytes);
+            },
+            120,
+            40,
+          );
+
+          runShell = async (cmd, ms = 6000) => {
+            captureBuf = '';
+            const result = await Promise.race([
+              cx.run('/bin/bash', ['-lc', cmd], {
+                cwd: '/',
+                uid: 0,
+                gid: 0,
+                env: ['HOME=/root', 'TERM=xterm', 'USER=root', 'SHELL=/bin/bash'],
+              }),
+              new Promise((res) =>
+                setTimeout(() => res({ status: 124 }), ms),
+              ),
+            ]);
+            await new Promise((x) => setTimeout(x, 50));
+            return { status: result.status, output: captureBuf.trim() };
+          };
+
+          // Trigger Tailscale login (some CheerpX builds require it)
+          if (typeof cx.networkLogin === 'function') {
+            try {
+              await Promise.race([
+                cx.networkLogin(),
+                new Promise((r) => setTimeout(r, 15_000)),
+              ]);
+            } catch (e) {
+              stateLog.push(`networkLogin threw: ${e?.message ?? e}`);
+            }
+          }
+
+          t4.run('waiting for state=6…');
+          const won = await Promise.race([
+            runningPromise,
+            new Promise((res) => setTimeout(() => res(false), 30_000)),
+          ]);
+          if (!won) {
+            t4.fail(
+              `state=6 not reached. Highest: ${stateLog.slice(-3).join(' | ')}`,
+            );
+            throw new Error('Tailscale never reached Running state');
+          }
+          t4.pass(
+            `Reached state=6. IP=${tailnetIp ?? 'unknown'}. Stages: ${stateLog.length}`,
+          );
+
+          // Now run the SAME tests as app-config, but AFTER tailscale is up
+          let r;
+          r = await runShell(
+            "mkdir -p /workspace/site && printf '%s' 'probe' > /workspace/site/.probe && cat /workspace/site/.probe && rm /workspace/site/.probe && echo OK",
+          );
+          ((r.status === 0 && r.output.includes('probe') && r.output.includes('OK')) ? t5.pass : t5.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          await dataDevice.writeFile('/site-html', '<h1>hello</h1>');
+          r = await runShell(
+            "cp /data/site-html /workspace/site/index.html && cat /workspace/site/index.html",
+          );
+          ((r.status === 0 && r.output.includes('hello')) ? t6.pass : t6.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          await dataDevice.writeFile(
+            '/script-py',
+            "import time\nimport sys\nopen('/workspace/site/log','w').write('python wrote here\\n')\nfor i in range(10):\n  time.sleep(1)\n",
+          );
+          await runShell('cp /data/script-py /workspace/.script.py');
+
+          r = await runShell(
+            "(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &) ; echo LAUNCHED",
+          );
+          (r.status === 0 ? t7.pass : t7.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          let logFound = false;
+          let logRead = '';
+          for (let i = 0; i < 60; i++) {
+            const probe = await runShell(
+              'if [ -f /workspace/site/log ]; then cat /workspace/site/log; else echo MISSING; fi',
+            );
+            logRead = probe.output;
+            if (probe.output.includes('python wrote')) {
+              logFound = true;
+              break;
+            }
+            await new Promise((x) => setTimeout(x, 100));
+          }
+          (logFound ? t8.pass : t8.fail)(`final read: ${logRead}`);
+
+          r = await runShell('ls -la /workspace/site');
+          t9.pass(`status=${r.status}\n${r.output}`);
+
+          t10.pass(
+            `STATE TIMELINE:\n${stateLog.join('\n')}\n\nNETMAP TIMELINE:\n${netmapLog.join('\n')}`,
+          );
+        } catch (e) {
+          const failedRow = addRow('FATAL during Tailscale run');
+          failedRow.fail(e.stack ?? e.message ?? String(e));
+        } finally {
+          if (errorBuffer.length > 0) {
+            const errRow = addRow('Window-level errors captured');
+            errRow.fail(errorBuffer.slice(0, 5).join('\n\n'));
+          }
+          runBtn.disabled = false;
+          runTsBtn.disabled = false;
+          wipeBtn.disabled = false;
+        }
+      });
+
+      const runAppBtn = document.getElementById('run-app');
+      runAppBtn.addEventListener('click', async () => {
+        runBtn.disabled = true;
+        runAppBtn.disabled = true;
+        wipeBtn.disabled = true;
+        results.innerHTML = '';
+
+        const a1 = addRow('Import CheerpX');
+        const a2 = addRow('Create devices (Cloud, IDBs, Overlay, Data, Web)');
+        const a3 = addRow(
+          'Linux.create with /workspace + /web + networkInterface (no authKey)',
+        );
+        const a4 = addRow('mkdir -p /workspace/site (probe writability)');
+        const a5 = addRow('cp /data/X to /workspace/site/index.html');
+        const a6 = addRow('cp /data/X to /workspace/.script.py (top-level)');
+        const a7 = addRow(
+          '(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &)',
+        );
+        const a8 = addRow('Read /workspace/site/log within 6s');
+        const a9 = addRow('Final ls -la /workspace/site');
+
+        let cx;
+        let captureBuf = '';
+        let runShell;
+
+        try {
+          a1.run('importing…');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          a1.pass(`Named exports: ${Object.keys(CheerpX).join(', ')}`);
+
+          a2.run('creating…');
+          const rootDevice = await CheerpX.CloudDevice.create(
+            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+          );
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const overlayDevice = await CheerpX.OverlayDevice.create(
+            rootDevice,
+            rootCache,
+          );
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-app-ws');
+          const dataDevice = await CheerpX.DataDevice.create();
+          const webDevice = await CheerpX.WebDevice.create('');
+          a2.pass('all devices created');
+
+          a3.run('mounting…');
+          const stateLog = [];
+          const netmapLog = [];
+          const networkInterface = {
+            authKey: undefined,
+            loginUrlCb: (url) => stateLog.push(`loginUrl ${url}`),
+            stateUpdateCb: (s) => stateLog.push(`state=${s}`),
+            netmapUpdateCb: (m) =>
+              netmapLog.push(JSON.stringify(m).slice(0, 100)),
+          };
+          cx = await CheerpX.Linux.create({
+            mounts: [
+              { type: 'ext2', dev: overlayDevice, path: '/' },
+              { type: 'dir', dev: wsDevice, path: '/workspace' },
+              { type: 'dir', dev: dataDevice, path: '/data' },
+              { type: 'dir', dev: webDevice, path: '/web' },
+              { type: 'devs', path: '/dev' },
+              { type: 'devpts', path: '/dev/pts' },
+              { type: 'proc', path: '/proc' },
+              { type: 'sys', path: '/sys' },
+            ],
+            networkInterface,
+          });
+          a3.pass(
+            `Linux.create returned. State: ${stateLog.join('|') || '(none)'} Netmap: ${netmapLog.length} updates`,
+          );
+
+          cx.setCustomConsole(
+            (buf) => {
+              const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+              captureBuf += new TextDecoder().decode(bytes);
+            },
+            120,
+            40,
+          );
+
+          runShell = async (cmd, ms = 5000) => {
+            captureBuf = '';
+            const result = await Promise.race([
+              cx.run('/bin/bash', ['-lc', cmd], {
+                cwd: '/',
+                uid: 0,
+                gid: 0,
+                env: ['HOME=/root', 'TERM=xterm', 'USER=root', 'SHELL=/bin/bash'],
+              }),
+              new Promise((res) =>
+                setTimeout(() => res({ status: 124 }), ms),
+              ),
+            ]);
+            await new Promise((x) => setTimeout(x, 50));
+            return { status: result.status, output: captureBuf.trim() };
+          };
+
+          let r;
+          r = await runShell(
+            "mkdir -p /workspace/site && printf '%s' 'probe' > /workspace/site/.probe && cat /workspace/site/.probe && rm /workspace/site/.probe && echo OK",
+          );
+          ((r.status === 0 && r.output.includes('probe') && r.output.includes('OK')) ? a4.pass : a4.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          // Stage data file via DataDevice and cp it
+          await dataDevice.writeFile('/site-html', '<h1>hello</h1>');
+          r = await runShell(
+            "cp /data/site-html /workspace/site/index.html && cat /workspace/site/index.html",
+          );
+          ((r.status === 0 && r.output.includes('hello')) ? a5.pass : a5.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          // Top-level py script (mirrors our /workspace/.sparkrun_static_server.py)
+          await dataDevice.writeFile(
+            '/script-py',
+            "import time\nimport sys\nopen('/workspace/site/log','w').write('python wrote here\\n')\nfor i in range(3):\n  time.sleep(1)\n",
+          );
+          r = await runShell(
+            "cp /data/script-py /workspace/.script.py && head -1 /workspace/.script.py",
+          );
+          ((r.status === 0 && r.output.includes('python')) ? a6.pass : a6.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          // The exact launch pattern from our server start
+          r = await runShell(
+            "(nohup python3 /workspace/.script.py > /workspace/site/log 2>&1 &) ; echo LAUNCHED",
+          );
+          (r.status === 0 ? a7.pass : a7.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          let logFound = false;
+          let logRead = '';
+          for (let i = 0; i < 60; i++) {
+            const probe = await runShell(
+              'if [ -f /workspace/site/log ]; then cat /workspace/site/log; else echo MISSING; fi',
+            );
+            logRead = probe.output;
+            if (probe.output.includes('python wrote')) {
+              logFound = true;
+              break;
+            }
+            await new Promise((x) => setTimeout(x, 100));
+          }
+          (logFound ? a8.pass : a8.fail)(`final read: ${logRead}`);
+
+          r = await runShell('ls -la /workspace/site');
+          a9.pass(`status=${r.status}\n${r.output}`);
+        } catch (e) {
+          const failedRow = addRow('FATAL during app-config run');
+          failedRow.fail(e.stack ?? e.message ?? String(e));
+        } finally {
+          if (errorBuffer.length > 0) {
+            const errRow = addRow('Window-level errors captured');
+            errRow.fail(errorBuffer.slice(0, 3).join('\n\n'));
+          }
+          runBtn.disabled = false;
+          runAppBtn.disabled = false;
+          wipeBtn.disabled = false;
+        }
+      });
+
+      runBtn.addEventListener('click', async () => {
+        runBtn.disabled = true;
+        wipeBtn.disabled = true;
+        results.innerHTML = '';
+
+        const t1 = addRow('Import CheerpX module');
+        const t2 = addRow('Create CloudDevice (disk)');
+        const t3 = addRow('Create IDB cache + overlay device');
+        const t4 = addRow('Create IDB workspace device');
+        const t5 = addRow('Linux.create() with /test mount');
+        const t6 = addRow('mkdir -p /test/sub');
+        const t7 = addRow('echo > /test/file1.txt (top level)');
+        const t8 = addRow('echo > /test/sub/file2.txt (subdir)');
+        const t9 = addRow('cat /test/file1.txt — content matches?');
+        const t10 = addRow('cat /test/sub/file2.txt — content matches?');
+        const t11 = addRow('ls /test — sees the entries?');
+        const t12 = addRow('ls /test/sub — sees the entries?');
+        const t13 = addRow('Append: echo >> /test/file1.txt');
+        const t14 = addRow('Foreground redirect: echo > /test/log.txt');
+        const t15 = addRow(
+          'Backgrounded redirect: (echo hello > /test/bg.txt &)',
+        );
+        const t16 = addRow('Read /test/bg.txt within 3s');
+        const t17 = addRow('python3 -c "open(...).write(...)"');
+        const t18 = addRow('cat python-written file');
+        const t19 = addRow('mount-diag dump');
+
+        let cx;
+        let runShell;
+        let captureBuf = '';
+
+        try {
+          t1.run('importing…');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const exported = Object.keys(CheerpX).join(', ');
+          t1.pass(`Named exports: ${exported}`);
+
+          t2.run('creating…');
+          let rootDevice;
+          try {
+            rootDevice = await CheerpX.CloudDevice.create(
+              'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+            );
+            t2.pass('ok');
+          } catch (e) {
+            t2.fail(`CloudDevice.create threw: ${e.message ?? e}`);
+            throw e;
+          }
+
+          t3.run('creating…');
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const overlayDevice = await CheerpX.OverlayDevice.create(
+            rootDevice,
+            rootCache,
+          );
+          t3.pass('ok');
+
+          t4.run('creating…');
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-workspace');
+          t4.pass('ok');
+
+          t5.run('creating…');
+          const dataDevice = await CheerpX.DataDevice.create();
+          cx = await CheerpX.Linux.create({
+            mounts: [
+              { type: 'ext2', dev: overlayDevice, path: '/' },
+              { type: 'dir', dev: wsDevice, path: '/test' },
+              { type: 'dir', dev: dataDevice, path: '/data' },
+              { type: 'devs', path: '/dev' },
+              { type: 'devpts', path: '/dev/pts' },
+              { type: 'proc', path: '/proc' },
+              { type: 'sys', path: '/sys' },
+            ],
+          });
+          t5.pass(
+            `Linux.create returned. Has run(): ${typeof cx.run === 'function'}`,
+          );
+
+          // Attach console to capture output
+          cx.setCustomConsole(
+            (buf) => {
+              const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+              captureBuf += new TextDecoder().decode(bytes);
+            },
+            120,
+            40,
+          );
+
+          runShell = async (cmd) => {
+            captureBuf = '';
+            const r = await cx.run('/bin/bash', ['-lc', cmd], {
+              cwd: '/',
+              uid: 0,
+              gid: 0,
+              env: ['HOME=/root', 'TERM=xterm', 'USER=root', 'SHELL=/bin/bash'],
+            });
+            // small wait for console flush
+            await new Promise((x) => setTimeout(x, 50));
+            return { status: r.status, output: captureBuf.trim() };
+          };
+
+          let r;
+          r = await runShell('mkdir -p /test/sub && echo OK');
+          (r.status === 0 ? t6.pass : t6.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell("echo 'hello-top' > /test/file1.txt && echo WROTE");
+          (r.status === 0 ? t7.pass : t7.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell("echo 'hello-sub' > /test/sub/file2.txt && echo WROTE");
+          (r.status === 0 ? t8.pass : t8.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell('cat /test/file1.txt');
+          ((r.status === 0 && r.output.includes('hello-top')) ? t9.pass : t9.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell('cat /test/sub/file2.txt');
+          ((r.status === 0 && r.output.includes('hello-sub')) ? t10.pass : t10.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell('ls -la /test');
+          ((r.status === 0 && r.output.includes('file1.txt') && r.output.includes('sub')) ? t11.pass : t11.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell('ls -la /test/sub');
+          ((r.status === 0 && r.output.includes('file2.txt')) ? t12.pass : t12.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell("echo 'append' >> /test/file1.txt && cat /test/file1.txt");
+          ((r.status === 0 && r.output.includes('append')) ? t13.pass : t13.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell("echo 'fg-log' > /test/log.txt && cat /test/log.txt");
+          ((r.status === 0 && r.output.includes('fg-log')) ? t14.pass : t14.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "(echo 'bg-content' > /test/bg.txt 2>&1 &) ; echo LAUNCHED",
+          );
+          (r.status === 0 ? t15.pass : t15.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          // wait up to 3s for bg.txt to appear
+          let bgFound = false;
+          let bgRead = '';
+          for (let i = 0; i < 30; i++) {
+            const probe = await runShell(
+              'if [ -f /test/bg.txt ]; then cat /test/bg.txt; else echo MISSING; fi',
+            );
+            if (probe.output.includes('bg-content')) {
+              bgFound = true;
+              bgRead = probe.output;
+              break;
+            }
+            bgRead = probe.output;
+            await new Promise((x) => setTimeout(x, 100));
+          }
+          (bgFound ? t16.pass : t16.fail)(
+            `final read after 3s polling: ${bgRead}`,
+          );
+
+          r = await runShell(
+            "python3 -c \"open('/test/py.txt','w').write('python-content')\" && echo OK",
+          );
+          (r.status === 0 ? t17.pass : t17.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell('cat /test/py.txt');
+          ((r.status === 0 && r.output.includes('python-content')) ? t18.pass : t18.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+
+          r = await runShell(
+            "echo '== /proc/mounts ==' ; cat /proc/mounts ; echo '== ls -la /test ==' ; ls -la /test ; echo '== ls -la /test/sub ==' ; ls -la /test/sub",
+          );
+          (r.status === 0 ? t19.pass : t19.fail)(
+            `status=${r.status}\n${r.output}`,
+          );
+        } catch (e) {
+          const failedRow = addRow('FATAL during run');
+          failedRow.fail(e.stack ?? e.message ?? String(e));
+        } finally {
+          if (errorBuffer.length > 0) {
+            const errRow = addRow('Window-level errors captured');
+            errRow.fail(errorBuffer.join('\n\n'));
+          }
+          runBtn.disabled = false;
+          wipeBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

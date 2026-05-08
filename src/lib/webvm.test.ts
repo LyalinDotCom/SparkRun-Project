@@ -98,11 +98,18 @@ vi.mock('@leaningtech/cheerpx', () => {
         }
       }
 
-      if (command.includes('cat /workspace/site/.server.pid')) {
+      if (command.includes('cat /tmp/sparkrun/server.pid')) {
         emitConsole('4242\n');
       }
 
-      if (command.includes('cat /workspace/site/.server.port')) {
+      const probeMatch = command.match(
+        /printf '%s' '([^']+)' > '\/workspace\/site\/\.sparkrun-write-probe'/,
+      );
+      if (probeMatch && command.includes("cat '/workspace/site/.sparkrun-write-probe'")) {
+        emitConsole(probeMatch[1]);
+      }
+
+      if (command.includes('cat /tmp/sparkrun/server.port')) {
         emitConsole(`${SERVER_PORT + 1}\n`);
       }
 
@@ -296,7 +303,7 @@ describe('WebVM backend setup', () => {
 
     const cleanupCommand =
       mockState.runCalls.find((call) =>
-        call.args[1]?.includes('rm -f /workspace/site/.server.pid'),
+        call.args[1]?.includes('rm -f /tmp/sparkrun/server.pid'),
       )?.args[1] ?? '';
     const serverLaunch = mockState.runCalls.find(
       (call) => call.args[1]?.includes(`nohup ${SERVER_COMMAND}`),
@@ -311,13 +318,13 @@ describe('WebVM backend setup', () => {
       background: true,
     });
     expect(serverLaunch?.args[1]).toContain(SERVER_COMMAND);
-    expect(cleanupCommand).toContain('/workspace/site/.server.pid');
-    expect(cleanupCommand).toContain('/workspace/site/.server.launch.pid');
+    expect(serverLaunch?.args[1]).toContain('/tmp/sparkrun/server.log');
+    expect(cleanupCommand).toContain('/tmp/sparkrun/server.pid');
+    expect(cleanupCommand).toContain('/tmp/sparkrun/server.launch.pid');
     expect(cleanupCommand).toContain('[.]sparkrun_static_server.py');
     expect(cleanupCommand).toContain('ps -eo pid,args');
     expect(cleanupCommand).toContain('kill -9');
     expect(cleanupCommand).not.toContain('pkill');
-    expect(cleanupCommand).not.toContain("pkill -f '/workspace/.sparkrun");
     expect(cleanupCommand).not.toContain('& &&');
     expect(stagedServerScript).toContain('Cross-Origin-Embedder-Policy');
     expect(stagedServerScript).toContain('cross-origin');
