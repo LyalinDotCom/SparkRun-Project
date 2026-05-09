@@ -905,7 +905,7 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   async startServer(): Promise<VmCommandResult> {
-    if (this.serverStarted && this.serverPort) {
+    if (this.serverPort) {
       return {
         status: 0,
         output: `Server is already running on port ${this.serverPort}.`,
@@ -1022,6 +1022,7 @@ export class WebVmBackend implements VmFileBackend {
       background: true,
     });
     if (port) {
+      this.serverStarted = true;
       this.publishStatus('booting', `VM web server started on port ${port}`);
     }
     return result;
