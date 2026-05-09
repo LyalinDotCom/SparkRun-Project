@@ -331,6 +331,39 @@ describe('WebVM backend setup', () => {
     expect(statuses).toContain('booting');
   });
 
+  it('does not kill an already started server on a second start request', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+
+    await backend.startServer();
+    const cleanupCallsAfterFirstStart = mockState.runCalls.filter((call) =>
+      call.args[1]?.includes('rm -f /tmp/sparkrun/server.pid'),
+    ).length;
+    const launchCallsAfterFirstStart = mockState.runCalls.filter((call) =>
+      call.args[1]?.includes(`nohup ${SERVER_COMMAND}`),
+    ).length;
+
+    const result = await backend.startServer();
+
+    expect(result).toMatchObject({
+      status: 0,
+      background: true,
+    });
+    expect(result.output).toContain(
+      `Server is already running on port ${SERVER_PORT + 1}`,
+    );
+    expect(
+      mockState.runCalls.filter((call) =>
+        call.args[1]?.includes('rm -f /tmp/sparkrun/server.pid'),
+      ).length,
+    ).toBe(cleanupCallsAfterFirstStart);
+    expect(
+      mockState.runCalls.filter((call) =>
+        call.args[1]?.includes(`nohup ${SERVER_COMMAND}`),
+      ).length,
+    ).toBe(launchCallsAfterFirstStart);
+  });
+
   it('opens manual Tailscale login and converts netmap IP to preview URL', async () => {
     const backend = await WebVmBackend.create({});
 
