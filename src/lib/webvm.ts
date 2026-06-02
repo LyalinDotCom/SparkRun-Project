@@ -1022,6 +1022,7 @@ export class WebVmBackend implements VmFileBackend {
       background: true,
     });
     if (port) {
+      this.serverStarted = true;
       this.publishStatus('booting', `VM web server started on port ${port}`);
     }
     return result;

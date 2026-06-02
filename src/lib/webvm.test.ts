@@ -331,6 +331,25 @@ describe('WebVM backend setup', () => {
     expect(statuses).toContain('booting');
   });
 
+  it('does not relaunch the VM web server before the health check runs', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+
+    await backend.startServer();
+    const runCallsAfterFirstStart = mockState.runCalls.length;
+
+    const secondStart = await backend.startServer();
+
+    expect(secondStart).toMatchObject({
+      status: 0,
+      background: true,
+    });
+    expect(secondStart.output).toBe(
+      `Server is already running on port ${SERVER_PORT + 1}.`,
+    );
+    expect(mockState.runCalls).toHaveLength(runCallsAfterFirstStart);
+  });
+
   it('opens manual Tailscale login and converts netmap IP to preview URL', async () => {
     const backend = await WebVmBackend.create({});
 
