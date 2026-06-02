@@ -109,7 +109,7 @@ const INITIAL_STATUS: WebVmStatus = {
 };
 
 const MODELS = [
-  { id: MODEL_ID, label: 'Flash preview', sub: 'Only model enabled' },
+  { id: MODEL_ID, label: '3.5 Flash', sub: 'Only model enabled' },
 ];
 
 function formatBuildTimeLocal(iso: string): string {

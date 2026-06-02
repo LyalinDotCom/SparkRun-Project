@@ -401,7 +401,7 @@ describe('SparkRun chat screen', () => {
     appMocks.runWebsiteAgent.mockImplementation(async (options) => {
       options.onEvent?.({
         type: 'model',
-        message: 'Calling gemini-3-flash-preview, turn 1',
+        message: `Calling ${MODEL_ID}, turn 1`,
       });
       options.onEvent?.({
         type: 'done',
