@@ -90,7 +90,18 @@ export async function ensureDirectoryWritePermission(
   if (current === 'granted') {
     return;
   }
-  const requested = await handle.requestPermission?.(descriptor);
+  // requestPermission() requires transient user activation. Called outside a
+  // user gesture (e.g. during the post-build sync on a handle restored from
+  // IndexedDB) it rejects with a SecurityError. Surface an actionable message
+  // instead of an opaque DOM error so the caller can prompt a re-attach.
+  let requested: PermissionState | undefined;
+  try {
+    requested = await handle.requestPermission?.(descriptor);
+  } catch {
+    throw new Error(
+      'Local folder write permission needs to be re-granted. Re-attach the source folder, then build again.',
+    );
+  }
   if (requested !== 'granted') {
     throw new Error('Local folder write permission was not granted.');
   }
@@ -120,22 +131,46 @@ export async function writeSourceFiles(
 ): Promise<number> {
   await ensureDirectoryWritePermission(root);
 
+  const failures: string[] = [];
+  let written = 0;
   for (const file of files) {
-    const segments = normalizeSourcePath(file.path);
-    const fileName = segments.at(-1);
-    if (!fileName) {
-      throw new Error('Source file path cannot be empty.');
-    }
+    try {
+      const segments = normalizeSourcePath(file.path);
+      const fileName = segments.at(-1);
+      if (!fileName) {
+        throw new Error('Source file path cannot be empty.');
+      }
 
-    let directory = root;
-    for (const segment of segments.slice(0, -1)) {
-      directory = await directory.getDirectoryHandle(segment, { create: true });
+      let directory = root;
+      for (const segment of segments.slice(0, -1)) {
+        directory = await directory.getDirectoryHandle(segment, { create: true });
+      }
+      const fileHandle = await directory.getFileHandle(fileName, { create: true });
+      const writable = await fileHandle.createWritable();
+      try {
+        await writable.write(file.content);
+        await writable.close();
+      } catch (error) {
+        // Release the open writable so it doesn't leave a locked .crswap temp
+        // file / hold a lock on the target on Chrome.
+        await writable.abort?.().catch(() => undefined);
+        throw error;
+      }
+      written += 1;
+    } catch (error) {
+      failures.push(
+        `${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    const fileHandle = await directory.getFileHandle(fileName, { create: true });
-    const writable = await fileHandle.createWritable();
-    await writable.write(file.content);
-    await writable.close();
   }
 
-  return files.length;
+  if (failures.length > 0) {
+    throw new Error(
+      `Failed to sync ${failures.length} of ${files.length} file${
+        files.length === 1 ? '' : 's'
+      } to the local folder: ${failures.join('; ')}`,
+    );
+  }
+
+  return written;
 }

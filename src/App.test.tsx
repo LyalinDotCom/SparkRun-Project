@@ -466,4 +466,59 @@ describe('SparkRun chat screen', () => {
     );
     await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(1));
   });
+
+  it('re-restores project files into the fresh VM on every rebuild', async () => {
+    window.localStorage.setItem(
+      'sparkrun.projects.v1',
+      JSON.stringify([
+        {
+          id: 'saved-project',
+          name: 'Black hole sim',
+          prompt: 'continue the black hole sim',
+          previewUrl: 'http://100.64.0.25:8080/',
+          updatedAt: new Date().toISOString(),
+          files: [{ path: 'index.html', content: '<h1>Old sim</h1>' }],
+        },
+      ]),
+    );
+    // Each build boots a brand-new VM whose workspace is wiped by resetWorkspace.
+    const backends: ReturnType<typeof fakeBackend>[] = [];
+    appMocks.createBackend.mockImplementation(async () => {
+      const backend = fakeBackend();
+      backends.push(backend);
+      return backend;
+    });
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Black hole sim' }),
+    );
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    gotoChat();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
+    await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(1));
+    await screen.findByText(/Site is live/i);
+
+    // Iterate: a second build wipes the workspace again. The restore must run
+    // again — before the fix, the "already restored" marker survived the wipe
+    // and the agent rebuilt against an empty workspace.
+    fireEvent.change(screen.getByLabelText(/Website brief/i), {
+      target: { value: 'add a starfield background' },
+    });
+    // After the first build hasStarted is true, so the composer button is "Update".
+    fireEvent.click(screen.getByRole('button', { name: /^Update$/i }));
+    await waitFor(() => expect(appMocks.runWebsiteAgent).toHaveBeenCalledTimes(2));
+
+    expect(backends).toHaveLength(2);
+    // The second VM received the restored file rather than booting empty.
+    await waitFor(() =>
+      expect(backends[1].writeText).toHaveBeenCalledWith(
+        'index.html',
+        expect.any(String),
+      ),
+    );
+  });
 });

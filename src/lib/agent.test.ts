@@ -145,6 +145,65 @@ describe('website agent loop', () => {
     expect(JSON.stringify(secondTurnContents)).toContain('cannot escape');
   });
 
+  it('keeps distinct same-name parallel tool calls when ids are missing', async () => {
+    const backend = new MemoryVmFileBackend();
+    const generateContent = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({
+          // No top-level functionCalls array (e.g. a non-stock adapter); two
+          // parallel write_file calls with no ids. Both must be kept, otherwise
+          // the function-response count won't match and the next turn rejects.
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    functionCall: {
+                      name: 'write_file',
+                      args: { file_path: 'index.html', content: '<h1>A</h1>' },
+                    },
+                  },
+                  {
+                    functionCall: {
+                      name: 'write_file',
+                      args: { file_path: 'about.html', content: '<h1>B</h1>' },
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        response({
+          text: 'Done.',
+          candidates: [
+            { content: { role: 'model', parts: [{ text: 'Done.' }] } },
+          ],
+        }),
+      );
+
+    const result = await runWebsiteAgent({
+      apiKey: 'test-key',
+      prompt: 'make two pages',
+      backend,
+      ai: { models: { generateContent } },
+    });
+
+    expect(result.changedFiles).toEqual(['about.html', 'index.html']);
+    expect(backend.snapshot()['index.html']).toContain('A');
+    expect(backend.snapshot()['about.html']).toContain('B');
+
+    const secondTurnContents = generateContent.mock.calls[1][0].contents;
+    const functionResponses = JSON.stringify(secondTurnContents).match(
+      /functionResponse/g,
+    );
+    expect(functionResponses).toHaveLength(2);
+  });
+
   it('requires a non-empty website prompt', async () => {
     await expect(
       runWebsiteAgent({

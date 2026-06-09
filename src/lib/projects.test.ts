@@ -46,4 +46,39 @@ describe('browser-cached projects', () => {
     window.localStorage.setItem('sparkrun.projects.v1', 'not-json');
     expect(loadProjects()).toEqual([]);
   });
+
+  it('does not clobber a project another tab persisted since this tab loaded', () => {
+    // This tab loaded an empty list.
+    const myList = upsertProject([], createProject('tab A project'));
+
+    // Another tab persists its own project directly to storage afterwards.
+    const otherTabProject = {
+      ...createProject('tab B project'),
+      id: 'tab-b',
+      name: 'Tab B',
+    };
+    window.localStorage.setItem(
+      'sparkrun.projects.v1',
+      JSON.stringify([otherTabProject, ...myList]),
+    );
+
+    // This tab saves again from its stale in-memory list.
+    const saved = upsertProject(myList, {
+      ...myList[0],
+      name: 'Tab A renamed',
+    });
+
+    const ids = saved.map((project) => project.id);
+    expect(ids).toContain('tab-b');
+    expect(loadProjects().map((project) => project.id)).toContain('tab-b');
+  });
+
+  it('only removes the targeted project when merging with storage', () => {
+    const a = upsertProject([], { ...createProject('a'), id: 'a' });
+    const list = upsertProject(a, { ...createProject('b'), id: 'b' });
+
+    const afterDelete = deleteProject(list, 'a');
+    expect(afterDelete.map((project) => project.id)).toEqual(['b']);
+    expect(loadProjects().map((project) => project.id)).toEqual(['b']);
+  });
 });

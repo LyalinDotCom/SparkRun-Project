@@ -12,7 +12,7 @@ export interface SavedProjectFile {
   content: string;
 }
 
-const PROJECTS_STORAGE_KEY = 'sparkrun.projects.v1';
+export const PROJECTS_STORAGE_KEY = 'sparkrun.projects.v1';
 
 function parseProjects(raw: string | null): SavedProject[] {
   if (!raw) {
@@ -77,6 +77,23 @@ export function createProject(prompt: string): SavedProject {
   };
 }
 
+// Merge the in-memory list with whatever is currently persisted. The list lives
+// under a single localStorage key, so a tab that wrote only its own in-memory
+// array would silently clobber projects that another tab created or updated
+// since this tab loaded. Merging by id (in-memory wins) preserves both.
+function mergeWithPersisted(projects: SavedProject[]): SavedProject[] {
+  const merged: SavedProject[] = [];
+  const seen = new Set<string>();
+  for (const project of [...projects, ...loadProjects()]) {
+    if (seen.has(project.id)) {
+      continue;
+    }
+    seen.add(project.id);
+    merged.push(project);
+  }
+  return merged;
+}
+
 export function upsertProject(
   projects: SavedProject[],
   project: SavedProject,
@@ -85,7 +102,10 @@ export function upsertProject(
     ...project,
     updatedAt: new Date().toISOString(),
   };
-  const next = [updated, ...projects.filter((item) => item.id !== project.id)];
+  const others = mergeWithPersisted(projects).filter(
+    (item) => item.id !== project.id,
+  );
+  const next = [updated, ...others];
   persistProjects(next);
   return next;
 }
@@ -94,7 +114,9 @@ export function deleteProject(
   projects: SavedProject[],
   projectId: string,
 ): SavedProject[] {
-  const next = projects.filter((project) => project.id !== projectId);
+  const next = mergeWithPersisted(projects).filter(
+    (project) => project.id !== projectId,
+  );
   persistProjects(next);
   return next;
 }

@@ -360,7 +360,7 @@ export class WebVmBackend implements VmFileBackend {
   private loginUrl: string | null = null;
   private serverPort: number | null = null;
   private serverStarted = false;
-  private serverRunPromise: Promise<{ status: number }> | null = null;
+  private startServerPromise: Promise<VmCommandResult> | null = null;
   private serverLastExit: VmCommandResult | null = null;
   private commandRunnerTimedOut = false;
   private consoleInput: ((charCode: number) => void) | null = null;
@@ -370,7 +370,6 @@ export class WebVmBackend implements VmFileBackend {
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
   private highestTailnetState: number | null = null;
-  workspaceCorrupt: boolean = false;
 
   private constructor(
     private readonly cx: CheerpXLinux,
@@ -548,6 +547,12 @@ export class WebVmBackend implements VmFileBackend {
         });
         if (!ip) {
           console.warn('[webvm] netmapUpdateCb received empty self.addresses', map);
+          // A transient empty netmap must not wipe an address we already have,
+          // which would regress status to "waiting for address" and null the
+          // preview URL while the server is still serving.
+          if (backend?.getTailnetIp()) {
+            return;
+          }
         }
         if (backend) {
           backend.setTailnetIp(ip);
@@ -592,7 +597,7 @@ export class WebVmBackend implements VmFileBackend {
     if (pendingTailnetIp) {
       backend.setTailnetIp(pendingTailnetIp);
     }
-    if (!backend.tailnetIp && !backend.workspaceCorrupt) {
+    if (!backend.tailnetIp) {
       backend.publishStatus('ready', 'VM ready');
     }
     return backend;
@@ -707,10 +712,15 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   async resetWorkspace(): Promise<void> {
+    // Reset is an explicit recovery action. Clear any stale timeout lockout
+    // first, otherwise every execBash below (server cleanup, rm -rf/mkdir)
+    // would short-circuit with status 124 and we'd publish "Workspace reset"
+    // while leaving SITE_ROOT missing and the backend still wedged.
+    this.commandRunnerTimedOut = false;
     await this.stopServer();
     await this.workspaceDevice.reset();
     this.serverStarted = false;
-    this.serverRunPromise = null;
+    this.startServerPromise = null;
     this.serverLastExit = null;
     this.serverPort = null;
     await this.prepareWorkspace();
@@ -808,8 +818,22 @@ export class WebVmBackend implements VmFileBackend {
       timeoutMs?: number;
     },
   ): Promise<VmCommandResult> {
-    if (command === SERVER_COMMAND || options.background) {
+    const normalized = command.trim().replace(/\s+/g, ' ');
+    if (normalized === SERVER_COMMAND) {
       return this.startServer();
+    }
+    if (options.background) {
+      // Generic background command: detach it inside the VM so it returns
+      // immediately instead of blocking the runner until the exec timeout.
+      // Only the static server command routes through startServer(); other
+      // background work must not hijack the server lifecycle.
+      return this.execBash(
+        `(nohup ${command} > /dev/null 2>&1 &) ; echo 'started in background'`,
+        options.cwd,
+        true,
+        false,
+        options.timeoutMs,
+      );
     }
     return this.execBash(
       command,
@@ -894,8 +918,11 @@ export class WebVmBackend implements VmFileBackend {
         background: false,
       };
     }
-    for (const char of input) {
-      this.consoleInput(char.charCodeAt(0));
+    // Send UTF-8 bytes, not UTF-16 code units. charCodeAt(0) would corrupt any
+    // non-ASCII character (accents, smart quotes, emoji) into a single >127
+    // value instead of its multi-byte UTF-8 sequence.
+    for (const byte of new TextEncoder().encode(input)) {
+      this.consoleInput(byte);
     }
     return {
       status: 0,
@@ -913,6 +940,24 @@ export class WebVmBackend implements VmFileBackend {
       };
     }
 
+    // In-flight guard: the early "already running" check only flips true after
+    // the whole multi-phase startup (staging, up-to-45s Tailnet connect, launch,
+    // port poll) completes. A second concurrent startServer() would otherwise
+    // pass that check and have its cleanup command kill the first launch
+    // mid-flight. Coalesce overlapping calls onto a single promise.
+    if (this.startServerPromise) {
+      return this.startServerPromise;
+    }
+    const startPromise = this.startServerInner();
+    this.startServerPromise = startPromise;
+    try {
+      return await startPromise;
+    } finally {
+      this.startServerPromise = null;
+    }
+  }
+
+  private async startServerInner(): Promise<VmCommandResult> {
     if (this.commandRunnerTimedOut) {
       this.publishDebug({
         phase: 'server',
@@ -1063,10 +1108,6 @@ export class WebVmBackend implements VmFileBackend {
     }
   }
 
-  isWorkspaceCorrupt(): boolean {
-    return this.workspaceCorrupt;
-  }
-
   async dumpMountDiagnostics(): Promise<void> {
     const cmd = [
       `echo '== /proc/mounts =='`,
@@ -1148,7 +1189,15 @@ export class WebVmBackend implements VmFileBackend {
         2_000,
         false,
       );
-      const port = Number(result.output.match(/\b\d{2,5}\b/)?.[0]);
+      // The port file contains only the port number on its own line. Match a
+      // line that is *entirely* a 2-5 digit number rather than the first digits
+      // anywhere in the capture, so stray output (e.g. from a concurrent
+      // interactive shell) can't be misread as the server port.
+      const portLine = result.output
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => /^\d{2,5}$/.test(line));
+      const port = Number(portLine);
       if (result.status === 0 && Number.isInteger(port) && port > 0) {
         this.serverPort = port;
         return port;
@@ -1212,7 +1261,7 @@ export class WebVmBackend implements VmFileBackend {
       10_000,
     );
     this.serverStarted = false;
-    this.serverRunPromise = null;
+    this.startServerPromise = null;
     this.serverLastExit = null;
     this.serverPort = null;
     this.publishStatus('ready', 'VM web server stopped');
@@ -1235,6 +1284,38 @@ export class WebVmBackend implements VmFileBackend {
       });
       return result;
     }
+
+    // A port file alone is not proof of life — the startup script only deletes
+    // it on (re)start, so it survives a server that has since crashed. Confirm
+    // the recorded PID is still alive; if not, clear the cached state so a
+    // subsequent startServer() can actually relaunch instead of short-circuiting
+    // forever on "already running".
+    const liveness = await this.execBash(
+      `if [ -f ${SERVER_PID_PATH} ] && kill -0 "$(cat ${SERVER_PID_PATH})" 2>/dev/null; then echo SPARKRUN_ALIVE; else echo SPARKRUN_DEAD; fi`,
+      SITE_ROOT,
+      false,
+      false,
+      3_000,
+    );
+    if (!liveness.output.includes('SPARKRUN_ALIVE')) {
+      this.serverStarted = false;
+      this.serverPort = null;
+      const log = await this.readServerLog(40);
+      const result: VmCommandResult = {
+        status: 1,
+        output: ['Server process is not running.', log].filter(Boolean).join('\n'),
+        background: false,
+      };
+      this.publishStatus('ready', 'VM web server is not running');
+      this.publishDebug({
+        phase: 'health',
+        status: result.status,
+        output: result.output,
+      });
+      return result;
+    }
+
+    this.serverPort = port;
     this.serverStarted = true;
     this.publishStatus('server-running', `VM web server listening on port ${port}`);
     const result: VmCommandResult = {

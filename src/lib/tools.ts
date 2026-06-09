@@ -182,7 +182,10 @@ function applyIndentedReplacement(
       .join('\n')
       .replace(/\n?$/, '\n');
     currentLines.splice(index, oldLines.length, replacement);
-    index += newLines.length;
+    // splice inserted a single joined replacement element at `index`; advance
+    // past it by one. Advancing by newLines.length would skip (and silently
+    // drop) occurrences that start within newLines.length - 1 lines below.
+    index += 1;
   }
 
   if (occurrences === 0) {
@@ -197,6 +200,22 @@ function applyIndentedReplacement(
 }
 
 function replaceContent(
+  current: string,
+  oldString: string,
+  newString: string,
+): { next: string; occurrences: number; strategy: 'exact' | 'flexible' } {
+  // Match on LF-normalized text for robustness, but if the original file used
+  // CRLF line endings, convert the result back so a single localized edit does
+  // not silently rewrite every line ending in the file.
+  const usesCrlf = current.includes('\r\n');
+  const result = replaceContentNormalized(current, oldString, newString);
+  if (usesCrlf && result.occurrences > 0) {
+    return { ...result, next: result.next.replace(/\n/g, '\r\n') };
+  }
+  return result;
+}
+
+function replaceContentNormalized(
   current: string,
   oldString: string,
   newString: string,
@@ -271,16 +290,11 @@ function readLineRange(
   return lines.slice(startIndex, endIndex).join('\n');
 }
 
+// Collapses whitespace for COMPARISON and DISPLAY only — never for execution.
+// Used to detect the server command regardless of incidental spacing and to
+// render a compact one-line label.
 function normalizeShellCommand(command: string): string {
   return command.trim().replace(/\s+/g, ' ');
-}
-
-function shellCommandForExecution(command: string): string {
-  const trimmed = command.trim();
-  if (/^python3 - <<'PY'\n[\s\S]*\nPY$/.test(trimmed)) {
-    return trimmed;
-  }
-  return normalizeShellCommand(command);
 }
 
 export async function executeToolCall(
@@ -401,11 +415,15 @@ export async function executeToolCall(
         const relativeCwd = normalizeSitePath(
           typeof call.args.dir_path === 'string' ? call.args.dir_path : '',
         );
+        // The command is run VERBATIM (only outer whitespace trimmed) so that
+        // heredocs, quoted strings, and embedded newlines survive intact.
+        // normalizedCommand is used solely for server detection and display.
         const normalizedCommand = normalizeShellCommand(command);
-        const commandToRun = shellCommandForExecution(command);
+        const commandToRun = command.trim();
+        const isServerCommand = normalizedCommand === SERVER_COMMAND;
         const result = await backend.runCommand(commandToRun, {
           cwd: toVmPath(relativeCwd),
-          background: normalizedCommand === SERVER_COMMAND,
+          background: isServerCommand || call.args.is_background === true,
         });
         if (result.status !== 0) {
           throw new Error(

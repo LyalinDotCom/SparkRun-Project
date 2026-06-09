@@ -31,6 +31,7 @@ import { runWebsiteAgent, type AgentEvent } from './lib/agent';
 import { MODEL_ID, SITE_ROOT } from './lib/constants';
 import {
   clearDirectoryHandle,
+  ensureDirectoryWritePermission,
   isLocalFolderSupported,
   loadSavedDirectoryHandle,
   pickSourceDirectory,
@@ -42,6 +43,7 @@ import {
   createProject,
   deleteProject,
   loadProjects,
+  PROJECTS_STORAGE_KEY,
   renameProject,
   upsertProject,
   type SavedProject,
@@ -258,8 +260,14 @@ function clearSavedKeys(): void {
   }
 }
 
+let lastEventId = 0;
+
 function makeId(): number {
-  return Date.now() + Math.floor(Math.random() * 1000);
+  // Strictly monotonic so event ids never collide, even for tool events that
+  // arrive within the same millisecond. Date.now() + random could repeat and
+  // produce duplicate React keys, which drops/misrenders timeline rows.
+  lastEventId = Math.max(lastEventId + 1, Date.now());
+  return lastEventId;
 }
 
 function isRetryPrompt(text: string): boolean {
@@ -1118,7 +1126,10 @@ function ChatScreen({
     } else {
       el.scrollTop = el.scrollHeight;
     }
-  }, [events.length, hasStarted]);
+    // Depend on the events array identity, not its length: once the list is
+    // capped at 200, length stays constant and a length-only dep would stop
+    // firing, freezing auto-scroll for the rest of the session.
+  }, [events, hasStarted]);
 
   const canSend = draft.trim().length > 3 && !building;
   const statusText = ready
@@ -1796,6 +1807,7 @@ export default function App() {
   const restoredProjectIdRef = useRef<string | null>(null);
   const tailnetReadyLoggedRef = useRef<string | null>(null);
   const buildAbortControllerRef = useRef<AbortController | null>(null);
+  const vmBootChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
   const previewUrl = useMemo(
     () => vmStatus.previewUrl ?? backend?.getPreviewUrl() ?? null,
@@ -1852,6 +1864,18 @@ export default function App() {
       }
     };
   }, [backend]);
+
+  // Keep the project list in sync when another tab writes to the shared
+  // localStorage key, so this tab doesn't keep clobbering it from a stale copy.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PROJECTS_STORAGE_KEY) {
+        setProjects(loadProjects());
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   const saveKeysIfRemembered = (
     nextApiKey = apiKey,
@@ -1919,7 +1943,10 @@ export default function App() {
       files: updates.files ?? activeProject.files,
     };
     setActiveProject(nextProject);
-    setProjects((current) => upsertProject(current, nextProject));
+    // upsertProject persists to localStorage; keep that side effect out of the
+    // setState updater (which React may invoke more than once) by computing the
+    // next list from the current state value here.
+    setProjects(upsertProject(projects, nextProject));
     return nextProject;
   };
 
@@ -2013,7 +2040,15 @@ export default function App() {
     });
   };
 
+  // Stop any in-flight build so it can't keep mutating shared state (backend,
+  // ready flag, saved project) after the user has navigated away from it.
+  const abortActiveBuild = () => {
+    buildAbortControllerRef.current?.abort();
+    buildAbortControllerRef.current = null;
+  };
+
   const newProject = () => {
+    abortActiveBuild();
     const project = createProject(DEFAULT_PROMPT);
     setActiveProject(project);
     setDraft(project.prompt);
@@ -2027,6 +2062,7 @@ export default function App() {
   };
 
   const selectProject = async (project: SavedProject) => {
+    abortActiveBuild();
     setActiveProject(project);
     setDraft(project.prompt);
     setFiles(entriesFromProjectFiles(project.files));
@@ -2040,8 +2076,9 @@ export default function App() {
   };
 
   const removeProject = (projectId: string) => {
-    setProjects((current) => deleteProject(current, projectId));
+    setProjects(deleteProject(projects, projectId));
     if (activeProject.id === projectId) {
+      abortActiveBuild();
       const project = createProject(DEFAULT_PROMPT);
       setActiveProject(project);
       setDraft(project.prompt);
@@ -2089,7 +2126,25 @@ export default function App() {
     }
   };
 
-  const bootVm = async (): Promise<WebVmBackend> => {
+  const bootVm = async (signal?: AbortSignal): Promise<WebVmBackend> => {
+    // Serialize VM boots. Stop+Build in quick succession can leave the previous
+    // (now aborted) build still inside WebVmBackend.create — which is not
+    // abortable — and two creates racing the same persistent workspace IndexedDB
+    // risks corruption. Wait for any prior boot's critical section to finish.
+    const priorBoot = vmBootChainRef.current;
+    let releaseBoot: () => void = () => undefined;
+    vmBootChainRef.current = new Promise<void>((resolve) => {
+      releaseBoot = resolve;
+    });
+    try {
+      await priorBoot.catch(() => undefined);
+      return await bootVmCritical(signal);
+    } finally {
+      releaseBoot();
+    }
+  };
+
+  const bootVmCritical = async (signal?: AbortSignal): Promise<WebVmBackend> => {
     if (backend) {
       appendEvent({
         kind: 'status',
@@ -2142,10 +2197,25 @@ export default function App() {
         },
       });
       await vm.resetWorkspace();
+      // The workspace was just wiped, so any previously restored project files
+      // are gone. Clear the marker so send() re-restores them into the clean VM
+      // instead of skipping the restore and building against an empty workspace.
+      restoredProjectIdRef.current = null;
+      if (signal?.aborted) {
+        // This build was stopped while the VM was booting. Don't commit it as
+        // the active backend (a newer build may already own one); tear it down.
+        await vm.stopServer().catch(() => undefined);
+        const abortError = new Error('Website generation was stopped.');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
       setBackend(vm);
       await loadFiles(vm);
       return vm;
     } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       setVmStatus({
         lifecycle: 'error',
@@ -2195,8 +2265,32 @@ export default function App() {
     }
     setDraft('');
 
+    const ensureNotAborted = () => {
+      if (abortController.signal.aborted) {
+        const abortError = new Error('Website generation was stopped.');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+    };
+
+    // Re-grant local-folder write permission now, while the Build click still
+    // provides the transient user activation that requestPermission() requires.
+    // Doing it later (during the post-build sync) on a handle restored from
+    // IndexedDB would fail with a SecurityError on every run after a reload.
+    if (sourceDirectory) {
+      try {
+        await ensureDirectoryWritePermission(sourceDirectory);
+      } catch (error) {
+        appendEvent({
+          kind: 'status',
+          label: 'Folder sync',
+          text: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     try {
-      const vm = await bootVm();
+      const vm = await bootVm(abortController.signal);
       if (
         activeProject.files.length > 0 &&
         restoredProjectIdRef.current !== activeProject.id
@@ -2236,6 +2330,12 @@ export default function App() {
           }
         },
       });
+
+      // Stop pressed during/after the agent run: bail before the server start,
+      // health checks, folder sync, and project save run — otherwise a build the
+      // user already stopped would flip to "live" and overwrite the saved
+      // project with its results.
+      ensureNotAborted();
 
       const startResult = await vm.startServer();
       if (startResult.status !== 0) {
@@ -2291,6 +2391,11 @@ export default function App() {
         await syncSourceToFolder(vm, sourceDirectory);
       }
 
+      // The health/preview phase has several long awaits (waitForPreviewUrl
+      // alone is up to 45s). If Stop was pressed during them, don't mark the
+      // build live or overwrite the saved project.
+      ensureNotAborted();
+
       const finalText = formatFinalSummary(
         result.finalText || agentFinalText || 'Website generation finished.',
         url,
@@ -2334,10 +2439,13 @@ export default function App() {
         text: error instanceof Error ? error.message : String(error),
       });
     } finally {
+      // Only clear state if this is still the current build. A stale build that
+      // was superseded (Stop then Build, or a project switch) must not turn off
+      // the building indicator for the newer build that now owns the ref.
       if (buildAbortControllerRef.current === abortController) {
         buildAbortControllerRef.current = null;
+        setBuilding(false);
       }
-      setBuilding(false);
     }
   };
 
@@ -2365,6 +2473,16 @@ export default function App() {
     setBuilding(true);
     setReady(false);
     setErrorMessage(null);
+    buildAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    buildAbortControllerRef.current = abortController;
+    const ensureNotAborted = () => {
+      if (abortController.signal.aborted) {
+        const abortError = new Error('Retry Tailnet was stopped.');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+    };
     try {
       appendEvent({
         kind: 'status',
@@ -2400,6 +2518,7 @@ export default function App() {
         text: `Tailnet IP ready: ${backend.getTailnetIp()}. Starting the VM web server.`,
       });
 
+      ensureNotAborted();
       const startResult = await backend.startServer();
       if (startResult.status !== 0) {
         appendEvent({
@@ -2444,6 +2563,7 @@ export default function App() {
           `Browser preview check exited with ${previewHealth.status}`,
       });
 
+      ensureNotAborted();
       await loadFiles(backend);
       const sourceFiles = await collectSourceFiles(backend);
       saveActiveProject({
@@ -2456,13 +2576,19 @@ export default function App() {
       });
       setReady(true);
     } catch (error) {
+      if (abortController.signal.aborted || isAbortError(error)) {
+        return;
+      }
       appendEvent({
         kind: 'error',
         label: 'Retry Tailnet',
         text: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      setBuilding(false);
+      if (buildAbortControllerRef.current === abortController) {
+        buildAbortControllerRef.current = null;
+        setBuilding(false);
+      }
     }
   };
 

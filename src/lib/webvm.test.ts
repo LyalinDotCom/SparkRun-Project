@@ -13,6 +13,7 @@ const mockState = vi.hoisted(() => ({
     | null,
   dataFiles: new Map<string, string | Uint8Array>(),
   emitEarlyIp: false,
+  serverAlive: true,
   networkInterface: null as {
     authKey?: string;
     loginUrlCb?: (url: string) => void;
@@ -98,7 +99,9 @@ vi.mock('@leaningtech/cheerpx', () => {
         }
       }
 
-      if (command.includes('cat /tmp/sparkrun/server.pid')) {
+      if (command.includes('kill -0')) {
+        emitConsole(mockState.serverAlive ? 'SPARKRUN_ALIVE\n' : 'SPARKRUN_DEAD\n');
+      } else if (command.includes('cat /tmp/sparkrun/server.pid')) {
         emitConsole('4242\n');
       }
 
@@ -193,6 +196,7 @@ describe('WebVM backend setup', () => {
     mockState.consoleCallback = null;
     mockState.dataFiles.clear();
     mockState.emitEarlyIp = false;
+    mockState.serverAlive = true;
     mockState.networkInterface = null;
     mockState.runCalls = [];
     mockState.workspaceFiles.clear();
@@ -290,6 +294,29 @@ describe('WebVM backend setup', () => {
       `internal: server process is listening on port ${SERVER_PORT + 1}`,
     );
     expect(result.output).not.toContain('tailnet:');
+  });
+
+  it('reports a dead server and clears cached state so it can be restarted', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+
+    await backend.startServer();
+    expect(backend.getServerPort()).toBe(SERVER_PORT + 1);
+
+    // The recorded PID is no longer alive (server crashed). checkServer must not
+    // trust the lingering port file.
+    mockState.serverAlive = false;
+    const dead = await backend.checkServer();
+    expect(dead.status).toBe(1);
+    expect(dead.output).toContain('Server process is not running.');
+    expect(backend.getServerPort()).toBeNull();
+
+    // Because the cached state was cleared, startServer no longer short-circuits
+    // on "already running" and actually relaunches.
+    mockState.serverAlive = true;
+    const restart = await backend.startServer();
+    expect(restart.status).toBe(0);
+    expect(restart.output).not.toContain('already running');
   });
 
   it('starts the real VM web server command without invalid shell composition', async () => {

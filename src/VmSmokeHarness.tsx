@@ -104,6 +104,7 @@ export default function VmSmokeHarness() {
   const [logs, setLogs] = useState<string[]>([]);
   const [tailKeySource, setTailKeySource] = useState('');
   const runIdRef = useRef(0);
+  const vmRef = useRef<WebVmBackend | null>(null);
   const logRef = useRef<HTMLPreElement | null>(null);
 
   const append = (message: string) => {
@@ -116,6 +117,14 @@ export default function VmSmokeHarness() {
     setState('running');
     setLogs([]);
     setStatus(null);
+
+    // Tear down any VM from a previous run so its background boot/Tailnet work
+    // and status callbacks stop competing with this run for the shared
+    // workspace and status pills.
+    if (vmRef.current) {
+      await vmRef.current.stopServer().catch(() => undefined);
+      vmRef.current = null;
+    }
 
     const tailKey = resolveTailKey();
     setTailKeySource(tailKey.source);
@@ -135,6 +144,9 @@ export default function VmSmokeHarness() {
       const vm = await WebVmBackend.create({
         tailscaleAuthKey: tailKey.value || undefined,
         onStatus: (next) => {
+          // Ignore callbacks from a superseded run so a stale VM can't overwrite
+          // the current run's status pills or interleave into its log.
+          if (runIdRef.current !== runId) return;
           setStatus(next);
           append(
             `status ${next.lifecycle}: ${next.message}${
@@ -143,6 +155,7 @@ export default function VmSmokeHarness() {
           );
         },
         onDebug: (entry) => {
+          if (runIdRef.current !== runId) return;
           const lines = [
             `${entry.phase}${entry.status !== undefined ? ` status=${entry.status}` : ''}`,
             entry.command ? `$ ${entry.command}` : '',
@@ -151,7 +164,11 @@ export default function VmSmokeHarness() {
           append(lines.join('\n'));
         },
       });
-      if (runIdRef.current !== runId) return;
+      if (runIdRef.current !== runId) {
+        await vm.stopServer().catch(() => undefined);
+        return;
+      }
+      vmRef.current = vm;
 
       append('Resetting /workspace/site');
       await vm.resetWorkspace();

@@ -222,4 +222,80 @@ describe('browser VM tool executor', () => {
       background: false,
     });
   });
+
+  it('runs multi-line commands verbatim without collapsing whitespace', async () => {
+    const backend = new MemoryVmFileBackend();
+
+    const heredoc = "cat > index.html <<'EOF'\n<h1>Hello</h1>\n<p>two  spaces</p>\nEOF";
+    const result = await executeToolCall(backend, {
+      name: 'run_shell_command',
+      args: { command: heredoc },
+    });
+
+    expect(result.error).toBeUndefined();
+    // Newlines and the double space inside the body must survive intact, or the
+    // heredoc terminator never matches and bash hangs.
+    expect(backend.commands.at(-1)?.command).toBe(heredoc);
+  });
+
+  it('honors is_background for arbitrary commands', async () => {
+    const backend = new MemoryVmFileBackend();
+
+    const result = await executeToolCall(backend, {
+      name: 'run_shell_command',
+      args: { command: 'sleep 60', is_background: true },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(backend.commands.at(-1)).toMatchObject({
+      command: 'sleep 60',
+      background: true,
+    });
+  });
+
+  it('replaces every flexible-match occurrence without skipping adjacent ones', async () => {
+    const backend = new MemoryVmFileBackend({
+      // Two back-to-back indented blocks. Before the index-advance fix, the
+      // matcher jumped ahead by newLines.length after a replacement and skipped
+      // the immediately following occurrence.
+      'script.js': ['  a();', '  b();', '  a();', '  b();'].join('\n'),
+    });
+
+    const result = await executeToolCall(backend, {
+      name: 'replace',
+      args: {
+        file_path: 'script.js',
+        old_string: ['a();', 'b();'].join('\n'),
+        new_string: ['a();', 'c();'].join('\n'),
+        allow_multiple: true,
+      },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.llmContent).toContain('flexible matching');
+    expect(result.llmContent).toContain('2 occurrences');
+    expect(await backend.readText('script.js')).toBe(
+      ['  a();', '  c();', '  a();', '  c();'].join('\n'),
+    );
+  });
+
+  it('preserves CRLF line endings on a localized exact replace', async () => {
+    const backend = new MemoryVmFileBackend({
+      'index.html': '<h1>Hi</h1>\r\n<p>old</p>\r\n<footer>x</footer>',
+    });
+
+    const result = await executeToolCall(backend, {
+      name: 'replace',
+      args: {
+        file_path: 'index.html',
+        old_string: '<p>old</p>',
+        new_string: '<p>new</p>',
+      },
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(await backend.readText('index.html')).toBe(
+      '<h1>Hi</h1>\r\n<p>new</p>\r\n<footer>x</footer>',
+    );
+  });
 });

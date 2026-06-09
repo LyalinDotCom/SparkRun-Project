@@ -67,4 +67,42 @@ describe('local source folder writer', () => {
     expect(assets?.files.get('site.css')).toBe('body { color: teal; }');
     expect(root.queryPermission).toHaveBeenCalledWith({ mode: 'readwrite' });
   });
+
+  it('aborts the writable and reports which files failed without aborting the rest', async () => {
+    const written = new Map<string, string>();
+    const abort = vi.fn(async () => undefined);
+    const root = {
+      queryPermission: vi.fn(async () => 'granted' as PermissionState),
+      requestPermission: vi.fn(async () => 'granted' as PermissionState),
+      getDirectoryHandle: vi.fn(),
+      getFileHandle: vi.fn(async (fileName: string) => ({
+        kind: 'file' as const,
+        name: fileName,
+        createWritable: async () => ({
+          write: async (content: string) => {
+            if (fileName === 'broken.html') {
+              throw new Error('disk full');
+            }
+            written.set(fileName, content);
+          },
+          close: async () => undefined,
+          abort,
+        }),
+      })),
+    };
+
+    await expect(
+      writeSourceFiles(root as unknown as FileSystemDirectoryHandle, [
+        { path: 'index.html', content: 'ok' },
+        { path: 'broken.html', content: 'boom' },
+        { path: 'about.html', content: 'also ok' },
+      ]),
+    ).rejects.toThrow(/Failed to sync 1 of 3 files.*broken\.html: disk full/);
+
+    // The failing write released its writable, and the surrounding files synced.
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(written.get('index.html')).toBe('ok');
+    expect(written.get('about.html')).toBe('also ok');
+    expect(written.has('broken.html')).toBe(false);
+  });
 });

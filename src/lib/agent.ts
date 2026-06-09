@@ -82,6 +82,23 @@ function responseContent(response: GenerateContentResponse): Content | undefined
 
 function extractFunctionCalls(response: GenerateContentResponse): ToolCall[] {
   const calls: ToolCall[] = [];
+  const seen = new Set<string>();
+  // Dedup across the SDK's `functionCalls` array and the raw content parts,
+  // which usually contain the same calls. Key on the id when present; when
+  // Gemini omits ids (common for parallel calls), fall back to name+args so two
+  // *distinct* parallel calls to the same tool are both kept — keying on name
+  // alone would silently drop the second and desync the function-response count.
+  const keyFor = (call: ToolCall): string =>
+    call.id ? `id:${call.id}` : `na:${call.name}:${JSON.stringify(call.args)}`;
+  const addCall = (call: ToolCall): void => {
+    const key = keyFor(call);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    calls.push(call);
+  };
+
   const directCalls = (response as { functionCalls?: unknown }).functionCalls;
   if (Array.isArray(directCalls)) {
     for (const call of directCalls) {
@@ -91,7 +108,7 @@ function extractFunctionCalls(response: GenerateContentResponse): ToolCall[] {
         'name' in call &&
         typeof call.name === 'string'
       ) {
-        calls.push({
+        addCall({
           id:
             'id' in call && typeof call.id === 'string' ? call.id : undefined,
           name: call.name,
@@ -123,9 +140,7 @@ function extractFunctionCalls(response: GenerateContentResponse): ToolCall[] {
         'id' in functionCall && typeof functionCall.id === 'string'
           ? functionCall.id
           : undefined;
-      if (!calls.some((call) => call.id === id && call.name === functionCall.name)) {
-        calls.push({ id, name: functionCall.name, args });
-      }
+      addCall({ id, name: functionCall.name, args });
     }
   }
 
