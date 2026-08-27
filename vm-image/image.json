@@ -7,7 +7,7 @@
   "distribution": "Debian GNU/Linux 13 (trixie)",
   "baseImage": "docker.io/library/debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
   "debianSnapshot": "20260827T000000Z",
-  "imageSizeMiB": 950,
+  "imageSizeMiB": 1600,
   "filesystem": "ext2 revision 0",
   "diskFile": "sparkrun-coding-2026.08.27-rc1.ext2",
   "notes": [
