@@ -1,0 +1,167 @@
+name: Build WebVM coding image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "vm-image/**"
+      - ".github/workflows/vm-image.yml"
+
+concurrency:
+  group: sparkrun-vm-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      disk_file: ${{ steps.metadata.outputs.disk_file }}
+      image_version: ${{ steps.metadata.outputs.image_version }}
+    steps:
+      - name: Check out the immutable recipe
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read and validate image metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '
+            .schemaVersion == 1 and
+            .status == "candidate" and
+            .architecture == "linux/386" and
+            (.imageSizeMiB >= 600 and .imageSizeMiB <= 1900) and
+            (.diskFile | endswith(".ext2"))
+          ' vm-image/image.json >/dev/null
+          echo "disk_file=$(jq -r .diskFile vm-image/image.json)" >> "$GITHUB_OUTPUT"
+          echo "image_version=$(jq -r .version vm-image/image.json)" >> "$GITHUB_OUTPUT"
+          echo "image_size_mib=$(jq -r .imageSizeMiB vm-image/image.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build pinned linux/386 toolchain container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/386 \
+            --file vm-image/Dockerfile \
+            --tag sparkrun-coding:${{ steps.metadata.outputs.image_version }} \
+            .
+
+      - name: Verify installed tools in the container
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vm-image-build
+          docker run --rm --platform linux/386 \
+            sparkrun-coding:${{ steps.metadata.outputs.image_version }} \
+            /usr/local/bin/sparkrun-toolchain-check --json --smoke \
+            | tee vm-image-build/toolchain.json
+          jq -e '.smokePassed == true and .architecture == "i686"' \
+            vm-image-build/toolchain.json >/dev/null
+
+      - name: Export the root filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id=$(docker create --platform linux/386 \
+            sparkrun-coding:${{ steps.metadata.outputs.image_version }})
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          mkdir -p vm-image-build/rootfs
+          docker export "$container_id" | tar -C vm-image-build/rootfs -xf -
+          docker rm "$container_id" >/dev/null
+          trap - EXIT
+
+          used_kib=$(du -sk vm-image-build/rootfs | awk '{print $1}')
+          capacity_kib=$(( ${{ steps.metadata.outputs.image_size_mib }} * 1024 ))
+          if (( used_kib > capacity_kib * 88 / 100 )); then
+            echo "Root filesystem uses ${used_kib} KiB; image capacity is ${capacity_kib} KiB." >&2
+            echo "Keep at least 12% free for package and runtime metadata." >&2
+            exit 1
+          fi
+
+      - name: Create and validate the CheerpX ext2 image
+        shell: bash
+        env:
+          DISK_FILE: ${{ steps.metadata.outputs.disk_file }}
+          IMAGE_SIZE_MIB: ${{ steps.metadata.outputs.image_size_mib }}
+        run: |
+          set -euo pipefail
+          disk_path="vm-image-build/${DISK_FILE}"
+          truncate -s "${IMAGE_SIZE_MIB}M" "$disk_path"
+          mkfs.ext2 -F -r 0 -b 4096 -L SPARKRUN \
+            -d vm-image-build/rootfs "$disk_path"
+          e2fsck -fn "$disk_path"
+          debugfs -R 'stat /usr/local/bin/sparkrun-toolchain-check' "$disk_path" \
+            | tee vm-image-build/ext2-check.txt
+          grep -q 'Type: regular' vm-image-build/ext2-check.txt
+          sha256sum "$disk_path" | tee vm-image-build/disk.sha256
+
+      - name: Build the immutable GitHubDevice site
+        shell: bash
+        env:
+          DISK_FILE: ${{ steps.metadata.outputs.disk_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p vm-image-site/images
+          disk_path="vm-image-build/${DISK_FILE}"
+          split "$disk_path" "vm-image-site/images/${DISK_FILE}.c" \
+            --suffix-length=6 \
+            --bytes=128K \
+            --hex-suffixes=0 \
+            --additional-suffix=.txt
+          stat --format=%s "$disk_path" > "vm-image-site/images/${DISK_FILE}.meta"
+          find vm-image-site/images -maxdepth 1 -type f -printf '%f\n' \
+            | sort > vm-image-site/images/index.list
+
+          disk_sha=$(cut -d' ' -f1 vm-image-build/disk.sha256)
+          jq \
+            --arg diskSha256 "$disk_sha" \
+            --arg sourceCommit "$GITHUB_SHA" \
+            --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --slurpfile toolchain vm-image-build/toolchain.json \
+            '. + {
+              diskSha256: $diskSha256,
+              sourceCommit: $sourceCommit,
+              publishedAt: $publishedAt,
+              toolchain: $toolchain[0]
+            }' vm-image/image.json > vm-image-site/manifest.json
+          cp vm-image-build/disk.sha256 vm-image-site/
+
+          cat > vm-image-site/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>SparkRun WebVM image</title>
+          <h1>SparkRun WebVM coding image</h1>
+          <p>This origin serves immutable CheerpX disk chunks. See
+          <a href="manifest.json">manifest.json</a> and the
+          <a href="https://github.com/LyalinDotCom/SparkRun-Project/tree/main/vm-image">reproducible recipe</a>.</p>
+          HTML
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload the image site
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: vm-image-site
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy immutable VM image chunks
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

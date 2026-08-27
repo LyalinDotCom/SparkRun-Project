@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Inventory and smoke-test the tools promised by the SparkRun VM image."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import pty
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+
+
+COMMANDS: dict[str, list[str]] = {
+    "bash": ["bash", "--version"],
+    "zsh": ["zsh", "--version"],
+    "git": ["git", "--version"],
+    "git-lfs": ["git-lfs", "version"],
+    "ssh": ["ssh", "-V"],
+    "curl": ["curl", "--version"],
+    "wget": ["wget", "--version"],
+    "dig": ["dig", "-v"],
+    "node": ["node", "--version"],
+    "npm": ["npm", "--version"],
+    "npx": ["npx", "--version"],
+    "pnpm": ["pnpm", "--version"],
+    "yarn": ["yarn", "--version"],
+    "python": ["python3", "--version"],
+    "pip": ["pip3", "--version"],
+    "go": ["go", "version"],
+    "gcc": ["gcc", "--version"],
+    "g++": ["g++", "--version"],
+    "make": ["make", "--version"],
+    "cmake": ["cmake", "--version"],
+    "ninja": ["ninja", "--version"],
+    "gdb": ["gdb", "--version"],
+    "sqlite": ["sqlite3", "--version"],
+    "jq": ["jq", "--version"],
+    "ripgrep": ["rg", "--version"],
+    "fd": ["fd", "--version"],
+    "tmux": ["tmux", "-V"],
+    "rsync": ["rsync", "--version"],
+    "socat": ["socat", "-V"],
+    "netcat": ["nc", "-h"],
+    "lsof": ["lsof", "-v"],
+}
+
+
+def run(command: list[str], *, cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=45,
+        check=False,
+        env={**os.environ, "LC_ALL": "C.UTF-8"},
+    )
+
+
+def inventory() -> tuple[dict[str, dict[str, object]], list[str]]:
+    result: dict[str, dict[str, object]] = {}
+    missing: list[str] = []
+    for name, command in COMMANDS.items():
+        executable = shutil.which(command[0])
+        if executable is None:
+            missing.append(name)
+            result[name] = {"available": False}
+            continue
+        completed = run(command)
+        first_line = completed.stdout.strip().splitlines()
+        result[name] = {
+            "available": True,
+            "executable": executable,
+            "status": completed.returncode,
+            "version": first_line[0] if first_line else "",
+        }
+    return result, missing
+
+
+def smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="sparkrun-toolchain-") as raw_directory:
+        directory = pathlib.Path(raw_directory)
+
+        node = run(["node", "-e", "console.log('node-ok')"], cwd=directory)
+        if node.returncode != 0 or "node-ok" not in node.stdout:
+            raise RuntimeError(f"Node smoke failed: {node.stdout}")
+
+        python = run(
+            ["python3", "-c", "import sqlite3; print(sqlite3.sqlite_version)"],
+            cwd=directory,
+        )
+        if python.returncode != 0:
+            raise RuntimeError(f"Python smoke failed: {python.stdout}")
+
+        c_source = directory / "hello.c"
+        c_source.write_text(
+            '#include <stdio.h>\nint main(void) { puts("c-ok"); return 0; }\n',
+            encoding="utf-8",
+        )
+        compile_c = run(["gcc", "hello.c", "-o", "hello-c"], cwd=directory)
+        execute_c = run([str(directory / "hello-c")], cwd=directory)
+        if compile_c.returncode != 0 or execute_c.stdout.strip() != "c-ok":
+            raise RuntimeError(f"C smoke failed: {compile_c.stdout}{execute_c.stdout}")
+
+        go_source = directory / "hello.go"
+        go_source.write_text(
+            'package main\nimport "fmt"\nfunc main() { fmt.Println("go-ok") }\n',
+            encoding="utf-8",
+        )
+        compile_go = run(["go", "build", "-o", "hello-go", "hello.go"], cwd=directory)
+        execute_go = run([str(directory / "hello-go")], cwd=directory)
+        if compile_go.returncode != 0 or execute_go.stdout.strip() != "go-ok":
+            raise RuntimeError(f"Go smoke failed: {compile_go.stdout}{execute_go.stdout}")
+
+        database = sqlite3.connect(directory / "smoke.sqlite")
+        database.execute("create table smoke (value text not null)")
+        database.execute("insert into smoke values ('sqlite-ok')")
+        value = database.execute("select value from smoke").fetchone()
+        database.close()
+        if value != ("sqlite-ok",):
+            raise RuntimeError("SQLite smoke failed")
+
+        master, slave = pty.openpty()
+        os.close(master)
+        os.close(slave)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true", help="print machine-readable inventory")
+    parser.add_argument("--smoke", action="store_true", help="compile and run representative programs")
+    args = parser.parse_args()
+
+    tools, missing = inventory()
+    if args.smoke:
+        smoke()
+
+    report = {
+        "schemaVersion": 1,
+        "architecture": os.uname().machine,
+        "tools": tools,
+        "smokePassed": bool(args.smoke),
+    }
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        for name, details in tools.items():
+            marker = "ok" if details["available"] else "missing"
+            print(f"{marker:7} {name:10} {details.get('version', '')}")
+
+    if missing:
+        print(f"Missing required tools: {', '.join(missing)}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
