@@ -63,7 +63,11 @@ jobs:
             sparkrun-coding:${{ steps.metadata.outputs.image_version }} \
             /usr/local/bin/sparkrun-toolchain-check --json --smoke \
             | tee vm-image-build/toolchain.json
-          jq -e '.smokePassed == true and .architecture == "i686"' \
+          jq -e '
+            .smokePassed == true and
+            .architecture == "i386" and
+            (.bashBinary | contains("Intel 80386"))
+          ' \
             vm-image-build/toolchain.json >/dev/null
 
       - name: Export the root filesystem

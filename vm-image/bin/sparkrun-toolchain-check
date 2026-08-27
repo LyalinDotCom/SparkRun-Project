@@ -140,9 +140,13 @@ def main() -> int:
     if args.smoke:
         smoke()
 
+    userspace_architecture = run(["dpkg", "--print-architecture"]).stdout.strip()
+    bash_binary = run(["file", "-b", "/bin/bash"]).stdout.strip()
     report = {
         "schemaVersion": 1,
-        "architecture": os.uname().machine,
+        "architecture": userspace_architecture,
+        "kernelArchitecture": os.uname().machine,
+        "bashBinary": bash_binary,
         "tools": tools,
         "smokePassed": bool(args.smoke),
     }
