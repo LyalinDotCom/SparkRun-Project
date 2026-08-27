@@ -1,5 +1,4 @@
 import { GoogleGenAI } from '@google/genai';
-import type { Content, GenerateContentResponse } from '@google/genai';
 import { MODEL_ID, SERVER_COMMAND, SITE_ROOT } from './constants';
 import { SHELL_TOOL_NAME, TOOL_DECLARATIONS } from './toolSchemas';
 import {
@@ -10,9 +9,35 @@ import {
 } from './tools';
 
 type GenAiLike = {
-  models: {
-    generateContent(params: unknown): Promise<GenerateContentResponse>;
+  interactions: {
+    create(
+      params: unknown,
+      options?: unknown,
+    ): Promise<InteractionResponse>;
   };
+};
+
+type InteractionStep = {
+  type?: string;
+  id?: string;
+  name?: string;
+  arguments?: Record<string, unknown>;
+};
+
+type InteractionResponse = {
+  id: string;
+  status?: string;
+  steps?: InteractionStep[];
+  output_text?: string;
+  errors?: unknown[];
+};
+
+type InteractionFunctionResult = {
+  type: 'function_result';
+  call_id: string;
+  name: string;
+  result: Array<{ type: 'text'; text: string }>;
+  is_error?: boolean;
 };
 
 export interface AgentEvent {
@@ -67,108 +92,44 @@ function emit(options: AgentRunOptions, event: AgentEvent): void {
   options.onEvent?.(event);
 }
 
-function responseText(response: GenerateContentResponse): string {
-  const maybeText = (response as { text?: unknown }).text;
-  return typeof maybeText === 'string' ? maybeText : '';
+function extractFunctionCalls(response: InteractionResponse): ToolCall[] {
+  return (response.steps ?? [])
+    .filter(
+      (step): step is Required<
+        Pick<InteractionStep, 'id' | 'name' | 'arguments'>
+      > &
+        InteractionStep =>
+        step.type === 'function_call' &&
+        typeof step.id === 'string' &&
+        typeof step.name === 'string' &&
+        !!step.arguments &&
+        typeof step.arguments === 'object',
+    )
+    .map((step) => ({
+      id: step.id,
+      name: step.name,
+      args: step.arguments,
+    }));
 }
 
-function responseContent(response: GenerateContentResponse): Content | undefined {
-  const candidate = response.candidates?.[0];
-  if (candidate?.content) {
-    return candidate.content;
-  }
-  const text = responseText(response);
-  if (text) {
-    return { role: 'model', parts: [{ text }] };
-  }
-  return undefined;
-}
-
-function extractFunctionCalls(response: GenerateContentResponse): ToolCall[] {
-  const calls: ToolCall[] = [];
-  const seen = new Set<string>();
-  // Dedup across the SDK's `functionCalls` array and the raw content parts,
-  // which usually contain the same calls. Key on the id when present; when
-  // Gemini omits ids (common for parallel calls), fall back to name+args so two
-  // *distinct* parallel calls to the same tool are both kept — keying on name
-  // alone would silently drop the second and desync the function-response count.
-  const keyFor = (call: ToolCall): string =>
-    call.id ? `id:${call.id}` : `na:${call.name}:${JSON.stringify(call.args)}`;
-  const addCall = (call: ToolCall): void => {
-    const key = keyFor(call);
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    calls.push(call);
-  };
-
-  const directCalls = (response as { functionCalls?: unknown }).functionCalls;
-  if (Array.isArray(directCalls)) {
-    for (const call of directCalls) {
-      if (
-        call &&
-        typeof call === 'object' &&
-        'name' in call &&
-        typeof call.name === 'string'
-      ) {
-        addCall({
-          id:
-            'id' in call && typeof call.id === 'string' ? call.id : undefined,
-          name: call.name,
-          args:
-            'args' in call && call.args && typeof call.args === 'object'
-              ? (call.args as Record<string, unknown>)
-              : {},
-        });
-      }
-    }
-  }
-
-  const parts = response.candidates?.[0]?.content?.parts ?? [];
-  for (const part of parts) {
-    const functionCall = (part as { functionCall?: unknown }).functionCall;
-    if (
-      functionCall &&
-      typeof functionCall === 'object' &&
-      'name' in functionCall &&
-      typeof functionCall.name === 'string'
-    ) {
-      const args =
-        'args' in functionCall &&
-        functionCall.args &&
-        typeof functionCall.args === 'object'
-          ? (functionCall.args as Record<string, unknown>)
-          : {};
-      const id =
-        'id' in functionCall && typeof functionCall.id === 'string'
-          ? functionCall.id
-          : undefined;
-      addCall({ id, name: functionCall.name, args });
-    }
-  }
-
-  return calls;
-}
-
-function buildToolResponseContent(
+function buildToolResult(
   call: ToolCall,
   result: ToolExecutionResult,
-): Content {
+): InteractionFunctionResult {
   return {
-    role: 'user',
-    parts: [
+    type: 'function_result',
+    call_id: call.id ?? `${call.name}-${crypto.randomUUID()}`,
+    name: call.name,
+    result: [
       {
-        functionResponse: {
-          name: call.name,
-          response: {
-            result: result.llmContent,
-            error: result.error ?? null,
-          },
-        },
+        type: 'text',
+        text: result.error
+          ? `Error: ${result.error}\n${result.llmContent}`
+          : result.llmContent,
       },
     ],
-  } as Content;
+    ...(result.error ? { is_error: true } : {}),
+  };
 }
 
 function shouldNudgeToFinish(turn: number, maxTurns: number): boolean {
@@ -272,27 +233,22 @@ async function withAbortableTurn<T>(
   }
 }
 
-async function generateModelResponse(
+async function createInteraction(
   ai: GenAiLike,
-  contents: Content[],
+  params: Record<string, unknown>,
   options: AgentRunOptions,
-): Promise<GenerateContentResponse> {
+): Promise<InteractionResponse> {
   for (let retry = 0; retry <= MODEL_REQUEST_MAX_RETRIES; retry++) {
     try {
       return await withAbortableTurn(
         (abortSignal) =>
-          ai.models.generateContent({
-            model: MODEL_ID,
-            contents,
-            config: {
-              systemInstruction: SYSTEM_PROMPT,
-              tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
-              temperature: 0.35,
-              abortSignal,
-              httpOptions: {
-                timeout: options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
-              },
-            },
+          ai.interactions.create(params, {
+            signal: abortSignal,
+            timeout: options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+            // Keep retry ownership here so every request follows SparkRun's
+            // visible, abortable eight-retry policy instead of stacking hidden
+            // SDK retries underneath it.
+            maxRetries: 0,
           }),
         options,
       );
@@ -321,6 +277,13 @@ async function generateModelResponse(
 
   throw new Error('Gemini request failed after retrying.');
 }
+
+const INTERACTION_TOOLS = TOOL_DECLARATIONS.map((tool) => ({
+  type: 'function' as const,
+  name: tool.name,
+  description: tool.description,
+  parameters: tool.parametersJsonSchema,
+}));
 
 function summarizeToolCall(call: ToolCall): string {
   const path =
@@ -361,54 +324,55 @@ export async function runWebsiteAgent(
       apiKey: options.apiKey,
     });
 
-  const contents: Content[] = [
-    {
-      role: 'user',
-      parts: [
-        {
-          text: `Build this website: ${prompt}`,
-        },
-      ],
-    },
-  ];
   const changedFiles = new Set<string>();
   const maxTurns = options.maxTurns ?? DEFAULT_AGENT_MAX_TURNS;
   let serverStartRequested = false;
+  let previousInteractionId: string | undefined;
+  let nextInput: string | InteractionFunctionResult[] =
+    `Build this website: ${prompt}`;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     throwIfAborted(options.abortSignal);
-    if (shouldNudgeToFinish(turn, maxTurns)) {
-      contents.push({
-        role: 'user',
-        parts: [
-          {
-            text:
-              'You are near the tool turn budget. If index.html and related assets are present and the server has been started, stop calling tools and return the final summary. Only call tools for a critical missing file or broken behavior.',
-          },
-        ],
-      });
-    }
 
     emit(options, {
       type: 'model',
       message: `Calling ${MODEL_ID}, turn ${turn}`,
     });
 
-    const response = await generateModelResponse(ai, contents, options);
+    const response = await createInteraction(
+      ai,
+      previousInteractionId
+        ? {
+            model: MODEL_ID,
+            previous_interaction_id: previousInteractionId,
+            input: nextInput,
+          }
+        : {
+            model: MODEL_ID,
+            input: nextInput,
+            system_instruction: SYSTEM_PROMPT,
+            generation_config: { temperature: 0.35 },
+            tools: INTERACTION_TOOLS,
+          },
+      options,
+    );
+    previousInteractionId = response.id;
 
-    const modelContent = responseContent(response);
-    if (modelContent) {
-      contents.push(modelContent);
+    if (response.status === 'failed') {
+      throw new Error(
+        `Gemini interaction failed: ${JSON.stringify(response.errors ?? [])}`,
+      );
     }
 
     const calls = extractFunctionCalls(response);
     if (calls.length === 0) {
-      const finalText = responseText(response) || 'Website generation finished.';
+      const finalText =
+        response.output_text?.trim() || 'Website generation finished.';
       emit(options, { type: 'done', message: finalText });
       return { finalText, changedFiles: Array.from(changedFiles).sort() };
     }
 
-    const functionResponses: Content[] = [];
+    const functionResults: InteractionFunctionResult[] = [];
     for (const call of calls) {
       throwIfAborted(options.abortSignal);
       const serverStartCall = isServerStartCall(call);
@@ -429,10 +393,9 @@ export async function runWebsiteAgent(
           ? `${call.name} failed: ${result.error}`
           : result.display,
       });
-      functionResponses.push(buildToolResponseContent(call, result));
+      functionResults.push(buildToolResult(call, result));
     }
-
-    contents.push(...functionResponses);
+    nextInput = functionResults;
 
     if (serverStartRequested && changedFiles.size > 0) {
       const finalText =
@@ -442,6 +405,14 @@ export async function runWebsiteAgent(
         finalText,
         changedFiles: Array.from(changedFiles).sort(),
       };
+    }
+
+    if (shouldNudgeToFinish(turn + 1, maxTurns)) {
+      emit(options, {
+        type: 'status',
+        message:
+          'Gemini is near the tool turn budget; serving the latest usable files if it does not finish soon.',
+      });
     }
 
   }

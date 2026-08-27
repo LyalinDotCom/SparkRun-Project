@@ -1,11 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { GenerateContentResponse } from '@google/genai';
 import { runWebsiteAgent } from './agent';
 import { MODEL_ID, SERVER_COMMAND } from './constants';
 import { MemoryVmFileBackend } from './tools';
 
-function response(value: unknown): GenerateContentResponse {
-  return value as GenerateContentResponse;
+type TestInteraction = {
+  id: string;
+  status: string;
+  steps?: Array<{
+    type: string;
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  }>;
+  output_text?: string;
+};
+
+function interaction(value: TestInteraction): TestInteraction {
+  return value;
 }
 
 describe('website agent loop', () => {
@@ -13,67 +24,29 @@ describe('website agent loop', () => {
     expect(MODEL_ID).toBe('gemini-3.7-flash');
 
     const backend = new MemoryVmFileBackend();
-    const generateContent = vi
+    const create = vi
       .fn()
       .mockResolvedValueOnce(
-        response({
-          candidates: [
+        interaction({
+          id: 'int-write',
+          status: 'requires_action',
+          steps: [
             {
-              content: {
-                role: 'model',
-                parts: [
-                  {
-                    functionCall: {
-                      id: 'write-index',
-                      name: 'write_file',
-                      args: {
-                        file_path: 'index.html',
-                        content:
-                          '<!doctype html><html><body><h1>Hello world</h1></body></html>',
-                      },
-                    },
-                  },
-                  {
-                    functionCall: {
-                      id: 'start-server',
-                      name: 'run_shell_command',
-                      args: {
-                        command: SERVER_COMMAND,
-                      },
-                    },
-                  },
-                ],
-              },
-            },
-          ],
-          functionCalls: [
-            {
+              type: 'function_call',
               id: 'write-index',
               name: 'write_file',
-              args: {
+              arguments: {
                 file_path: 'index.html',
                 content:
                   '<!doctype html><html><body><h1>Hello world</h1></body></html>',
               },
             },
             {
+              type: 'function_call',
               id: 'start-server',
               name: 'run_shell_command',
-              args: {
+              arguments: {
                 command: SERVER_COMMAND,
-              },
-            },
-          ],
-        }),
-      )
-      .mockResolvedValueOnce(
-        response({
-          text: 'Done.',
-          candidates: [
-            {
-              content: {
-                role: 'model',
-                parts: [{ text: 'Done.' }],
               },
             },
           ],
@@ -85,7 +58,7 @@ describe('website agent loop', () => {
       apiKey: 'test-key',
       prompt: 'make a hello world site',
       backend,
-      ai: { models: { generateContent } },
+      ai: { interactions: { create } },
       onEvent: (event) => events.push(`${event.type}:${event.message}`),
     });
 
@@ -101,37 +74,41 @@ describe('website agent loop', () => {
       events.some((event) => event.includes('Deferred server start')),
     ).toBe(true);
 
-    expect(generateContent).toHaveBeenCalledTimes(1);
-    for (const call of generateContent.mock.calls) {
+    expect(create).toHaveBeenCalledTimes(1);
+    for (const call of create.mock.calls) {
       expect(call[0].model).toBe(MODEL_ID);
+      expect(call[0].system_instruction).toContain('website-building agent');
+      expect(call[0].tools[0]).toMatchObject({
+        type: 'function',
+        name: 'read_file',
+      });
+      expect(call[1]).toMatchObject({ maxRetries: 0 });
     }
   });
 
   it('returns tool errors to the model so it can recover', async () => {
     const backend = new MemoryVmFileBackend();
-    const generateContent = vi
+    const create = vi
       .fn()
       .mockResolvedValueOnce(
-        response({
-          functionCalls: [
+        interaction({
+          id: 'int-read-error',
+          status: 'requires_action',
+          steps: [
             {
+              type: 'function_call',
+              id: 'read-outside',
               name: 'read_file',
-              args: { file_path: '../outside.txt' },
+              arguments: { file_path: '../outside.txt' },
             },
           ],
         }),
       )
       .mockResolvedValueOnce(
-        response({
-          text: 'Recovered.',
-          candidates: [
-            {
-              content: {
-                role: 'model',
-                parts: [{ text: 'Recovered.' }],
-              },
-            },
-          ],
+        interaction({
+          id: 'int-recovered',
+          status: 'completed',
+          output_text: 'Recovered.',
         }),
       );
 
@@ -139,17 +116,18 @@ describe('website agent loop', () => {
       apiKey: 'test-key',
       prompt: 'make a page',
       backend,
-      ai: { models: { generateContent } },
+      ai: { interactions: { create } },
     });
 
     expect(result.finalText).toBe('Recovered.');
-    const secondTurnContents = generateContent.mock.calls[1][0].contents;
-    expect(JSON.stringify(secondTurnContents)).toContain('functionResponse');
-    expect(JSON.stringify(secondTurnContents)).toContain('cannot escape');
+    const secondRequest = create.mock.calls[1][0];
+    expect(secondRequest.previous_interaction_id).toBe('int-read-error');
+    expect(JSON.stringify(secondRequest.input)).toContain('function_result');
+    expect(JSON.stringify(secondRequest.input)).toContain('cannot escape');
   });
 
   it('retries a transient Gemini 503 response', async () => {
-    const generateContent = vi
+    const create = vi
       .fn()
       .mockRejectedValueOnce(
         new Error(
@@ -158,16 +136,10 @@ describe('website agent loop', () => {
       )
       .mockRejectedValueOnce(new TypeError('Load failed'))
       .mockResolvedValueOnce(
-        response({
-          text: 'Recovered after retry.',
-          candidates: [
-            {
-              content: {
-                role: 'model',
-                parts: [{ text: 'Recovered after retry.' }],
-              },
-            },
-          ],
+        interaction({
+          id: 'int-retry-recovered',
+          status: 'completed',
+          output_text: 'Recovered after retry.',
         }),
       );
     const events: string[] = [];
@@ -176,12 +148,12 @@ describe('website agent loop', () => {
       apiKey: 'test-key',
       prompt: 'make a page',
       backend: new MemoryVmFileBackend(),
-      ai: { models: { generateContent } },
+      ai: { interactions: { create } },
       modelRetryBaseDelayMs: 0,
       onEvent: (event) => events.push(`${event.type}:${event.message}`),
     });
 
-    expect(generateContent).toHaveBeenCalledTimes(3);
+    expect(create).toHaveBeenCalledTimes(3);
     expect(result.finalText).toBe('Recovered after retry.');
     expect(events).toContainEqual(
       expect.stringContaining('status:Gemini is temporarily unavailable'),
@@ -192,59 +164,56 @@ describe('website agent loop', () => {
     const unavailable = new Error(
       '{"error":{"code":503,"message":"high demand","status":"UNAVAILABLE"}}',
     );
-    const generateContent = vi.fn().mockRejectedValue(unavailable);
+    const create = vi.fn().mockRejectedValue(unavailable);
 
     await expect(
       runWebsiteAgent({
         apiKey: 'test-key',
         prompt: 'make a page',
         backend: new MemoryVmFileBackend(),
-        ai: { models: { generateContent } },
+        ai: { interactions: { create } },
         modelRetryBaseDelayMs: 0,
       }),
     ).rejects.toThrow('high demand');
 
-    expect(generateContent).toHaveBeenCalledTimes(9);
+    expect(create).toHaveBeenCalledTimes(9);
   });
 
-  it('keeps distinct same-name parallel tool calls when ids are missing', async () => {
+  it('handles distinct same-name parallel function calls', async () => {
     const backend = new MemoryVmFileBackend();
-    const generateContent = vi
+    const create = vi
       .fn()
       .mockResolvedValueOnce(
-        response({
-          // No top-level functionCalls array (e.g. a non-stock adapter); two
-          // parallel write_file calls with no ids. Both must be kept, otherwise
-          // the function-response count won't match and the next turn rejects.
-          candidates: [
+        interaction({
+          id: 'int-parallel-writes',
+          status: 'requires_action',
+          steps: [
             {
-              content: {
-                role: 'model',
-                parts: [
-                  {
-                    functionCall: {
-                      name: 'write_file',
-                      args: { file_path: 'index.html', content: '<h1>A</h1>' },
-                    },
-                  },
-                  {
-                    functionCall: {
-                      name: 'write_file',
-                      args: { file_path: 'about.html', content: '<h1>B</h1>' },
-                    },
-                  },
-                ],
+              type: 'function_call',
+              id: 'write-a',
+              name: 'write_file',
+              arguments: {
+                file_path: 'index.html',
+                content: '<h1>A</h1>',
+              },
+            },
+            {
+              type: 'function_call',
+              id: 'write-b',
+              name: 'write_file',
+              arguments: {
+                file_path: 'about.html',
+                content: '<h1>B</h1>',
               },
             },
           ],
         }),
       )
       .mockResolvedValueOnce(
-        response({
-          text: 'Done.',
-          candidates: [
-            { content: { role: 'model', parts: [{ text: 'Done.' }] } },
-          ],
+        interaction({
+          id: 'int-parallel-done',
+          status: 'completed',
+          output_text: 'Done.',
         }),
       );
 
@@ -252,18 +221,21 @@ describe('website agent loop', () => {
       apiKey: 'test-key',
       prompt: 'make two pages',
       backend,
-      ai: { models: { generateContent } },
+      ai: { interactions: { create } },
     });
 
     expect(result.changedFiles).toEqual(['about.html', 'index.html']);
     expect(backend.snapshot()['index.html']).toContain('A');
     expect(backend.snapshot()['about.html']).toContain('B');
 
-    const secondTurnContents = generateContent.mock.calls[1][0].contents;
-    const functionResponses = JSON.stringify(secondTurnContents).match(
-      /functionResponse/g,
-    );
-    expect(functionResponses).toHaveLength(2);
+    const secondRequest = create.mock.calls[1][0];
+    expect(secondRequest.previous_interaction_id).toBe('int-parallel-writes');
+    expect(secondRequest.input).toHaveLength(2);
+    expect(
+      secondRequest.input.map(
+        (item: { call_id: string }) => item.call_id,
+      ),
+    ).toEqual(['write-a', 'write-b']);
   });
 
   it('requires a non-empty website prompt', async () => {
@@ -272,19 +244,24 @@ describe('website agent loop', () => {
         apiKey: 'test-key',
         prompt: '   ',
         backend: new MemoryVmFileBackend(),
-        ai: { models: { generateContent: vi.fn() } },
+        ai: { interactions: { create: vi.fn() } },
       }),
     ).rejects.toThrow('Describe the website');
   });
 
   it('uses a larger default turn budget and returns a usable result if the budget is reached after edits', async () => {
     const backend = new MemoryVmFileBackend();
-    const generateContent = vi.fn().mockImplementation(async () =>
-      response({
-        functionCalls: [
+    let interactionNumber = 0;
+    const create = vi.fn().mockImplementation(async () =>
+      interaction({
+        id: `int-budget-${++interactionNumber}`,
+        status: 'requires_action',
+        steps: [
           {
+            type: 'function_call',
+            id: `write-budget-${interactionNumber}`,
             name: 'write_file',
-            args: {
+            arguments: {
               file_path: 'index.html',
               content: '<h1>Still useful</h1>',
             },
@@ -297,10 +274,10 @@ describe('website agent loop', () => {
       apiKey: 'test-key',
       prompt: 'make a slow site',
       backend,
-      ai: { models: { generateContent } },
+      ai: { interactions: { create } },
     });
 
-    expect(generateContent).toHaveBeenCalledTimes(40);
+    expect(create).toHaveBeenCalledTimes(40);
     expect(result.reachedTurnBudget).toBe(true);
     expect(result.changedFiles).toEqual(['index.html']);
     expect(result.finalText).toContain('Serving the latest generated version');

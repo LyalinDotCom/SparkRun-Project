@@ -30,8 +30,10 @@ owns the entire build loop:
 2. SparkRun boots CheerpX with a Debian disk image, an IndexedDB-backed root
    cache, an IndexedDB-backed `/workspace`, and an in-memory `/data` staging
    device.
-3. Gemini is called through `@google/genai` with tool declarations for reading,
-   writing, replacing, listing, and running commands in `/workspace/site`.
+3. Gemini is called through the `@google/genai` Interactions API
+   (`ai.interactions.create`) with function tools for reading, writing,
+   replacing, listing, and running commands in `/workspace/site`. Tool results
+   continue the server-managed interaction with `previous_interaction_id`.
 4. File writes are staged through CheerpX's `DataDevice` and copied into the VM
    workspace.
 5. After generated files exist, SparkRun activates CheerpX's userspace
@@ -137,6 +139,9 @@ The active model is configured in `src/lib/constants.ts`:
 ```ts
 export const MODEL_ID = 'gemini-3.7-flash';
 ```
+
+The Google Gen AI JavaScript SDK is pinned in `package.json`. The agent uses
+the Interactions API rather than the older `generateContent` request flow.
 
 The CheerpX package is pinned in `package.json`. Do not change it to `latest`.
 The setup screen displays both the installed CheerpX version and the runtime
