@@ -10,12 +10,14 @@ ARG DEBIAN_SNAPSHOT=20260827T000000Z
 
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-# A dated Debian snapshot makes package resolution repeatable. The base image
-# remains independently digest-pinned above.
+# A dated Debian snapshot makes package resolution repeatable. The slim base
+# does not yet contain the CA bundle, so this bootstrap transport is HTTP; APT
+# still authenticates the signed Debian Release metadata and package hashes.
+# The installed image includes ca-certificates for every later HTTPS client.
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* && \
     printf '%s\n' \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie main" \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} trixie-security main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie main" \
+      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} trixie-security main" \
       > /etc/apt/sources.list && \
     printf '%s\n' \
       'Acquire::Check-Valid-Until "false";' \
