@@ -10,7 +10,10 @@ was learned the hard way during a long debugging session and hard-won fixes
 are encoded in the code — read this before touching `src/lib/webvm.ts` or
 the build/server flow in `src/App.tsx`.
 
-## The CheerpX 1.3.1 footguns we hit
+## CheerpX footguns first observed on 1.3.1
+
+The app is currently pinned to CheerpX 1.3.9. The mitigations below remain
+load-bearing unless a focused reproducer proves they are no longer needed.
 
 ### IDB workspace corruption — the "read-only file system" trap
 
@@ -42,7 +45,7 @@ Symptom: console floods with
 `TypeError: Cannot read properties of undefined (reading 'a1') at y8 (cx_esm.js:1:190555)`
 firing on every CheerpX network event.
 
-Cause: known noise from CheerpX 1.3.1's userspace network worker. **It is
+Cause: known noise first observed in CheerpX 1.3.1's userspace network worker. **It is
 benign.** Do not chase it.
 
 We capture it via a `window.addEventListener('error', ...)` in
@@ -89,6 +92,13 @@ flips the workspace IDB read-only, `/tmp` stays writable. Python's
 `serve_forever` doesn't write to `/workspace` during normal operation —
 just reads files for HTTP responses.
 
+CheerpX 1.3.9 may report success for the detached launch shell well before the
+Python child is scheduled. A real Chrome run observed roughly 27 seconds of
+startup latency, so `startServer()` waits up to 45 seconds for `server.port`.
+Do not shorten this to native-process timing. The command capture must also
+accept non-default virtual terminals because concurrent VM work can move later
+commands away from VT 1.
+
 App.tsx does NOT pre-connect Tailnet at the start of a build. Don't move
 `connectTailnet` earlier in the flow — that's a regression we already paid
 for once.
@@ -109,8 +119,9 @@ We removed a `WebDevice` mount at `/web` because nothing in the codebase used
 it and it was a frequent suspect during debugging. Don't add it back unless
 you actually need it.
 
-The disk image is `wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2`
-served by leaningtech. CheerpX runtime modules load from
+The disk image is
+`wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2`,
+matching the current official WebVM configuration. CheerpX runtime modules load from
 `https://cxrtnc.leaningtech.com/<version>/cx.esm.js` (the dot-named file —
 the underscore-named `cx_esm.js` is the Worker bundle, not the main API).
 
@@ -139,7 +150,7 @@ rm -rf dist && npm run build && firebase deploy --only hosting
 Always `rm -rf dist` before `npm run build` before `firebase deploy`. Skipping
 the rebuild will deploy whatever is in `dist/` from your last build, even if
 your code has moved on. (Yes, this happened. We chased ghosts for an hour
-because the live bundle was 1.3.2 while local was 1.3.1.)
+because the live bundle did not match the intended pinned version.)
 
 After deploy, **verify the live bundle**:
 
@@ -158,7 +169,7 @@ When a bug is intermittent or machine-specific, **don't ship hypothesis-based
 fixes**. Build an isolated reproducer first.
 
 We have one already: `public/diag.html` (deployed at `/diag.html`). It's a
-self-contained page that loads CheerpX 1.3.1 directly with no React, no
+self-contained page that loads the currently pinned CheerpX version directly with no React, no
 agent, no Tailscale (or with a real authKey if you paste one). Five buttons:
 
 - **Run tests** — basic mount, write, read, ls, append, redirect, bg, python3

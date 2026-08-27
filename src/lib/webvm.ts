@@ -109,6 +109,7 @@ export interface ConnectTailnetOptions {
 type ActiveCapture = {
   output: string;
   streamToConsole: boolean;
+  vt?: number;
 };
 
 function shellQuote(value: string): string {
@@ -217,7 +218,8 @@ write_log(f"SparkRun Python server listening on {bound_host}:{bound_port}")
 server.serve_forever()
 `.trimStart();
 
-const DEFAULT_COMMAND_TIMEOUT_MS = 15_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const BOOTSTRAP_COMMAND_TIMEOUT_MS = 60_000;
 const SERVER_STATE_DIR = '/tmp/sparkrun';
 const SERVER_LOG_PATH = `${SERVER_STATE_DIR}/server.log`;
 const SERVER_PORT_PATH = `${SERVER_STATE_DIR}/server.port`;
@@ -233,7 +235,7 @@ const SERVER_CLEANUP_COMMAND = [
   "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill \"$pid\" 2>/dev/null || true; done",
   'sleep 0.2',
   "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill -9 \"$pid\" 2>/dev/null || true; done",
-  `rm -f ${SERVER_PID_PATH} ${SERVER_PORT_PATH} ${SERVER_HOST_PATH} ${SERVER_URL_PATH} ${SERVER_LAUNCH_PID_PATH}`,
+  `rm -f ${SERVER_PID_PATH} ${SERVER_PORT_PATH} ${SERVER_HOST_PATH} ${SERVER_URL_PATH} ${SERVER_LAUNCH_PID_PATH} ${SERVER_LOG_PATH}`,
 ].join(' ; ');
 
 function formatPreviewUrl(ip: string | null, port: number | null): string | null {
@@ -268,9 +270,14 @@ export const SPARKRUN_BUILD_TIME: string =
     ? __SPARKRUN_BUILD_TIME__
     : 'dev';
 
+const WORKSPACE_DB_NAME = 'sparkrun-workspace';
+const ROOT_CACHE_DB_NAME = 'sparkrun-root-cache-debian-2026-06-01';
+const LEGACY_ROOT_CACHE_DB_NAME = 'sparkrun-root-cache';
+
 export const SPARKRUN_IDB_DATABASES = [
-  'sparkrun-workspace',
-  'sparkrun-root-cache',
+  WORKSPACE_DB_NAME,
+  ROOT_CACHE_DB_NAME,
+  LEGACY_ROOT_CACHE_DB_NAME,
 ] as const;
 
 export async function hardResetSparkrunCaches(options: {
@@ -279,9 +286,9 @@ export async function hardResetSparkrunCaches(options: {
   if (typeof indexedDB === 'undefined') {
     throw new Error('IndexedDB is not available in this environment.');
   }
-  const targets: string[] = ['sparkrun-workspace'];
+  const targets: string[] = [WORKSPACE_DB_NAME];
   if (options.includeDiskCache) {
-    targets.push('sparkrun-root-cache');
+    targets.push(ROOT_CACHE_DB_NAME, LEGACY_ROOT_CACHE_DB_NAME);
   }
   await Promise.all(
     targets.map(
@@ -473,9 +480,9 @@ export class WebVmBackend implements VmFileBackend {
       }
     }
 
-    const rootCache = await CheerpX.IDBDevice.create('sparkrun-root-cache');
+    const rootCache = await CheerpX.IDBDevice.create(ROOT_CACHE_DB_NAME);
     const overlayDevice = await CheerpX.OverlayDevice.create(rootDevice, rootCache);
-    const workspaceDevice = await CheerpX.IDBDevice.create('sparkrun-workspace');
+    const workspaceDevice = await CheerpX.IDBDevice.create(WORKSPACE_DB_NAME);
     const dataDevice = await CheerpX.DataDevice.create();
 
     const trimmedAuthKey = options.tailscaleAuthKey?.trim() || undefined;
@@ -1030,16 +1037,16 @@ export class WebVmBackend implements VmFileBackend {
       };
     }
 
-    // PHASE 3: Launch. Output goes to /tmp/sparkrun/server.log on the
-    // rootCache overlay, NOT the workspace IDB, so the redirect works
-    // even if the workspace is now read-only.
+    // PHASE 3: Launch detached. CheerpX 1.3.9 can take tens of seconds to
+    // schedule the child after the parent shell reports success, so the port
+    // handshake deliberately waits longer than a normal native launch.
     const command = `mkdir -p ${SERVER_STATE_DIR} && (nohup ${SERVER_COMMAND} > ${SERVER_LOG_PATH} 2>&1 &)`;
     const launch = await this.execBash(command, SITE_ROOT, true, false);
     if (launch.status !== 0) {
       return launch;
     }
 
-    const port = await this.waitForServerPort(6_000);
+    const port = await this.waitForServerPort(45_000);
     const log = await this.readServerLog(40);
     const result: VmCommandResult = port
       ? {
@@ -1344,19 +1351,25 @@ export class WebVmBackend implements VmFileBackend {
     this.consoleInput = this.cx.setCustomConsole((buf, vt) => {
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
       const text = decoder.decode(bytes);
+      // A long-lived process can occupy VT 1, causing later cx.run commands to
+      // execute on another virtual terminal. Capture the first VT that emits
+      // for the active command instead of discarding every non-default VT.
+      if (this.activeCapture !== null) {
+        this.activeCapture.vt ??= vt;
+        if (this.activeCapture.vt === vt) {
+          this.activeCapture.output += text;
+          if (this.activeCapture.streamToConsole) {
+            this.onConsole?.(text);
+          }
+        }
+        return;
+      }
       if (vt !== undefined && vt !== 1) {
         if (text.trim().length > 0) {
           this.publishDebug({
             phase: 'console-vt',
             output: `vt=${vt}: ${text}`,
           });
-        }
-        return;
-      }
-      if (this.activeCapture !== null) {
-        this.activeCapture.output += text;
-        if (this.activeCapture.streamToConsole) {
-          this.onConsole?.(text);
         }
         return;
       }
@@ -1378,7 +1391,20 @@ export class WebVmBackend implements VmFileBackend {
       `rm -rf ${shellQuote(SITE_ROOT)}`,
       `mkdir -p ${shellQuote(SITE_ROOT)}`,
     ].join(' && ');
-    await this.execBash(cmd, '/', false, false);
+    const result = await this.execBash(
+      cmd,
+      '/',
+      false,
+      false,
+      BOOTSTRAP_COMMAND_TIMEOUT_MS,
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `Could not prepare ${SITE_ROOT}: ${
+          result.output || `command exited with status ${result.status}`
+        }`,
+      );
+    }
   }
 
   private runOptions(cwd: string): NonNullable<Parameters<CheerpXLinux['run']>[2]> {

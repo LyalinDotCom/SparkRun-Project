@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CheerpX 1.3.1 Isolation Test</title>
+    <title>CheerpX 1.3.9 Isolation Test</title>
     <style>
       body {
         font-family:
@@ -87,7 +87,7 @@
     </style>
   </head>
   <body>
-    <h1>CheerpX 1.3.1 — isolation test</h1>
+    <h1>CheerpX 1.3.9 — isolation test</h1>
     <p class="lede">
       No agent. No Tailscale. No Gemini. Just CheerpX with one IDB device
       mounted at <code>/test</code>. Click run and tell us what passes / fails
@@ -179,13 +179,13 @@
       wipeBtn.addEventListener('click', async () => {
         wipeBtn.disabled = true;
         await new Promise((resolve, reject) => {
-          const r = indexedDB.deleteDatabase('sparkrun-diag-cache');
+          const r = indexedDB.deleteDatabase('sparkrun-diag-cache-139');
           r.onsuccess = () => resolve();
           r.onerror = () => reject(r.error);
           r.onblocked = () => resolve();
         });
         await new Promise((resolve, reject) => {
-          const r = indexedDB.deleteDatabase('sparkrun-diag-workspace');
+          const r = indexedDB.deleteDatabase('sparkrun-diag-workspace-139');
           r.onsuccess = () => resolve();
           r.onerror = () => reject(r.error);
           r.onblocked = () => resolve();
@@ -222,19 +222,19 @@
 
         try {
           r1.run('importing…');
-          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.9/cx.esm.js');
           r1.pass('ok');
 
           r2.run('creating…');
           const rootDevice = await CheerpX.CloudDevice.create(
-            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+            'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
           );
-          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache-139');
           const overlayDevice = await CheerpX.OverlayDevice.create(
             rootDevice,
             rootCache,
           );
-          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-noweb-ws');
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-noweb-ws-139');
           const dataDevice = await CheerpX.DataDevice.create();
           r2.pass('all devices created (WebDevice intentionally skipped)');
 
@@ -384,16 +384,16 @@
 
         try {
           t1.run('mounting…');
-          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.9/cx.esm.js');
           const rootDevice = await CheerpX.CloudDevice.create(
-            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+            'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
           );
-          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache-139');
           const overlayDevice = await CheerpX.OverlayDevice.create(
             rootDevice,
             rootCache,
           );
-          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-race-ws');
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-race-ws-139');
           const dataDevice = await CheerpX.DataDevice.create();
           const webDevice = await CheerpX.WebDevice.create('');
 
@@ -601,19 +601,19 @@
 
         try {
           t1.run('importing…');
-          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.9/cx.esm.js');
           t1.pass(`Named exports: ${Object.keys(CheerpX).join(', ')}`);
 
           t2.run('creating…');
           const rootDevice = await CheerpX.CloudDevice.create(
-            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+            'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
           );
-          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache-139');
           const overlayDevice = await CheerpX.OverlayDevice.create(
             rootDevice,
             rootCache,
           );
-          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-ts-ws');
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-ts-ws-139');
           const dataDevice = await CheerpX.DataDevice.create();
           const webDevice = await CheerpX.WebDevice.create('');
           t2.pass('all devices created');
@@ -800,19 +800,19 @@
 
         try {
           a1.run('importing…');
-          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.9/cx.esm.js');
           a1.pass(`Named exports: ${Object.keys(CheerpX).join(', ')}`);
 
           a2.run('creating…');
           const rootDevice = await CheerpX.CloudDevice.create(
-            'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+            'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
           );
-          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache-139');
           const overlayDevice = await CheerpX.OverlayDevice.create(
             rootDevice,
             rootCache,
           );
-          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-app-ws');
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-app-ws-139');
           const dataDevice = await CheerpX.DataDevice.create();
           const webDevice = await CheerpX.WebDevice.create('');
           a2.pass('all devices created');
@@ -971,7 +971,7 @@
 
         try {
           t1.run('importing…');
-          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.1/cx.esm.js');
+          const CheerpX = await import('https://cxrtnc.leaningtech.com/1.3.9/cx.esm.js');
           const exported = Object.keys(CheerpX).join(', ');
           t1.pass(`Named exports: ${exported}`);
 
@@ -979,7 +979,7 @@
           let rootDevice;
           try {
             rootDevice = await CheerpX.CloudDevice.create(
-              'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2',
+              'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
             );
             t2.pass('ok');
           } catch (e) {
@@ -988,7 +988,7 @@
           }
 
           t3.run('creating…');
-          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache');
+          const rootCache = await CheerpX.IDBDevice.create('sparkrun-diag-cache-139');
           const overlayDevice = await CheerpX.OverlayDevice.create(
             rootDevice,
             rootCache,
@@ -996,7 +996,7 @@
           t3.pass('ok');
 
           t4.run('creating…');
-          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-workspace');
+          const wsDevice = await CheerpX.IDBDevice.create('sparkrun-diag-workspace-139');
           t4.pass('ok');
 
           t5.run('creating…');

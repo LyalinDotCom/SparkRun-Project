@@ -124,6 +124,14 @@ describe('website agent loop', () => {
     expect(secondRequest.previous_interaction_id).toBe('int-read-error');
     expect(JSON.stringify(secondRequest.input)).toContain('function_result');
     expect(JSON.stringify(secondRequest.input)).toContain('cannot escape');
+    expect(secondRequest.system_instruction).toContain(
+      'website-building agent',
+    );
+    expect(secondRequest.tools).toEqual(expect.any(Array));
+    expect(secondRequest.tools[0]).toMatchObject({
+      type: 'function',
+      name: 'read_file',
+    });
   });
 
   it('retries a transient Gemini 503 response', async () => {
@@ -158,6 +166,47 @@ describe('website agent loop', () => {
     expect(events).toContainEqual(
       expect.stringContaining('status:Gemini is temporarily unavailable'),
     );
+  });
+
+  it('retries a client-side API timeout instead of treating it as Stop', async () => {
+    const create = vi
+      .fn()
+      .mockImplementationOnce(
+        (
+          _params: unknown,
+          requestOptions: { signal: AbortSignal },
+        ) =>
+          new Promise<TestInteraction>((_resolve, reject) => {
+            requestOptions.signal.addEventListener(
+              'abort',
+              () => {
+                const error = new Error('signal is aborted without reason');
+                error.name = 'AbortError';
+                reject(error);
+              },
+              { once: true },
+            );
+          }),
+      )
+      .mockResolvedValueOnce(
+        interaction({
+          id: 'int-timeout-recovered',
+          status: 'completed',
+          output_text: 'Recovered after timeout.',
+        }),
+      );
+
+    const result = await runWebsiteAgent({
+      apiKey: 'test-key',
+      prompt: 'make a page',
+      backend: new MemoryVmFileBackend(),
+      ai: { interactions: { create } },
+      turnTimeoutMs: 1,
+      modelRetryBaseDelayMs: 0,
+    });
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(result.finalText).toBe('Recovered after timeout.');
   });
 
   it('makes eight retries before surfacing a persistent API failure', async () => {

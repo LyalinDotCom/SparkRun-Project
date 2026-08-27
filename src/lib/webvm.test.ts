@@ -13,6 +13,7 @@ const mockState = vi.hoisted(() => ({
     | null,
   dataFiles: new Map<string, string | Uint8Array>(),
   emitEarlyIp: false,
+  consoleVt: 1,
   serverAlive: true,
   networkInterface: null as {
     authKey?: string;
@@ -30,7 +31,10 @@ const mockState = vi.hoisted(() => ({
 }));
 
 function emitConsole(text: string): void {
-  mockState.consoleCallback?.(new TextEncoder().encode(text), 1);
+  mockState.consoleCallback?.(
+    new TextEncoder().encode(text),
+    mockState.consoleVt,
+  );
 }
 
 function parseSingleQuoted(command: string, prefix: string): string | null {
@@ -196,6 +200,7 @@ describe('WebVM backend setup', () => {
     mockState.consoleCallback = null;
     mockState.dataFiles.clear();
     mockState.emitEarlyIp = false;
+    mockState.consoleVt = 1;
     mockState.serverAlive = true;
     mockState.networkInterface = null;
     mockState.runCalls = [];
@@ -356,6 +361,18 @@ describe('WebVM backend setup', () => {
     expect(stagedServerScript).toContain('Cross-Origin-Embedder-Policy');
     expect(stagedServerScript).toContain('cross-origin');
     expect(statuses).toContain('booting');
+  });
+
+  it('captures server handshake commands from a non-default virtual terminal', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+
+    // CheerpX may assign the port poller a non-default VT.
+    mockState.consoleVt = 2;
+    const result = await backend.startServer();
+
+    expect(result.status).toBe(0);
+    expect(backend.getServerPort()).toBe(SERVER_PORT + 1);
   });
 
   it('does not relaunch the VM web server before the health check runs', async () => {

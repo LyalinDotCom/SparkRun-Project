@@ -64,7 +64,10 @@ export interface AgentRunResult {
 }
 
 export const DEFAULT_AGENT_MAX_TURNS = 40;
-const DEFAULT_TURN_TIMEOUT_MS = 60_000;
+// Gemini 3.7 Flash Interactions can legitimately take a little over a minute
+// under load, especially after a function result. Leave enough headroom to
+// avoid manufacturing retries while still bounding every request.
+const DEFAULT_TURN_TIMEOUT_MS = 90_000;
 const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 2_000;
 const DEFAULT_MODEL_RETRY_MAX_DELAY_MS = 15_000;
 const MODEL_REQUEST_MAX_RETRIES = 8;
@@ -219,14 +222,30 @@ async function withAbortableTurn<T>(
 ): Promise<T> {
   throwIfAborted(options.abortSignal);
   const controller = new AbortController();
+  let timedOut = false;
   const abort = () => controller.abort();
   const timeout = globalThis.setTimeout(
-    abort,
+    () => {
+      timedOut = true;
+      controller.abort();
+    },
     options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
   );
   options.abortSignal?.addEventListener('abort', abort, { once: true });
   try {
     return await operation(controller.signal);
+  } catch (error) {
+    if (timedOut && !options.abortSignal?.aborted) {
+      const timeoutError = new Error(
+        `Gemini request timed out after ${
+          options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
+        }ms.`,
+      ) as Error & { status?: number };
+      timeoutError.name = 'TimeoutError';
+      timeoutError.status = 408;
+      throw timeoutError;
+    }
+    throw error;
   } finally {
     globalThis.clearTimeout(timeout);
     options.abortSignal?.removeEventListener('abort', abort);
@@ -341,19 +360,19 @@ export async function runWebsiteAgent(
 
     const response = await createInteraction(
       ai,
-      previousInteractionId
-        ? {
-            model: MODEL_ID,
-            previous_interaction_id: previousInteractionId,
-            input: nextInput,
-          }
-        : {
-            model: MODEL_ID,
-            input: nextInput,
-            system_instruction: SYSTEM_PROMPT,
-            generation_config: { temperature: 0.35 },
-            tools: INTERACTION_TOOLS,
-          },
+      {
+        model: MODEL_ID,
+        input: nextInput,
+        ...(previousInteractionId
+          ? { previous_interaction_id: previousInteractionId }
+          : {}),
+        // Interactions settings are scoped to a single turn. Re-send them on
+        // continuations so Gemini can make another tool call after receiving
+        // function results from the previous interaction.
+        system_instruction: SYSTEM_PROMPT,
+        generation_config: { temperature: 0.35 },
+        tools: INTERACTION_TOOLS,
+      },
       options,
     );
     previousInteractionId = response.id;

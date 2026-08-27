@@ -1677,7 +1677,7 @@ function TerminalDrawer({
     'pwd',
     'ls -la',
     'ps aux',
-    'cat .server.log',
+    'cat /tmp/sparkrun/server.log',
     "python3 - <<'PY'\nimport pathlib\nimport urllib.request\nport = pathlib.Path('.server.port').read_text().strip()\nurl = f'http://127.0.0.1:{port}/'\nwith urllib.request.urlopen(url, timeout=3) as response:\n    print(response.status, url)\nPY",
   ];
 
@@ -1760,7 +1760,11 @@ function TerminalDrawer({
             autoCorrect="off"
             disabled={disabled}
             onChange={(event) => onInput(event.target.value)}
-            placeholder={disabled ? 'Boot the VM first' : 'pwd, ls -la, cat .server.log'}
+            placeholder={
+              disabled
+                ? 'Boot the VM first'
+                : 'pwd, ls -la, cat /tmp/sparkrun/server.log'
+            }
             spellCheck={false}
             value={input}
           />

@@ -109,7 +109,8 @@ debugging.
 - Generated projects are static websites only.
 - Tailnet preview requires a valid Tailscale auth key and browser/host network
   conditions that can reach the VM's tailnet address.
-- CheerpX 1.3.1 can emit noisy worker errors related to network events. They
+- CheerpX can emit noisy worker errors related to network events. They were
+  first observed on 1.3.1 and may still appear on newer pinned releases; they
   are captured in diagnostics but are not treated as app failures.
 - The generated website workspace is stored in browser IndexedDB, so reset tools
   are part of the normal recovery path.
@@ -165,7 +166,8 @@ rm -rf /workspace/site && mkdir -p /workspace/site
 ```
 
 Generated projects are preserved separately in `localStorage` and restored after
-boot. This avoids a known IndexedDB directory corruption mode in CheerpX 1.3.1
+boot. This avoids an IndexedDB directory corruption mode first observed with
+CheerpX 1.3.1
 where a stale `/workspace/site` inode can appear writable but fail later writes
 with `Read-only file system`.
 

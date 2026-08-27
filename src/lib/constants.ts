@@ -5,4 +5,4 @@ export const SERVER_PORT = 8081;
 export const SERVER_PORT_RANGE_END = 8120;
 export const SERVER_COMMAND = `python3 ${WORKSPACE_ROOT}/.sparkrun_static_server.py --host 0.0.0.0 --port auto`;
 export const WEBVM_DISK_URL =
-  'wss://disks.webvm.io/debian_large_20230522_5044875331_2.ext2';
+  'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2';
