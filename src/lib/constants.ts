@@ -1,4 +1,4 @@
-export const MODEL_ID = 'gemini-3.5-flash';
+export const MODEL_ID = 'gemini-3.7-flash';
 export const WORKSPACE_ROOT = '/workspace';
 export const SITE_ROOT = `${WORKSPACE_ROOT}/site`;
 export const SERVER_PORT = 8081;

@@ -16,7 +16,7 @@ type GenAiLike = {
 };
 
 export interface AgentEvent {
-  type: 'model' | 'tool' | 'error' | 'done';
+  type: 'model' | 'tool' | 'status' | 'error' | 'done';
   message: string;
 }
 
@@ -28,6 +28,7 @@ export interface AgentRunOptions {
   maxTurns?: number;
   abortSignal?: AbortSignal;
   turnTimeoutMs?: number;
+  modelRetryBaseDelayMs?: number;
   onEvent?: (event: AgentEvent) => void;
 }
 
@@ -39,6 +40,9 @@ export interface AgentRunResult {
 
 export const DEFAULT_AGENT_MAX_TURNS = 40;
 const DEFAULT_TURN_TIMEOUT_MS = 60_000;
+const DEFAULT_MODEL_RETRY_BASE_DELAY_MS = 2_000;
+const DEFAULT_MODEL_RETRY_MAX_DELAY_MS = 15_000;
+const MODEL_REQUEST_MAX_RETRIES = 8;
 
 const SYSTEM_PROMPT = `
 You are a website-building agent running inside a browser-hosted Linux VM.
@@ -50,7 +54,7 @@ Rules:
 - Always create ${SITE_ROOT}/index.html.
 - Write complete file contents. Never use placeholders or omitted sections.
 - Do not call any model other than ${MODEL_ID}.
-- Start the server with ${SERVER_COMMAND} exactly once, only after index.html and any referenced CSS/JS files exist.
+- Request server startup with ${SERVER_COMMAND} exactly once, only after index.html and any referenced CSS/JS files exist. The host app defers the actual launch until Tailnet is connected.
 - Inspect files with list_directory/read_file. If you need shell inspection, only use safe commands like pwd, ls, ls -R ${SITE_ROOT}, or find . -maxdepth 2 -type f.
 - Never tell the user to open localhost. The host app will provide the real Tailnet preview URL.
 - Prefer write_file for complete small static files. Use replace for targeted follow-up edits.
@@ -189,6 +193,65 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   }
 }
 
+function isTransientModelError(error: unknown): boolean {
+  if (error instanceof Error && error.name === 'AbortError') {
+    return false;
+  }
+
+  const details =
+    error && typeof error === 'object'
+      ? (error as { code?: unknown; status?: unknown; message?: unknown })
+      : {};
+  const status = details.status ?? details.code;
+  if (
+    status === 408 ||
+    status === '408' ||
+    status === 429 ||
+    status === '429' ||
+    (typeof status === 'number' && status >= 500 && status <= 599) ||
+    (typeof status === 'string' && /^5\d\d$/.test(status)) ||
+    status === 'UNAVAILABLE'
+  ) {
+    return true;
+  }
+
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof details.message === 'string'
+        ? details.message
+        : String(error);
+  return (
+    /(?:"code"\s*:\s*(?:408|429|5\d\d)|\b(?:408|429|5\d\d)\b)/i.test(
+      message,
+    ) ||
+    /\b(?:UNAVAILABLE|RESOURCE_EXHAUSTED)\b/i.test(message) ||
+    /high demand|service temporarily unavailable|network error|fetch failed|load failed/i.test(
+      message,
+    )
+  );
+}
+
+async function waitForModelRetry(
+  delayMs: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const abort = () => {
+      globalThis.clearTimeout(timeout);
+      const error = new Error('Website generation was stopped.');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    const timeout = globalThis.setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
 async function withAbortableTurn<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   options: AgentRunOptions,
@@ -207,6 +270,56 @@ async function withAbortableTurn<T>(
     globalThis.clearTimeout(timeout);
     options.abortSignal?.removeEventListener('abort', abort);
   }
+}
+
+async function generateModelResponse(
+  ai: GenAiLike,
+  contents: Content[],
+  options: AgentRunOptions,
+): Promise<GenerateContentResponse> {
+  for (let retry = 0; retry <= MODEL_REQUEST_MAX_RETRIES; retry++) {
+    try {
+      return await withAbortableTurn(
+        (abortSignal) =>
+          ai.models.generateContent({
+            model: MODEL_ID,
+            contents,
+            config: {
+              systemInstruction: SYSTEM_PROMPT,
+              tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+              temperature: 0.35,
+              abortSignal,
+              httpOptions: {
+                timeout: options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
+              },
+            },
+          }),
+        options,
+      );
+    } catch (error) {
+      if (
+        !isTransientModelError(error) ||
+        retry === MODEL_REQUEST_MAX_RETRIES
+      ) {
+        throw error;
+      }
+
+      const delayMs = Math.min(
+        (options.modelRetryBaseDelayMs ?? DEFAULT_MODEL_RETRY_BASE_DELAY_MS) *
+          2 ** retry,
+        DEFAULT_MODEL_RETRY_MAX_DELAY_MS,
+      );
+      emit(options, {
+        type: 'status',
+        message: `Gemini is temporarily unavailable. Retrying in ${(
+          delayMs / 1_000
+        ).toLocaleString()}s (attempt ${retry + 2}/${MODEL_REQUEST_MAX_RETRIES + 1}).`,
+      });
+      await waitForModelRetry(delayMs, options.abortSignal);
+    }
+  }
+
+  throw new Error('Gemini request failed after retrying.');
 }
 
 function summarizeToolCall(call: ToolCall): string {
@@ -281,23 +394,7 @@ export async function runWebsiteAgent(
       message: `Calling ${MODEL_ID}, turn ${turn}`,
     });
 
-    const response = await withAbortableTurn(
-      (abortSignal) =>
-        ai.models.generateContent({
-          model: MODEL_ID,
-          contents,
-          config: {
-            systemInstruction: SYSTEM_PROMPT,
-            tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
-            temperature: 0.35,
-            abortSignal,
-            httpOptions: {
-              timeout: options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS,
-            },
-          },
-        }),
-      options,
-    );
+    const response = await generateModelResponse(ai, contents, options);
 
     const modelContent = responseContent(response);
     if (modelContent) {
@@ -312,17 +409,19 @@ export async function runWebsiteAgent(
     }
 
     const functionResponses: Content[] = [];
-    let serverStartError: string | null = null;
     for (const call of calls) {
       throwIfAborted(options.abortSignal);
-      const result = await executeToolCall(options.backend, call);
+      const serverStartCall = isServerStartCall(call);
+      const result: ToolExecutionResult = serverStartCall
+        ? {
+            llmContent:
+              'Server startup accepted. The host app will activate Tailnet and launch the server after website generation finishes.',
+            display: 'Deferred server start until Tailnet is ready',
+          }
+        : await executeToolCall(options.backend, call);
       result.changedFiles?.forEach((file) => changedFiles.add(file));
-      if (isServerStartCall(call)) {
-        if (result.error) {
-          serverStartError = result.error;
-        } else {
-          serverStartRequested = true;
-        }
+      if (serverStartCall) {
+        serverStartRequested = true;
       }
       emit(options, {
         type: result.error ? 'error' : 'tool',
@@ -337,7 +436,7 @@ export async function runWebsiteAgent(
 
     if (serverStartRequested && changedFiles.size > 0) {
       const finalText =
-        'Website files were created and the VM web server was started.';
+        'Website files were created. The host app is starting the VM web server.';
       emit(options, { type: 'done', message: finalText });
       return {
         finalText,
@@ -345,9 +444,6 @@ export async function runWebsiteAgent(
       };
     }
 
-    if (serverStartError) {
-      throw new Error(`Server start failed: ${serverStartError}`);
-    }
   }
 
   if (changedFiles.size > 0) {

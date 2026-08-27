@@ -135,7 +135,7 @@ Open the Vite URL printed by the dev server.
 The active model is configured in `src/lib/constants.ts`:
 
 ```ts
-export const MODEL_ID = 'gemini-3.5-flash';
+export const MODEL_ID = 'gemini-3.7-flash';
 ```
 
 The CheerpX package is pinned in `package.json`. Do not change it to `latest`.

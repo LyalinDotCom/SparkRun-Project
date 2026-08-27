@@ -128,6 +128,7 @@ describe('SparkRun setup screen', () => {
     expect(
       screen.getByLabelText(/Remember keys on this browser/i),
     ).not.toBeChecked();
+    expect(screen.getByText('3.7 Flash')).toBeInTheDocument();
     expect(screen.getByText(/Only model enabled/i)).toBeInTheDocument();
     expect(screen.queryByText(/gemini-3-pro/i)).not.toBeInTheDocument();
   });

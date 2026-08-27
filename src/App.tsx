@@ -111,7 +111,7 @@ const INITIAL_STATUS: WebVmStatus = {
 };
 
 const MODELS = [
-  { id: MODEL_ID, label: '3.5 Flash', sub: 'Only model enabled' },
+  { id: MODEL_ID, label: '3.7 Flash', sub: 'Only model enabled' },
 ];
 
 function formatBuildTimeLocal(iso: string): string {
@@ -421,6 +421,14 @@ function eventFromAgentEvent(
 ): Omit<LogEvent, 'id' | 'time'> | null {
   if (event.type === 'model' || event.type === 'done') {
     return null;
+  }
+
+  if (event.type === 'status') {
+    return {
+      kind: 'status',
+      label: 'Gemini retry',
+      text: event.message,
+    };
   }
 
   const category = toolCategoryForMessage(event.message);

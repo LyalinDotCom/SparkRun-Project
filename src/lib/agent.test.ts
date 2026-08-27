@@ -10,6 +10,8 @@ function response(value: unknown): GenerateContentResponse {
 
 describe('website agent loop', () => {
   it('uses the single configured model and executes tool calls until final text', async () => {
+    expect(MODEL_ID).toBe('gemini-3.7-flash');
+
     const backend = new MemoryVmFileBackend();
     const generateContent = vi
       .fn()
@@ -88,15 +90,16 @@ describe('website agent loop', () => {
     });
 
     expect(result).toEqual({
-      finalText: 'Website files were created and the VM web server was started.',
+      finalText:
+        'Website files were created. The host app is starting the VM web server.',
       changedFiles: ['index.html'],
     });
     expect(backend.snapshot()['index.html']).toContain('Hello world');
-    expect(backend.commands[0]).toMatchObject({
-      command: SERVER_COMMAND,
-      background: true,
-    });
+    expect(backend.commands).toHaveLength(0);
     expect(events.some((event) => event.includes('Wrote'))).toBe(true);
+    expect(
+      events.some((event) => event.includes('Deferred server start')),
+    ).toBe(true);
 
     expect(generateContent).toHaveBeenCalledTimes(1);
     for (const call of generateContent.mock.calls) {
@@ -143,6 +146,65 @@ describe('website agent loop', () => {
     const secondTurnContents = generateContent.mock.calls[1][0].contents;
     expect(JSON.stringify(secondTurnContents)).toContain('functionResponse');
     expect(JSON.stringify(secondTurnContents)).toContain('cannot escape');
+  });
+
+  it('retries a transient Gemini 503 response', async () => {
+    const generateContent = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          '{"error":{"code":503,"message":"This model is currently experiencing high demand.","status":"UNAVAILABLE"}}',
+        ),
+      )
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce(
+        response({
+          text: 'Recovered after retry.',
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text: 'Recovered after retry.' }],
+              },
+            },
+          ],
+        }),
+      );
+    const events: string[] = [];
+
+    const result = await runWebsiteAgent({
+      apiKey: 'test-key',
+      prompt: 'make a page',
+      backend: new MemoryVmFileBackend(),
+      ai: { models: { generateContent } },
+      modelRetryBaseDelayMs: 0,
+      onEvent: (event) => events.push(`${event.type}:${event.message}`),
+    });
+
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    expect(result.finalText).toBe('Recovered after retry.');
+    expect(events).toContainEqual(
+      expect.stringContaining('status:Gemini is temporarily unavailable'),
+    );
+  });
+
+  it('makes eight retries before surfacing a persistent API failure', async () => {
+    const unavailable = new Error(
+      '{"error":{"code":503,"message":"high demand","status":"UNAVAILABLE"}}',
+    );
+    const generateContent = vi.fn().mockRejectedValue(unavailable);
+
+    await expect(
+      runWebsiteAgent({
+        apiKey: 'test-key',
+        prompt: 'make a page',
+        backend: new MemoryVmFileBackend(),
+        ai: { models: { generateContent } },
+        modelRetryBaseDelayMs: 0,
+      }),
+    ).rejects.toThrow('high demand');
+
+    expect(generateContent).toHaveBeenCalledTimes(9);
   });
 
   it('keeps distinct same-name parallel tool calls when ids are missing', async () => {
