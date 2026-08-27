@@ -66,7 +66,7 @@ jobs:
           jq -e '
             .smokePassed == true and
             .architecture == "i386" and
-            (.bashBinary | contains("Intel 80386"))
+            (.bashBinary | test("ELF 32-bit.*Intel (i386|80386)"))
           ' \
             vm-image-build/toolchain.json >/dev/null
 
