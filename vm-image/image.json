@@ -34,6 +34,7 @@
     "Candidate until the image passes the CheerpX Chrome runtime smoke suite.",
     "Alpine musl replaces the Debian glibc userspace, but musl alone did not fix Node's CheerpX native teardown hang.",
     "A root-owned N-API cleanup addon preserves Node's resolved exit status and exits before the broken native teardown path.",
+    "The preload records status after user exit listeners, matching Node's final process.exitCode semantics.",
     "Modern Chrome is not available for linux/386; browser automation runs in the outer Chrome harness.",
     "Node exit semantics, package managers, process and worker behavior, output integrity, Python threads, POSIX condition variables, and Go must pass both container and CheerpX runtime smoke suites before promotion."
   ]

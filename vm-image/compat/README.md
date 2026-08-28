@@ -6,13 +6,15 @@ that failure. This directory contains the small, auditable compatibility layer
 used by the SparkRun image.
 
 `node-exit-preload.cjs` is loaded through the image's default `NODE_OPTIONS`.
-In the main thread it loads `node-exit-addon.node` and records Node's resolved
-status during the normal JavaScript `exit` event. A stable N-API environment
-cleanup hook then calls `_exit(recorded_status)` before Node enters the broken
-CheerpX native teardown path. Worker environments deliberately do not install
-the hook; child Node processes inherit the preload and install their own hook.
-Because `_exit` also precedes Node's automatic compile-cache flush, the preload
-calls Node 24's `flushCompileCache()` during the normal `exit` event first.
+In the main thread it loads `node-exit-addon.node` and wraps the process event
+emission boundary. The wrapper records `process.exitCode` only after every user
+`exit` listener has run, matching Node's own final-status reload semantics. A
+stable N-API environment cleanup hook then calls `_exit(recorded_status)` before
+Node enters the broken CheerpX native teardown path. Worker environments
+deliberately do not install the hook; child Node processes inherit the preload
+and install their own hook. Because `_exit` also precedes Node's automatic
+compile-cache flush, the preload calls Node 24's `flushCompileCache()` before
+the native hook runs.
 
 Docker image environment metadata is not included by `docker export`.
 `sparkrun-node.sh` therefore persists both defaults in `/etc/profile.d` for

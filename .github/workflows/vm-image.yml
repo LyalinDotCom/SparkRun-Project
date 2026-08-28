@@ -93,6 +93,8 @@ jobs:
             .tools.pipx.status == 0 and .tools.pipx.version == "1.14.0" and
             .tools.go.status == 0 and (.tools.go.version | startswith("go version go1.26.3 ")) and
             .nodeCompatibility.conformancePassed == true and
+            .nodeCompatibility.compileCacheUnavailableStatusVerified == 7 and
+            .nodeCompatibility.exitListenerStatusVerified == 9 and
             .nodeCompatibility.stdoutBytesVerified == 204800 and
             .nodeCompileCache.path == "/usr/local/lib/sparkrun/node-compile-cache" and
             .nodeCompileCache.mode == "0o700" and
@@ -116,12 +118,19 @@ jobs:
           container_id=$(docker create --platform linux/386 \
             sparkrun-coding:${{ steps.metadata.outputs.image_version }})
           trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
-          mkdir -p vm-image-build/rootfs
-          docker export "$container_id" | tar -C vm-image-build/rootfs -xf -
+          sudo install -d -o root -g root -m 0755 vm-image-build/rootfs
+          docker export --output vm-image-build/rootfs.tar "$container_id"
+          sudo tar \
+            --numeric-owner \
+            --same-owner \
+            --xattrs \
+            --xattrs-include='*' \
+            -C vm-image-build/rootfs \
+            -xf vm-image-build/rootfs.tar
           docker rm "$container_id" >/dev/null
           trap - EXIT
 
-          used_kib=$(du -sk vm-image-build/rootfs | awk '{print $1}')
+          used_kib=$(sudo du -sk vm-image-build/rootfs | awk '{print $1}')
           capacity_kib=$(( ${{ steps.metadata.outputs.image_size_mib }} * 1024 ))
           if (( used_kib > capacity_kib * 88 / 100 )); then
             echo "Root filesystem uses ${used_kib} KiB; image capacity is ${capacity_kib} KiB." >&2
@@ -129,23 +138,43 @@ jobs:
             exit 1
           fi
           echo "$used_kib" > vm-image-build/rootfs-used-kib.txt
-          find vm-image-build/rootfs -xdev \
-            -printf '%P\t%y\t%m\t%U\t%G\t%s\t%l\n' \
+          sudo find vm-image-build/rootfs -xdev \
+            -printf '%P\t%y\t%m\t%u\t%g\t%s\t%l\n' \
             | LC_ALL=C sort > vm-image-build/rootfs-manifest.txt
-          [[ "$(stat -c '%U:%G:%a' \
-            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-addon.node)" \
-            == "root:root:444" ]]
-          [[ "$(stat -c '%U:%G:%a' \
-            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-preload.cjs)" \
-            == "root:root:444" ]]
-          [[ "$(stat -c '%U:%G:%a' \
-            vm-image-build/rootfs/etc/profile.d/sparkrun-node.sh)" \
-            == "root:root:444" ]]
-          [[ "$(stat -c '%U:%G:%a' \
-            vm-image-build/rootfs/usr/local/lib/sparkrun/node-compile-cache)" \
-            == "root:root:700" ]]
-          find vm-image-build/rootfs/usr/local/lib/sparkrun/node-compile-cache \
-            -type f -print -quit | grep -q .
+          assert_metadata() {
+            local path=$1
+            local expected=$2
+            local actual
+            actual=$(sudo stat -c '%u:%g:%a' "$path")
+            echo "${path}: ${actual} (expected ${expected})"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "Unexpected ownership or mode for ${path}." >&2
+              exit 1
+            fi
+          }
+          assert_metadata \
+            vm-image-build/rootfs/usr/local/bin/sparkrun-toolchain-check \
+            0:0:755
+          assert_metadata \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-addon.node \
+            0:0:444
+          assert_metadata \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-preload.cjs \
+            0:0:444
+          assert_metadata \
+            vm-image-build/rootfs/etc/profile.d/sparkrun-node.sh \
+            0:0:444
+          assert_metadata \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-compile-cache \
+            0:0:700
+          cache_file_count=$(sudo find \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-compile-cache \
+            -type f -printf '1\n' | wc -l)
+          echo "Exported Node compile-cache files: ${cache_file_count}"
+          if (( cache_file_count == 0 )); then
+            echo "The exported image lost its prewarmed Node compile cache." >&2
+            exit 1
+          fi
 
       - name: Create and validate the CheerpX ext2 image
         shell: bash
@@ -155,22 +184,52 @@ jobs:
         run: |
           set -euo pipefail
           disk_path="vm-image-build/${DISK_FILE}"
-          truncate -s "${IMAGE_SIZE_MIB}M" "$disk_path"
-          mkfs.ext2 -F -r 0 -b 4096 -L SPARKRUN \
+          sudo truncate -s "${IMAGE_SIZE_MIB}M" "$disk_path"
+          sudo mkfs.ext2 -F -r 0 -b 4096 -L SPARKRUN \
             -d vm-image-build/rootfs "$disk_path"
-          e2fsck -fn "$disk_path"
-          debugfs -R 'stat /usr/local/bin/sparkrun-toolchain-check' "$disk_path" \
-            | tee vm-image-build/ext2-check.txt
-          grep -q 'Type: regular' vm-image-build/ext2-check.txt
-          debugfs -R 'stat /usr/local/lib/sparkrun/node-exit-addon.node' "$disk_path" \
-            | tee vm-image-build/ext2-node-addon-check.txt
-          grep -q 'Type: regular' vm-image-build/ext2-node-addon-check.txt
-          debugfs -R 'stat /usr/local/lib/sparkrun/node-exit-preload.cjs' "$disk_path" \
-            | tee vm-image-build/ext2-node-preload-check.txt
-          grep -q 'Type: regular' vm-image-build/ext2-node-preload-check.txt
-          debugfs -R 'stat /etc/profile.d/sparkrun-node.sh' "$disk_path" \
-            | tee vm-image-build/ext2-node-profile-check.txt
-          grep -q 'Type: regular' vm-image-build/ext2-node-profile-check.txt
+          sudo e2fsck -fn "$disk_path"
+          assert_ext2_metadata() {
+            local path=$1
+            local expected_type=$2
+            local expected_mode=$3
+            local report=$4
+            sudo debugfs -R "stat ${path}" "$disk_path" 2>&1 | tee "$report"
+            if ! grep -Eq \
+              "Type: ${expected_type}[[:space:]]+Mode:[[:space:]]+0*${expected_mode}([[:space:]]|$)" \
+              "$report"; then
+              echo "Unexpected ext2 type or mode for ${path}." >&2
+              exit 1
+            fi
+            if ! grep -Eq \
+              'User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)' \
+              "$report"; then
+              echo "Unexpected ext2 uid or gid for ${path}." >&2
+              exit 1
+            fi
+          }
+          assert_ext2_metadata \
+            /usr/local/bin/sparkrun-toolchain-check regular 755 \
+            vm-image-build/ext2-check.txt
+          assert_ext2_metadata \
+            /usr/local/lib/sparkrun/node-exit-addon.node regular 444 \
+            vm-image-build/ext2-node-addon-check.txt
+          assert_ext2_metadata \
+            /usr/local/lib/sparkrun/node-exit-preload.cjs regular 444 \
+            vm-image-build/ext2-node-preload-check.txt
+          assert_ext2_metadata \
+            /etc/profile.d/sparkrun-node.sh regular 444 \
+            vm-image-build/ext2-node-profile-check.txt
+          assert_ext2_metadata \
+            /usr/local/lib/sparkrun/node-compile-cache directory 700 \
+            vm-image-build/ext2-node-cache-check.txt
+          runner_identity="$(id -u):$(id -g)"
+          sudo chown "$runner_identity" "$disk_path"
+          disk_identity=$(stat -c '%u:%g' "$disk_path")
+          echo "Upload disk owner: ${disk_identity} (expected ${runner_identity})"
+          if [[ "$disk_identity" != "$runner_identity" ]]; then
+            echo "Failed to restore the disk to the Actions runner." >&2
+            exit 1
+          fi
           (cd vm-image-build && sha256sum "$DISK_FILE") \
             | tee vm-image-build/disk.sha256
 

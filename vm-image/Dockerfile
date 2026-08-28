@@ -81,7 +81,10 @@ RUN chmod 0755 /usr/local/bin/sparkrun-toolchain-check && \
 RUN node -e "require('node:fs'); require('node:path'); require('node:worker_threads')" && \
     npm --version >/dev/null && \
     pnpm --version >/dev/null && \
-    yarn --version >/dev/null
+    yarn --version >/dev/null && \
+    test -n "$(find /usr/local/lib/sparkrun/node-compile-cache -type f -print -quit)" && \
+    chown -R root:root /usr/local/lib/sparkrun/node-compile-cache && \
+    chmod 0700 /usr/local/lib/sparkrun/node-compile-cache
 
 ENV HOME=/root \
     USER=root \
