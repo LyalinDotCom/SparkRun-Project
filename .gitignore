@@ -6,6 +6,7 @@ dist/
 .vite/
 .firebase/
 coverage/
+.cache/
 
 # Local secrets and environment
 .env
@@ -29,3 +30,6 @@ pnpm-debug.log*
 # Local test/runtime artifacts
 playwright-report/
 test-results/
+# Raw peer-model output is untrusted, machine-specific investigation material.
+# Curated dispositions belong in docs/BUG_BASH.md.
+docs/bug-bash/

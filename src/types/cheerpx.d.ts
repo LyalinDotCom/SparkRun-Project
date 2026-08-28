@@ -3,6 +3,9 @@ declare module '@leaningtech/cheerpx' {
     CloudDevice: {
       create(url: string): Promise<unknown>;
     };
+    GitHubDevice: {
+      create(url: string): Promise<unknown>;
+    };
     HttpBytesDevice: {
       create(url: string): Promise<unknown>;
     };
@@ -28,6 +31,7 @@ declare module '@leaningtech/cheerpx' {
         mounts: Array<{ type: string; path: string; dev?: unknown }>;
         networkInterface?: unknown;
       }): Promise<{
+        delete(): void;
         run(
           fileName: string,
           args: string[],

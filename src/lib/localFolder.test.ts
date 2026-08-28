@@ -4,7 +4,7 @@ import { normalizeSourcePath, writeSourceFiles } from './localFolder';
 interface MockDirectory {
   kind: 'directory';
   name: string;
-  files: Map<string, string>;
+  files: Map<string, string | Uint8Array>;
   directories: Map<string, MockDirectory>;
   queryPermission: ReturnType<typeof vi.fn>;
   requestPermission: ReturnType<typeof vi.fn>;
@@ -13,7 +13,7 @@ interface MockDirectory {
 }
 
 function makeDirectory(name = 'root'): MockDirectory {
-  const files = new Map<string, string>();
+  const files = new Map<string, string | Uint8Array>();
   const directories = new Map<string, MockDirectory>();
 
   const directory: MockDirectory = {
@@ -35,7 +35,7 @@ function makeDirectory(name = 'root'): MockDirectory {
       kind: 'file' as const,
       name: fileName,
       createWritable: async () => ({
-        write: async (content: string) => {
+        write: async (content: string | Uint8Array) => {
           files.set(fileName, content);
         },
         close: async () => undefined,
@@ -66,6 +66,21 @@ describe('local source folder writer', () => {
     expect(root.files.get('index.html')).toBe('<h1>Hello</h1>');
     expect(assets?.files.get('site.css')).toBe('body { color: teal; }');
     expect(root.queryPermission).toHaveBeenCalledWith({ mode: 'readwrite' });
+  });
+
+  it('writes binary files without text decoding or byte corruption', async () => {
+    const root = makeDirectory();
+    const bytes = new Uint8Array([0x00, 0xff, 0x80]);
+
+    const count = await writeSourceFiles(
+      root as unknown as FileSystemDirectoryHandle,
+      [{ path: 'assets/module.wasm', content: bytes }],
+    );
+
+    const stored = root.directories.get('assets')?.files.get('module.wasm');
+    expect(count).toBe(1);
+    expect(stored).toBeInstanceOf(Uint8Array);
+    expect(Array.from(stored as Uint8Array)).toEqual([0x00, 0xff, 0x80]);
   });
 
   it('aborts the writable and reports which files failed without aborting the rest', async () => {

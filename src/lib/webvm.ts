@@ -3,8 +3,9 @@ import {
   SERVER_PORT,
   SERVER_PORT_RANGE_END,
   SITE_ROOT,
-  WEBVM_DISK_URL,
+  DEFAULT_WEBVM_DISK_PROFILE,
   WORKSPACE_ROOT,
+  type WebVmDiskProfile,
 } from './constants';
 import {
   normalizeSitePath,
@@ -12,7 +13,16 @@ import {
   type DirectoryEntry,
   type VmCommandResult,
   type VmFileBackend,
-} from './tools';
+} from './vmFileContract';
+import type {
+  CodingRuntime,
+  CodingRuntimePreviewOptions,
+  CodingRuntimePreviewResult,
+} from './codingHarness';
+import type {
+  PrivateNetworkConnectOptions,
+  WorkspaceRuntime,
+} from './workspaceRuntime';
 
 type ConsoleCallback = (text: string) => void;
 type StatusCallback = (status: WebVmStatus) => void;
@@ -20,6 +30,12 @@ type DebugCallback = (entry: WebVmDebugEntry) => void;
 
 type CheerpXModule = {
   CloudDevice: {
+    create(url: string): Promise<unknown>;
+  };
+  GitHubDevice: {
+    create(url: string): Promise<unknown>;
+  };
+  HttpBytesDevice: {
     create(url: string): Promise<unknown>;
   };
   IDBDevice: {
@@ -48,7 +64,49 @@ type DataDevice = {
   writeFile(path: string, content: string | Uint8Array): Promise<void>;
 };
 
+export const API_RETRY_LIMIT = 8;
+
+type ApiRetryOptions = {
+  delay?: (milliseconds: number) => Promise<void>;
+  onRetry?: (retry: number, error: unknown) => void;
+};
+
+const defaultRetryDelay = (milliseconds: number) =>
+  new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
+
+/** Run one initial API attempt plus exactly eight retries before failing. */
+export async function withEightApiRetries<T>(
+  operation: (retry: number) => Promise<T>,
+  options: ApiRetryOptions = {},
+): Promise<T> {
+  const delay = options.delay ?? defaultRetryDelay;
+  let lastError: unknown;
+  for (let retry = 0; retry <= API_RETRY_LIMIT; retry += 1) {
+    try {
+      return await operation(retry);
+    } catch (error) {
+      lastError = error;
+      if (retry === API_RETRY_LIMIT) break;
+      const nextRetry = retry + 1;
+      options.onRetry?.(nextRetry, error);
+      await delay(Math.min(250 * 2 ** retry, 2_000));
+    }
+  }
+  throw lastError;
+}
+
+export function cacheBustedByteDeviceUrl(url: string, retry: number): string {
+  if (retry === 0) return url;
+  const isRootRelative = url.startsWith('/');
+  const parsed = new URL(url, 'https://sparkrun.invalid');
+  parsed.searchParams.set('sparkrun-range-retry', String(retry));
+  return isRootRelative
+    ? `${parsed.pathname}${parsed.search}${parsed.hash}`
+    : parsed.toString();
+}
+
 type CheerpXLinux = {
+  delete(): void;
   run(
     fileName: string,
     args: string[],
@@ -96,6 +154,10 @@ export interface WebVmDebugEntry {
 
 export interface CreateWebVmBackendOptions {
   tailscaleAuthKey?: string;
+  workspaceDbName?: string;
+  rootCacheDbName?: string;
+  prepareWorkspace?: 'preserve' | 'clean-site';
+  diskProfile?: WebVmDiskProfile;
   onConsole?: ConsoleCallback;
   onStatus?: StatusCallback;
   onDebug?: DebugCallback;
@@ -107,13 +169,95 @@ export interface ConnectTailnetOptions {
 }
 
 type ActiveCapture = {
-  output: string;
+  outputByVirtualTerminal: Map<number | 'default', string>;
   streamToConsole: boolean;
-  vt?: number;
 };
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function containsUnsupportedDetachment(command: string): boolean {
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let unquoted = '';
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index] ?? '';
+    if (escaped) {
+      escaped = false;
+      unquoted += ' ';
+      continue;
+    }
+    if (character === '\\' && quote !== "'") {
+      escaped = true;
+      unquoted += ' ';
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = null;
+      unquoted += character === '\n' ? '\n' : ' ';
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      unquoted += ' ';
+      continue;
+    }
+    if (character === '#') {
+      const previous = index === 0 ? '\n' : (command[index - 1] ?? '');
+      if (/\s/.test(previous)) {
+        while (index < command.length && command[index] !== '\n') index += 1;
+        unquoted += '\n';
+        continue;
+      }
+    }
+    unquoted += character;
+  }
+
+  if (/(^|[\s;|()])(?:nohup|disown|coproc)(?=$|[\s;|&()])/m.test(unquoted)) {
+    return true;
+  }
+  if (
+    /(^|[\s;|()])setsid(?=$|[\s;|&()])[^\n;|&]*(?:--fork|(?:^|\s)-[^\s-]*f)/m.test(
+      unquoted,
+    )
+  ) {
+    return true;
+  }
+  for (let index = 0; index < unquoted.length; index += 1) {
+    if (unquoted[index] !== '&') continue;
+    const previous = unquoted[index - 1] ?? '';
+    const next = unquoted[index + 1] ?? '';
+    if (next === '&') {
+      index += 1;
+      continue;
+    }
+    // Redirection (`2>&1`, `<&0`, `&>file`) and Bash's `|&` pipe are finite
+    // shell syntax, not a detached process request.
+    if (previous === '>' || previous === '<' || previous === '|' || next === '>') {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function buildInternalHttpProbeCommand(port: number): string {
+  // Never launch a second CPython interpreter beside a live preview. In the
+  // real CheerpX VM a cold interpreter can take longer than the command
+  // watchdog while the first Python process is serving, which turns a healthy
+  // preview into a catastrophic false timeout. curl is part of every supported
+  // SparkRun image and exits under its own bounded network timers.
+  return [
+    'curl',
+    '--silent',
+    '--show-error',
+    '--output /dev/null',
+    `--write-out ${shellQuote('SPARKRUN_HTTP_%{http_code}\\n')}`,
+    '--connect-timeout 2',
+    '--max-time 4',
+    shellQuote(`http://127.0.0.1:${port}/`),
+  ].join(' ');
 }
 
 function toWorkspaceDevicePath(relativePath: string): string {
@@ -122,6 +266,12 @@ function toWorkspaceDevicePath(relativePath: string): string {
 
 function stageName(): string {
   return `stage-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
+}
+
+function commandAbortError(): Error {
+  const error = new Error('VM command was stopped.');
+  error.name = 'AbortError';
+  return error;
 }
 
 const SERVER_SCRIPT_PATH = `${WORKSPACE_ROOT}/.sparkrun_static_server.py`;
@@ -141,6 +291,7 @@ PID_PATH = STATE_DIR + "/server.pid"
 PORT_PATH = STATE_DIR + "/server.port"
 HOST_PATH = STATE_DIR + "/server.host"
 URL_PATH = STATE_DIR + "/server.url"
+READY_PATH = STATE_DIR + "/server.ready"
 os.makedirs(STATE_DIR, exist_ok=True)
 
 def write_log(message):
@@ -152,7 +303,6 @@ class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
-        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -171,7 +321,7 @@ auto_port = args.port == "auto"
 start_port = BASE_PORT if auto_port else int(args.port)
 os.makedirs(SITE_ROOT, exist_ok=True)
 os.chdir(SITE_ROOT)
-for path in (PORT_PATH, HOST_PATH, URL_PATH):
+for path in (PORT_PATH, HOST_PATH, URL_PATH, READY_PATH):
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -214,28 +364,56 @@ with open(HOST_PATH, "w", encoding="utf-8") as host_file:
     host_file.write(str(bound_host))
 with open(URL_PATH, "w", encoding="utf-8") as url_file:
     url_file.write(f"http://{bound_host}:{bound_port}/")
-write_log(f"SparkRun Python server listening on {bound_host}:{bound_port}")
+# CheerpX 1.3.9's userspace Tailscale stack cannot reliably loop a second
+# connection from this VM back into itself. The bind succeeded synchronously;
+# READY_PATH records that bind, while outer Chrome performs release E2E proof.
+with open(READY_PATH, "w", encoding="utf-8") as ready_file:
+    ready_file.write("SPARKRUN_BOUND")
+write_log(f"SparkRun Python server bound {bound_host}:{bound_port}")
 server.serve_forever()
 `.trimStart();
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const BOOTSTRAP_COMMAND_TIMEOUT_MS = 60_000;
+const VM_TIMEOUT_KILL_GRACE_SECONDS = 2;
+const COMMAND_COMPLETION_DRAIN_TIMEOUT_MS = 250;
+const COMMAND_CONSOLE_DRAIN_POLL_MS = 5;
+const COMMAND_TRAILING_OUTPUT_DRAIN_MS = 20;
+const HOST_COMMAND_WATCHDOG_GRACE_MS = 15_000;
+// Managed previews use curl with their own four-second socket deadline. Leave
+// enough scheduling headroom for a busy WebVM while keeping the command proof
+// watchdog bounded. The built-in Python server performs its readiness request
+// in-process and does not use this second command at all.
+const HTTP_PROBE_COMMAND_TIMEOUT_MS = 15_000;
+const COMMAND_COMPLETION_PREFIX = '__SPARKRUN_COMMAND_COMPLETED_';
 const SERVER_STATE_DIR = '/tmp/sparkrun';
 const SERVER_LOG_PATH = `${SERVER_STATE_DIR}/server.log`;
 const SERVER_PORT_PATH = `${SERVER_STATE_DIR}/server.port`;
 const SERVER_PID_PATH = `${SERVER_STATE_DIR}/server.pid`;
 const SERVER_HOST_PATH = `${SERVER_STATE_DIR}/server.host`;
 const SERVER_URL_PATH = `${SERVER_STATE_DIR}/server.url`;
+const SERVER_READY_PATH = `${SERVER_STATE_DIR}/server.ready`;
 const SERVER_LAUNCH_PID_PATH = `${SERVER_STATE_DIR}/server.launch.pid`;
+const TAILSCALE_LOGIN_HOSTS = new Set(['login.tailscale.com']);
 
 const SERVER_CLEANUP_COMMAND = [
   `mkdir -p ${SERVER_STATE_DIR}`,
-  `if [ -f ${SERVER_PID_PATH} ]; then kill "$(cat ${SERVER_PID_PATH})" 2>/dev/null || true; fi`,
-  `if [ -f ${SERVER_LAUNCH_PID_PATH} ]; then kill "$(cat ${SERVER_LAUNCH_PID_PATH})" 2>/dev/null || true; fi`,
-  "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill \"$pid\" 2>/dev/null || true; done",
-  'sleep 0.2',
-  "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do kill -9 \"$pid\" 2>/dev/null || true; done",
-  `rm -f ${SERVER_PID_PATH} ${SERVER_PORT_PATH} ${SERVER_HOST_PATH} ${SERVER_URL_PATH} ${SERVER_LAUNCH_PID_PATH} ${SERVER_LOG_PATH}`,
+  'sparkrun_valid_pid() { case "$1" in ""|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 1 ]; }',
+  'sparkrun_own_group="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d " \\n")"',
+  `sparkrun_group="$([ -f ${SERVER_LAUNCH_PID_PATH} ] && cat ${SERVER_LAUNCH_PID_PATH} 2>/dev/null || true)"`,
+  `sparkrun_pid="$([ -f ${SERVER_PID_PATH} ] && cat ${SERVER_PID_PATH} 2>/dev/null || true)"`,
+  'sparkrun_term_group() { sparkrun_valid_pid "$1" || return 0; [ "$1" = "$sparkrun_own_group" ] && return 0; kill -TERM -- "-$1" 2>/dev/null || true; }',
+  'sparkrun_kill_group() { sparkrun_valid_pid "$1" || return 0; [ "$1" = "$sparkrun_own_group" ] && return 0; kill -KILL -- "-$1" 2>/dev/null || true; }',
+  'sparkrun_term_pid() { sparkrun_valid_pid "$1" || return 0; kill -TERM -- "$1" 2>/dev/null || true; }',
+  'sparkrun_kill_pid() { sparkrun_valid_pid "$1" || return 0; kill -KILL -- "$1" 2>/dev/null || true; }',
+  'sparkrun_term_group "$sparkrun_group"',
+  'sparkrun_term_pid "$sparkrun_pid"',
+  "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do sparkrun_term_pid \"$pid\"; done",
+  'sleep 1',
+  'sparkrun_kill_group "$sparkrun_group"',
+  'sparkrun_kill_pid "$sparkrun_pid"',
+  "for pid in $(ps -eo pid,args 2>/dev/null | awk '/[.]sparkrun_static_server.py/ {print $1}'); do sparkrun_kill_pid \"$pid\"; done",
+  `rm -f ${SERVER_PID_PATH} ${SERVER_PORT_PATH} ${SERVER_HOST_PATH} ${SERVER_URL_PATH} ${SERVER_READY_PATH} ${SERVER_LAUNCH_PID_PATH} ${SERVER_LOG_PATH}`,
 ].join(' ; ');
 
 function formatPreviewUrl(ip: string | null, port: number | null): string | null {
@@ -250,8 +428,115 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 
-let globalErrorListenersInstalled = false;
-let lastWindowErrorSink: DebugCallback | null = null;
+type FatalTailnetRuntimeListener = (
+  error: CheerpXNetworkReloadRequiredError,
+) => void;
+
+interface FatalTailnetRuntimeRegistry {
+  fatalDiagnostic: string | null;
+  listeners: Set<FatalTailnetRuntimeListener>;
+  listenerInstalled: boolean;
+  lastDebugSink: DebugCallback | null;
+}
+
+const FATAL_TAILNET_REGISTRY_KEY = '__sparkrunFatalTailnetRuntimeV1__';
+const fatalTailnetRegistry = (() => {
+  const globalRecord = globalThis as typeof globalThis & {
+    [FATAL_TAILNET_REGISTRY_KEY]?: FatalTailnetRuntimeRegistry;
+  };
+  const existing = globalRecord[FATAL_TAILNET_REGISTRY_KEY];
+  if (existing) return existing;
+  const created: FatalTailnetRuntimeRegistry = {
+    fatalDiagnostic: null,
+    listeners: new Set(),
+    listenerInstalled: false,
+    lastDebugSink: null,
+  };
+  globalRecord[FATAL_TAILNET_REGISTRY_KEY] = created;
+  return created;
+})();
+
+const FATAL_TAILNET_RECOVERY_MESSAGE =
+  'The in-page WebVM network runtime crashed. Reload the browser tab to rebuild it; restarting only the VM cannot repair it. The Browser Vault workspace is safe.';
+
+export class CheerpXNetworkReloadRequiredError extends Error {
+  constructor() {
+    super(FATAL_TAILNET_RECOVERY_MESSAGE);
+    this.name = 'CheerpXNetworkReloadRequiredError';
+  }
+}
+
+function normalizeFatalTailnetRuntimeCandidate(value: unknown): string {
+  if (typeof value === 'string') return value.slice(0, 20_000);
+  if (value instanceof Error) {
+    return [value.name, value.message, value.stack]
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 20_000);
+  }
+  if (typeof ErrorEvent !== 'undefined' && value instanceof ErrorEvent) {
+    return [
+      normalizeFatalTailnetRuntimeCandidate(value.error),
+      value.message,
+      value.filename,
+    ]
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 20_000);
+  }
+  if (value && typeof value === 'object') {
+    const candidate = value as {
+      name?: unknown;
+      message?: unknown;
+      stack?: unknown;
+      filename?: unknown;
+    };
+    return [
+      candidate.name,
+      candidate.message,
+      candidate.stack,
+      candidate.filename,
+    ]
+      .filter((part): part is string => typeof part === 'string')
+      .join('\n')
+      .slice(0, 20_000);
+  }
+  return String(value).slice(0, 20_000);
+}
+
+export function isFatalTailnetRuntimeError(value: unknown): boolean {
+  const message = normalizeFatalTailnetRuntimeCandidate(value);
+  return (
+    /memory access out of bounds/i.test(message) &&
+    /\b(?:tcp_input|tcp_bind)\b/i.test(message) &&
+    /(?:ipstack|tailscale_tun)(?:\.js)?/i.test(message)
+  );
+}
+
+function recordFatalTailnetRuntimeError(value: unknown): boolean {
+  if (!isFatalTailnetRuntimeError(value)) return false;
+  if (fatalTailnetRegistry.fatalDiagnostic) return true;
+  fatalTailnetRegistry.fatalDiagnostic =
+    normalizeFatalTailnetRuntimeCandidate(value);
+  const error = new CheerpXNetworkReloadRequiredError();
+  for (const listener of [...fatalTailnetRegistry.listeners]) {
+    listener(error);
+  }
+  return true;
+}
+
+export function getFatalTailnetRuntimeFailure(): string | null {
+  return fatalTailnetRegistry.fatalDiagnostic
+    ? FATAL_TAILNET_RECOVERY_MESSAGE
+    : null;
+}
+
+/** Test-only reset for the page-lifetime fault latch. */
+export function resetFatalTailnetRuntimeFailureForTests(): void {
+  fatalTailnetRegistry.fatalDiagnostic = null;
+  fatalTailnetRegistry.listeners.clear();
+  fatalTailnetRegistry.lastDebugSink = null;
+}
 
 declare const __CHEERPX_PINNED_VERSION__: string;
 declare const __SPARKRUN_BUILD_SHA__: string;
@@ -270,28 +555,32 @@ export const SPARKRUN_BUILD_TIME: string =
     ? __SPARKRUN_BUILD_TIME__
     : 'dev';
 
-const WORKSPACE_DB_NAME = 'sparkrun-workspace';
-const ROOT_CACHE_DB_NAME = 'sparkrun-root-cache-debian-2026-06-01';
-const LEGACY_ROOT_CACHE_DB_NAME = 'sparkrun-root-cache';
+export const DEFAULT_WORKSPACE_DB_NAME = 'sparkrun-workspace';
+export const DEFAULT_ROOT_CACHE_DB_NAME = 'sparkrun-root-cache-debian-2026-06-01';
 
 export const SPARKRUN_IDB_DATABASES = [
-  WORKSPACE_DB_NAME,
-  ROOT_CACHE_DB_NAME,
-  LEGACY_ROOT_CACHE_DB_NAME,
+  DEFAULT_WORKSPACE_DB_NAME,
+  DEFAULT_ROOT_CACHE_DB_NAME,
 ] as const;
 
 export async function hardResetSparkrunCaches(options: {
   includeDiskCache?: boolean;
+  workspaceDbName?: string;
+  rootCacheDbName?: string;
 } = {}): Promise<void> {
   if (typeof indexedDB === 'undefined') {
     throw new Error('IndexedDB is not available in this environment.');
   }
-  const targets: string[] = [WORKSPACE_DB_NAME];
+  const targets: string[] = [
+    options.workspaceDbName?.trim() || DEFAULT_WORKSPACE_DB_NAME,
+  ];
   if (options.includeDiskCache) {
-    targets.push(ROOT_CACHE_DB_NAME, LEGACY_ROOT_CACHE_DB_NAME);
+    targets.push(
+      options.rootCacheDbName?.trim() || DEFAULT_ROOT_CACHE_DB_NAME,
+    );
   }
   await Promise.all(
-    targets.map(
+    Array.from(new Set(targets)).map(
       (name) =>
         new Promise<void>((resolve, reject) => {
           const request = indexedDB.deleteDatabase(name);
@@ -325,7 +614,7 @@ export function detectCheerpxRuntimeVersion(): string | null {
   return null;
 }
 
-const TAILSCALE_AUTH_KEY_PATTERN = /^tskey-(auth|client)-[A-Za-z0-9_-]+$/;
+const TAILSCALE_AUTH_KEY_PATTERN = /^tskey-auth-[A-Za-z0-9_-]+$/;
 
 export function validateTailscaleAuthKey(rawValue: string): string | null {
   const value = rawValue.trim();
@@ -334,6 +623,9 @@ export function validateTailscaleAuthKey(rawValue: string): string | null {
   }
   if (!value.startsWith('tskey-')) {
     return 'Tailscale auth keys start with "tskey-". Generate one in the Tailscale admin console under Settings → Keys.';
+  }
+  if (value.startsWith('tskey-client-')) {
+    return 'This is an OAuth client credential, not a device auth key. Generate an auth key in the Tailscale admin console under Settings → Keys.';
   }
   if (!TAILSCALE_AUTH_KEY_PATTERN.test(value)) {
     return 'This does not look like a Tailscale auth key. It should look like "tskey-auth-..." with no spaces.';
@@ -344,23 +636,35 @@ export function validateTailscaleAuthKey(rawValue: string): string | null {
   return null;
 }
 
-const GOOGLE_API_KEY_PATTERN = /^AIza[A-Za-z0-9_-]{30,}$/;
+// Google AI Studio now issues both legacy standard keys and dotted
+// authorization keys. Keep this check deliberately structural: the API is
+// the authority on whether an opaque key is valid.
+const GOOGLE_API_KEY_PATTERN = /^[A-Za-z0-9_.-]{20,200}$/;
 
 export function validateGoogleApiKey(rawValue: string): string | null {
   const value = rawValue.trim();
   if (!value) {
     return 'Google AI Studio API key is required.';
   }
-  if (!value.startsWith('AIza')) {
-    return 'Google AI Studio API keys start with "AIza". Get one at aistudio.google.com → Get API key.';
-  }
   if (!GOOGLE_API_KEY_PATTERN.test(value)) {
-    return 'This does not look like a Google API key. It should look like "AIza..." with no spaces.';
+    return 'This does not look like a Google API key. Paste the key exactly as issued, with no spaces.';
   }
   return null;
 }
 
-export class WebVmBackend implements VmFileBackend {
+export class WebVmBackend
+  implements VmFileBackend, CodingRuntime, WorkspaceRuntime
+{
+  readonly id = `cheerpx-${crypto.randomUUID()}`;
+  readonly provider = 'cheerpx' as const;
+  readonly workspaceRoot = SITE_ROOT;
+  readonly capabilities = {
+    interactiveTerminal: true,
+    managedPreview: true,
+    privatePreview: true,
+    workspaceArchive: true,
+    hardDispose: true,
+  } as const;
   private activeCapture: ActiveCapture | null = null;
   private queue: Promise<unknown> = Promise.resolve();
   private tailnetIp: string | null = null;
@@ -368,42 +672,81 @@ export class WebVmBackend implements VmFileBackend {
   private serverPort: number | null = null;
   private serverStarted = false;
   private startServerPromise: Promise<VmCommandResult> | null = null;
+  private serverProcessPromise: Promise<{ status: number }> | null = null;
   private serverLastExit: VmCommandResult | null = null;
   private commandRunnerTimedOut = false;
   private consoleInput: ((charCode: number) => void) | null = null;
   private interactiveShellRunning = false;
   private interactiveShellPromise: Promise<{ status: number }> | null = null;
   private tailnetLoginStarted = false;
+  private tailnetConnectPromise: Promise<string | null> | null = null;
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
   private highestTailnetState: number | null = null;
+  private fatalNetworkFailurePublished = false;
+  private readonly fatalNetworkRuntimeListener: FatalTailnetRuntimeListener;
+  private disposed = false;
+  private disposePromise: Promise<void> | null = null;
 
   private constructor(
     private readonly cx: CheerpXLinux,
     private readonly workspaceDevice: IdbDevice,
     private readonly dataDevice: DataDevice,
     private readonly autoConnectTailnetForServer: boolean,
+    private readonly timeoutRunner: 'gnu' | 'busybox',
+    private readonly nodeCompatibility: WebVmDiskProfile['nodeCompatibility'],
     private readonly onConsole?: ConsoleCallback,
     private readonly onStatus?: StatusCallback,
     private readonly onDebug?: DebugCallback,
-  ) {}
+  ) {
+    this.fatalNetworkRuntimeListener = () => {
+      this.publishFatalNetworkFailure();
+    };
+    fatalTailnetRegistry.listeners.add(this.fatalNetworkRuntimeListener);
+  }
+
+  private async awaitAbortable<T>(
+    operation: Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!signal) return operation;
+    if (signal.aborted) {
+      await this.dispose();
+      throw commandAbortError();
+    }
+
+    let onAbort: (() => void) | null = null;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        // CheerpX exposes no reliable per-process kill handle. Deleting the VM
+        // is the only fail-closed process-tree cancellation boundary.
+        void this.dispose();
+        reject(commandAbortError());
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([operation, aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+    }
+  }
 
   static async create(options: CreateWebVmBackendOptions): Promise<WebVmBackend> {
-    options.onStatus?.({
-      lifecycle: 'booting',
-      message: 'Loading CheerpX and disk image',
-    });
-
-    if (typeof window !== 'undefined' && !globalErrorListenersInstalled) {
-      globalErrorListenersInstalled = true;
+    if (typeof window !== 'undefined' && !fatalTailnetRegistry.listenerInstalled) {
+      fatalTailnetRegistry.listenerInstalled = true;
       window.addEventListener('error', (event) => {
-        const message = event.error
-          ? event.error instanceof Error
-            ? `${event.error.message} @ ${event.filename}:${event.lineno}:${event.colno}\n${event.error.stack ?? ''}`
-            : String(event.error)
-          : `${event.message} @ ${event.filename}:${event.lineno}:${event.colno}`;
+        const message = [
+          normalizeFatalTailnetRuntimeCandidate(event.error ?? event),
+          event.filename
+            ? `${event.filename}:${event.lineno}:${event.colno}`
+            : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
         console.error('[webvm] window.onerror', event);
-        lastWindowErrorSink?.({
+        recordFatalTailnetRuntimeError(event.error ?? event);
+        fatalTailnetRegistry.lastDebugSink?.({
           phase: 'window-error',
           status: 1,
           output: message,
@@ -411,17 +754,34 @@ export class WebVmBackend implements VmFileBackend {
       });
       window.addEventListener('unhandledrejection', (event) => {
         const reason = event.reason;
-        const message =
-          reason instanceof Error ? `${reason.message}\n${reason.stack ?? ''}` : String(reason);
+        const message = normalizeFatalTailnetRuntimeCandidate(reason);
         console.error('[webvm] unhandledrejection', event);
-        lastWindowErrorSink?.({
+        recordFatalTailnetRuntimeError(reason);
+        fatalTailnetRegistry.lastDebugSink?.({
           phase: 'unhandled-rejection',
           status: 1,
           output: message,
         });
       });
     }
-    lastWindowErrorSink = options.onDebug ?? null;
+    fatalTailnetRegistry.lastDebugSink = options.onDebug ?? null;
+
+    if (getFatalTailnetRuntimeFailure()) {
+      options.onStatus?.({
+        lifecycle: 'error',
+        message: 'Network runtime crashed — reload required',
+        tailnetIp: null,
+        loginUrl: null,
+        previewUrl: null,
+        serverPort: null,
+      });
+      throw new CheerpXNetworkReloadRequiredError();
+    }
+
+    options.onStatus?.({
+      lifecycle: 'booting',
+      message: 'Loading CheerpX and disk image',
+    });
 
     options.onDebug?.({
       phase: 'sparkrun-build',
@@ -439,25 +799,78 @@ export class WebVmBackend implements VmFileBackend {
       }`,
     });
 
+    const diskProfile = options.diskProfile ?? DEFAULT_WEBVM_DISK_PROFILE;
+    options.onDebug?.({
+      phase: 'disk',
+      output: `Loading ${diskProfile.label} (${diskProfile.id}) from ${diskProfile.url}`,
+    });
+
     let rootDevice: unknown;
+    const createRootDevice = async (url: string): Promise<unknown> => {
+      if (diskProfile.kind === 'github') {
+        return CheerpX.GitHubDevice.create(url);
+      }
+      if (diskProfile.kind === 'bytes') {
+        return CheerpX.HttpBytesDevice.create(url);
+      }
+      return CheerpX.CloudDevice.create(url);
+    };
+    const createRootDeviceWithRetries = (url: string) =>
+      withEightApiRetries(
+        (retry) =>
+          createRootDevice(
+            diskProfile.kind === 'bytes'
+              ? cacheBustedByteDeviceUrl(url, retry)
+              : url,
+          ),
+        {
+          onRetry: (retry, error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            options.onDebug?.({
+              phase: 'disk-retry',
+              status: 1,
+              output: `Disk initialization failed; retry ${retry}/${API_RETRY_LIMIT}: ${message}`,
+            });
+          },
+        },
+      );
     try {
-      rootDevice = await CheerpX.CloudDevice.create(WEBVM_DISK_URL);
+      rootDevice = await createRootDeviceWithRetries(diskProfile.url);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error('[webvm] CloudDevice.create failed for', WEBVM_DISK_URL, error);
+      console.error(
+        `[webvm] ${diskProfile.kind} disk create failed for`,
+        diskProfile.url,
+        error,
+      );
       options.onDebug?.({
         phase: 'disk',
         status: 1,
-        output: `CloudDevice.create failed for ${WEBVM_DISK_URL}: ${message}`,
+        output: `${diskProfile.kind} disk create failed for ${diskProfile.url}: ${message}`,
       });
-      if (WEBVM_DISK_URL.startsWith('wss:')) {
-        const fallbackUrl = `https:${WEBVM_DISK_URL.slice('wss:'.length)}`;
+      if (diskProfile.kind === 'cloud' && diskProfile.url.startsWith('wss:')) {
+        const fallbackUrl = `https:${diskProfile.url.slice('wss:'.length)}`;
         options.onDebug?.({
           phase: 'disk',
           output: `Retrying disk load over HTTPS fallback: ${fallbackUrl}`,
         });
         try {
-          rootDevice = await CheerpX.CloudDevice.create(fallbackUrl);
+          rootDevice = await withEightApiRetries(
+            () => CheerpX.CloudDevice.create(fallbackUrl),
+            {
+              onRetry: (retry, retryError) => {
+                const retryMessage =
+                  retryError instanceof Error
+                    ? retryError.message
+                    : String(retryError);
+                options.onDebug?.({
+                  phase: 'disk-retry',
+                  status: 1,
+                  output: `HTTPS fallback initialization failed; retry ${retry}/${API_RETRY_LIMIT}: ${retryMessage}`,
+                });
+              },
+            },
+          );
         } catch (fallbackError) {
           const fallbackMessage =
             fallbackError instanceof Error
@@ -480,9 +893,17 @@ export class WebVmBackend implements VmFileBackend {
       }
     }
 
-    const rootCache = await CheerpX.IDBDevice.create(ROOT_CACHE_DB_NAME);
+    const rootCacheDbName =
+      options.rootCacheDbName?.trim() || DEFAULT_ROOT_CACHE_DB_NAME;
+    const workspaceDbName =
+      options.workspaceDbName?.trim() || DEFAULT_WORKSPACE_DB_NAME;
+    options.onDebug?.({
+      phase: 'boot',
+      output: `IndexedDB rootCache=${rootCacheDbName} workspace=${workspaceDbName} prepareWorkspace=${options.prepareWorkspace ?? 'clean-site'}`,
+    });
+    const rootCache = await CheerpX.IDBDevice.create(rootCacheDbName);
     const overlayDevice = await CheerpX.OverlayDevice.create(rootDevice, rootCache);
-    const workspaceDevice = await CheerpX.IDBDevice.create(WORKSPACE_DB_NAME);
+    const workspaceDevice = await CheerpX.IDBDevice.create(workspaceDbName);
     const dataDevice = await CheerpX.DataDevice.create();
 
     const trimmedAuthKey = options.tailscaleAuthKey?.trim() || undefined;
@@ -513,9 +934,10 @@ export class WebVmBackend implements VmFileBackend {
     const networkInterface = {
       authKey: trimmedAuthKey,
       loginUrlCb: (url: string) => {
+        if (getFatalTailnetRuntimeFailure()) return;
         options.onDebug?.({
           phase: 'tailnet-login-url',
-          output: `Tailscale loginUrlCb fired: ${url}`,
+          output: 'Tailscale login URL callback received.',
         });
         try {
           backend?.handleLoginUrl(url);
@@ -531,6 +953,7 @@ export class WebVmBackend implements VmFileBackend {
         }
       },
       stateUpdateCb: (state: number) => {
+        if (getFatalTailnetRuntimeFailure()) return;
         const name = TAILNET_STATE_NAMES[state] ?? `Unknown(${state})`;
         options.onDebug?.({
           phase: 'tailnet-state',
@@ -544,6 +967,7 @@ export class WebVmBackend implements VmFileBackend {
       netmapUpdateCb: (map: {
         self?: { addresses?: string[] };
       }) => {
+        if (getFatalTailnetRuntimeFailure()) return;
         const addresses = map.self?.addresses ?? [];
         const ip = addresses[0] ?? null;
         options.onDebug?.({
@@ -569,67 +993,172 @@ export class WebVmBackend implements VmFileBackend {
       },
     };
 
-    const cx = await CheerpX.Linux.create({
-      mounts: [
-        { type: 'ext2', dev: overlayDevice, path: '/' },
-        { type: 'dir', dev: workspaceDevice, path: WORKSPACE_ROOT },
-        { type: 'dir', dev: dataDevice, path: '/data' },
-        { type: 'devs', path: '/dev' },
-        { type: 'devpts', path: '/dev/pts' },
-        { type: 'proc', path: '/proc' },
-        { type: 'sys', path: '/sys' },
-      ],
-      networkInterface,
-    });
+    let cx: CheerpXLinux;
+    try {
+      cx = await CheerpX.Linux.create({
+        mounts: [
+          { type: 'ext2', dev: overlayDevice, path: '/' },
+          { type: 'dir', dev: workspaceDevice, path: WORKSPACE_ROOT },
+          { type: 'dir', dev: dataDevice, path: '/data' },
+          { type: 'devs', path: '/dev' },
+          { type: 'devpts', path: '/dev/pts' },
+          { type: 'proc', path: '/proc' },
+          { type: 'sys', path: '/sys' },
+        ],
+        networkInterface,
+      });
+    } catch (error) {
+      recordFatalTailnetRuntimeError(error);
+      if (getFatalTailnetRuntimeFailure()) {
+        throw new CheerpXNetworkReloadRequiredError();
+      }
+      throw error;
+    }
+    if (getFatalTailnetRuntimeFailure()) {
+      cx.delete();
+      throw new CheerpXNetworkReloadRequiredError();
+    }
 
     backend = new WebVmBackend(
       cx,
       workspaceDevice,
       dataDevice,
       Boolean(options.tailscaleAuthKey?.trim()),
+      diskProfile.timeoutRunner,
+      diskProfile.nodeCompatibility,
       options.onConsole,
       options.onStatus,
       options.onDebug,
     );
-    backend.attachConsole();
-    await backend.prepareWorkspace();
-    // Note: we deliberately do NOT run probeWorkspaceWritable here at boot.
-    // On some machines, the probe's write+rm cycle (`printf > .probe; cat; rm`)
-    // leaves the IDB workspace in a half-committed state where the next
-    // unrelated cp immediately fails with "Read-only file system" — even
-    // though the probe itself succeeded. The probe was useful diagnostically
-    // but it became the cause of what it was trying to detect. The agent's
-    // first cp serves as the implicit probe; if it fails we surface the
-    // failure with a clear message at that point.
-    if (pendingTailnetIp) {
-      backend.setTailnetIp(pendingTailnetIp);
+    try {
+      backend.attachConsole();
+      await backend.prepareWorkspace(options.prepareWorkspace ?? 'clean-site');
+      // Note: we deliberately do NOT run probeWorkspaceWritable here at boot.
+      // On some machines, the probe's write+rm cycle (`printf > .probe; cat; rm`)
+      // leaves the IDB workspace in a half-committed state where the next
+      // unrelated cp immediately fails with "Read-only file system" — even
+      // though the probe itself succeeded. The probe was useful diagnostically
+      // but it became the cause of what it was trying to detect. The agent's
+      // first cp serves as the implicit probe; if it fails we surface the
+      // failure with a clear message at that point.
+      if (pendingTailnetIp) {
+        backend.setTailnetIp(pendingTailnetIp);
+      }
+      if (!backend.tailnetIp) {
+        backend.publishStatus('ready', 'VM ready');
+      }
+      backend.throwIfFatalNetworkFailure();
+      return backend;
+    } catch (error) {
+      // Linux.create has already mounted both IndexedDB devices. A failed
+      // console/workspace initialization must still release the CheerpX
+      // instance or the next boot can find a blocked/half-open database.
+      await backend.dispose().catch(() => undefined);
+      throw error;
     }
-    if (!backend.tailnetIp) {
-      backend.publishStatus('ready', 'VM ready');
-    }
-    return backend;
   }
 
   getPreviewUrl(): string | null {
-    return formatPreviewUrl(this.tailnetIp, this.serverPort);
+    return this.disposed || this.getFatalNetworkFailure()
+      ? null
+      : formatPreviewUrl(this.tailnetIp, this.serverPort);
   }
 
   getTailnetIp(): string | null {
-    return this.tailnetIp;
+    return this.disposed || this.getFatalNetworkFailure() ? null : this.tailnetIp;
+  }
+
+  getPrivateNetworkAddress(): string | null {
+    return this.getTailnetIp();
+  }
+
+  getFatalNetworkFailure(): string | null {
+    return getFatalTailnetRuntimeFailure();
+  }
+
+  private publishFatalNetworkFailure(): void {
+    const message = this.getFatalNetworkFailure();
+    if (!message || this.fatalNetworkFailurePublished || this.disposed) return;
+    this.fatalNetworkFailurePublished = true;
+    this.publishStatus('error', 'Network runtime crashed — reload required');
+    this.publishDebug({
+      phase: 'tailnet',
+      status: 1,
+      output: message,
+    });
+  }
+
+  private throwIfFatalNetworkFailure(): void {
+    if (!this.getFatalNetworkFailure()) return;
+    this.publishFatalNetworkFailure();
+    throw new CheerpXNetworkReloadRequiredError();
+  }
+
+  connectPrivateNetwork(
+    options: PrivateNetworkConnectOptions = {},
+  ): Promise<string | null> {
+    return this.connectTailnet(options);
   }
 
   getServerPort(): number | null {
     return this.serverPort;
   }
 
+  isDisposed(): boolean {
+    return this.disposed;
+  }
+
   async connectTailnet(
     options: ConnectTailnetOptions = {},
   ): Promise<string | null> {
+    if (this.disposed) {
+      throw new Error(
+        'The VM has been disposed. Start a fresh VM before connecting its private network.',
+      );
+    }
+    this.throwIfFatalNetworkFailure();
     if (this.tailnetIp) {
       this.publishStatus('tailnet-connected', 'Tailnet connected');
       return null;
     }
     if (!this.cx.networkLogin) {
+      throw new Error('This CheerpX build does not expose networkLogin.');
+    }
+
+    // networkInterface exposes only one set of callbacks, so two independent
+    // attempts cannot safely own separate resolver slots. Coalesce every
+    // overlapping caller onto the same attempt. This also prevents a second
+    // caller (including startServer) from invoking networkLogin again while
+    // the first login is still progressing.
+    if (this.tailnetConnectPromise) {
+      this.publishDebug({
+        phase: 'tailnet',
+        output: 'Reusing the in-flight Tailnet connection attempt.',
+      });
+      return this.tailnetConnectPromise;
+    }
+
+    if (this.loginUrl && !options.forceLogin) {
+      return this.loginUrl;
+    }
+
+    const connectPromise = this.connectTailnetInner(options);
+    this.tailnetConnectPromise = connectPromise;
+    try {
+      return await connectPromise;
+    } finally {
+      if (this.tailnetConnectPromise === connectPromise) {
+        this.tailnetConnectPromise = null;
+      }
+    }
+  }
+
+  private async connectTailnetInner(
+    options: ConnectTailnetOptions,
+  ): Promise<string | null> {
+    this.throwIfFatalNetworkFailure();
+    const networkLogin = this.cx.networkLogin;
+    if (!networkLogin) {
       throw new Error('This CheerpX build does not expose networkLogin.');
     }
     if (options.forceLogin) {
@@ -640,12 +1169,24 @@ export class WebVmBackend implements VmFileBackend {
     }
 
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let resolveSignal!: (url: string | null) => void;
+    let rejectSignal!: (error: Error) => void;
     const signalPromise = new Promise<string | null>((resolve, reject) => {
-      this.resolveTailnetSignal = resolve;
-      this.rejectTailnetSignal = reject;
+      resolveSignal = resolve;
+      rejectSignal = reject;
     });
+    this.resolveTailnetSignal = resolveSignal;
+    this.rejectTailnetSignal = rejectSignal;
     const timeoutPromise = new Promise<null>((resolve) => {
       timeoutId = setTimeout(() => resolve(null), options.timeoutMs ?? 15_000);
+    });
+    let rejectFatalRuntime!: FatalTailnetRuntimeListener;
+    const fatalRuntimePromise = new Promise<never>((_resolve, reject) => {
+      rejectFatalRuntime = (error) => reject(error);
+      fatalTailnetRegistry.listeners.add(rejectFatalRuntime);
+      if (this.getFatalNetworkFailure()) {
+        rejectFatalRuntime(new CheerpXNetworkReloadRequiredError());
+      }
     });
 
     this.publishStatus('booting', 'Starting Tailscale login');
@@ -654,17 +1195,25 @@ export class WebVmBackend implements VmFileBackend {
       const reportLoginFailure = (error: unknown): void => {
         const message = error instanceof Error ? error.message : String(error);
         console.error('[webvm] cx.networkLogin() rejected', error);
+        const isFatal = recordFatalTailnetRuntimeError(error);
         this.publishDebug({
           phase: 'tailnet-login',
           status: 1,
           output: `networkLogin() rejected: ${message}`,
         });
-        this.rejectTailnetSignal?.(
-          error instanceof Error ? error : new Error(String(error)),
-        );
+        this.tailnetLoginStarted = false;
+        if (this.rejectTailnetSignal === rejectSignal) {
+          rejectSignal(
+            isFatal
+              ? new CheerpXNetworkReloadRequiredError()
+              : error instanceof Error
+                ? error
+                : new Error(String(error)),
+          );
+        }
       };
       try {
-        void Promise.resolve(this.cx.networkLogin()).catch(reportLoginFailure);
+        void Promise.resolve(networkLogin.call(this.cx)).catch(reportLoginFailure);
       } catch (error) {
         reportLoginFailure(error);
       }
@@ -673,6 +1222,9 @@ export class WebVmBackend implements VmFileBackend {
     try {
       const result = await Promise.race([
         signalPromise.catch((error: unknown) => {
+          if (error instanceof CheerpXNetworkReloadRequiredError) {
+            throw error;
+          }
           const message = error instanceof Error ? error.message : String(error);
           console.error('[webvm] tailnet signal rejected', error);
           this.publishDebug({
@@ -683,11 +1235,14 @@ export class WebVmBackend implements VmFileBackend {
           return null;
         }),
         timeoutPromise,
+        fatalRuntimePromise,
       ]);
+      this.throwIfFatalNetworkFailure();
       if (result === null && !this.tailnetIp && !this.loginUrl) {
-        const stuckAtNoState =
-          this.highestTailnetState === null || this.highestTailnetState <= 0;
-        if (stuckAtNoState) {
+        if (
+          this.highestTailnetState === null ||
+          this.highestTailnetState <= 0
+        ) {
           this.publishStatus(
             'error',
             'Tailscale auth key rejected — generate a fresh reusable key',
@@ -710,28 +1265,147 @@ export class WebVmBackend implements VmFileBackend {
           });
         }
       }
+      this.throwIfFatalNetworkFailure();
       return result;
     } finally {
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
+      fatalTailnetRegistry.listeners.delete(rejectFatalRuntime);
+      // A timeout settles the caller but not signalPromise. Release the exact
+      // callbacks owned by this attempt so they cannot become orphaned or be
+      // mistaken for a later retry's waiters.
+      if (this.resolveTailnetSignal === resolveSignal) {
+        this.resolveTailnetSignal = null;
+      }
+      if (this.rejectTailnetSignal === rejectSignal) {
+        this.rejectTailnetSignal = null;
+      }
     }
   }
 
   async resetWorkspace(): Promise<void> {
-    // Reset is an explicit recovery action. Clear any stale timeout lockout
-    // first, otherwise every execBash below (server cleanup, rm -rf/mkdir)
-    // would short-circuit with status 124 and we'd publish "Workspace reset"
-    // while leaving SITE_ROOT missing and the backend still wedged.
-    this.commandRunnerTimedOut = false;
+    if (this.commandRunnerTimedOut || this.disposed) {
+      throw new Error(
+        'This VM was stopped after an unverified command timeout. Start a fresh VM before resetting its workspace.',
+      );
+    }
     await this.stopServer();
     await this.workspaceDevice.reset();
     this.serverStarted = false;
     this.startServerPromise = null;
     this.serverLastExit = null;
     this.serverPort = null;
-    await this.prepareWorkspace();
+    await this.prepareWorkspace('clean-site');
     this.publishStatus('ready', 'Workspace reset');
+  }
+
+  /**
+   * Create a byte-faithful recovery archive outside the app's metadata store.
+   * The tarball preserves binary files, dotfiles, modes, symlinks and empty
+   * directories; the caller commits the returned Blob to the independent
+   * SparkRun browser vault before any destructive VM action.
+   */
+  async createWorkspaceArchive(): Promise<Blob> {
+    const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const archiveName = `.sparkrun-vault-export-${stamp}.tar.gz`;
+    const archiveVmPath = `${WORKSPACE_ROOT}/${archiveName}`;
+    const archiveDevicePath = `/${archiveName}`;
+    const command = [
+      `rm -f ${shellQuote(archiveVmPath)}`,
+      `tar -C ${shellQuote(WORKSPACE_ROOT)} --exclude=${shellQuote(
+        '.sparkrun-vault-export-*.tar.gz',
+      )} -czf ${shellQuote(archiveVmPath)} site`,
+    ].join(' && ');
+    const result = await this.execBash(
+      command,
+      WORKSPACE_ROOT,
+      false,
+      false,
+      120_000,
+    );
+    if (result.status !== 0) {
+      throw new Error(
+        `Could not archive the VM workspace: ${
+          result.output || `tar exited with status ${result.status}`
+        }`,
+      );
+    }
+    try {
+      const blob = await this.workspaceDevice.readFileAsBlob(archiveDevicePath);
+      if (!blob || blob.size === 0) {
+        throw new Error('The VM created an empty workspace archive.');
+      }
+      // Detach the returned bytes from the workspace database. Some IDBDevice
+      // implementations stream lazily, so deleting the staging inode before a
+      // copy is materialized can invalidate the Blob.
+      return new Blob([await blob.arrayBuffer()], { type: 'application/gzip' });
+    } finally {
+      await this.execBash(
+        `rm -f ${shellQuote(archiveVmPath)}`,
+        WORKSPACE_ROOT,
+        false,
+        false,
+        15_000,
+        false,
+      ).catch(() => undefined);
+    }
+  }
+
+  /** Restore a previously committed tar.gz checkpoint into a clean site root. */
+  async restoreWorkspaceArchive(archive: Blob): Promise<void> {
+    const stage = `restore-${Date.now()}-${Math.random().toString(16).slice(2)}.tar.gz`;
+    const restoreRoot = `/tmp/sparkrun/${stage}-tree`;
+    const stopped = await this.stopServer();
+    if (stopped.status !== 0) {
+      throw new Error(
+        `Could not stop the preview before restoring the VM workspace checkpoint: ${
+          stopped.output || `cleanup exited with status ${stopped.status}`
+        }`,
+      );
+    }
+    await this.dataDevice.writeFile(`/${stage}`, new Uint8Array(await archive.arrayBuffer()));
+    const result = await this.execBash(
+      [
+        // /data is an in-memory DataDevice. Always remove the unique staging
+        // archive when this shell exits, including ordinary extraction/copy
+        // failures, so repeated restores cannot exhaust browser memory.
+        `trap ${shellQuote(
+          `rm -f ${shellQuote(`/data/${stage}`)}; rm -rf ${shellQuote(restoreRoot)}`,
+        )} EXIT`,
+        // Extract on the root overlay first. Direct tar extraction into the
+        // IDBDevice workspace triggers CheerpX's fileData worker failure, and
+        // root-owned archives also attempt an unsupported chown syscall.
+        `rm -rf ${shellQuote(restoreRoot)}`,
+        `mkdir -p ${shellQuote(restoreRoot)}`,
+        `tar --no-same-owner -C ${shellQuote(restoreRoot)} -xzf ${shellQuote(`/data/${stage}`)}`,
+        `test -d ${shellQuote(`${restoreRoot}/site`)}`,
+        // Keep the healthy SITE_ROOT inode created at boot. Copying ordinary
+        // files across mounts follows the same path as writeText/writeBytes,
+        // which CheerpX handles reliably, without tar applying metadata to IDB.
+        `mkdir -p ${shellQuote(SITE_ROOT)}`,
+        `rm -rf ${shellQuote(SITE_ROOT)}/* ${shellQuote(SITE_ROOT)}/.[!.]* ${shellQuote(SITE_ROOT)}/..?*`,
+        `cp -dR ${shellQuote(`${restoreRoot}/site`)}/. ${shellQuote(SITE_ROOT)}/`,
+        `rm -rf ${shellQuote(restoreRoot)}`,
+        `test -d ${shellQuote(SITE_ROOT)}`,
+      ].join(' && '),
+      '/',
+      false,
+      false,
+      120_000,
+    );
+    if (result.status !== 0) {
+      await this.cleanupDataStage(stage, restoreRoot);
+      throw new Error(
+        `Could not restore the VM workspace checkpoint: ${
+          result.output || `tar exited with status ${result.status}`
+        }`,
+      );
+    }
+    this.publishDebug({
+      phase: 'checkpoint-restore',
+      output: `Restored ${archive.size} bytes through the root overlay into ${SITE_ROOT}.`,
+    });
   }
 
   async readText(relativePath: string): Promise<string> {
@@ -745,28 +1419,49 @@ export class WebVmBackend implements VmFileBackend {
     return blob.text();
   }
 
-  async writeText(relativePath: string, content: string): Promise<void> {
+  async readBytes(relativePath: string): Promise<Uint8Array> {
     const normalized = normalizeSitePath(relativePath);
-    await this.copyTextToVm(toVmPath(normalized), content, SITE_ROOT);
+    const blob = await this.workspaceDevice.readFileAsBlob(
+      toWorkspaceDevicePath(normalized),
+    );
+    if (!blob || typeof blob.arrayBuffer !== 'function') {
+      throw new Error(`File not found: ${toVmPath(normalized)}`);
+    }
+    return new Uint8Array(await blob.arrayBuffer());
   }
 
-  private async copyTextToVm(
+  async writeText(relativePath: string, content: string): Promise<void> {
+    const normalized = normalizeSitePath(relativePath);
+    await this.copyContentToVm(toVmPath(normalized), content, SITE_ROOT);
+  }
+
+  async writeBytes(relativePath: string, content: Uint8Array): Promise<void> {
+    const normalized = normalizeSitePath(relativePath);
+    await this.copyContentToVm(toVmPath(normalized), content, SITE_ROOT);
+  }
+
+  private async copyContentToVm(
     destination: string,
-    content: string,
+    content: string | Uint8Array,
     cwd: string,
   ): Promise<void> {
     const staged = stageName();
     await this.dataDevice.writeFile(`/${staged}`, content);
     const directory = destination.slice(0, destination.lastIndexOf('/')) || SITE_ROOT;
     const result = await this.execBash(
-      `mkdir -p ${shellQuote(directory)} && cp ${shellQuote(
-        `/data/${staged}`,
-      )} ${shellQuote(destination)}`,
+      [
+        // DataDevice has no JavaScript unlink API. A shell EXIT trap removes
+        // the unique in-memory stage on both successful and failed copies.
+        `trap ${shellQuote(`rm -f ${shellQuote(`/data/${staged}`)}`)} EXIT`,
+        `mkdir -p ${shellQuote(directory)}`,
+        `cp ${shellQuote(`/data/${staged}`)} ${shellQuote(destination)}`,
+      ].join(' && '),
       SITE_ROOT,
       false,
       false,
     );
     if (result.status !== 0) {
+      await this.cleanupDataStage(staged);
       const message = `Failed to write ${destination}: ${
         result.output || `cp exited with status ${result.status}`
       }`;
@@ -779,25 +1474,55 @@ export class WebVmBackend implements VmFileBackend {
     }
   }
 
+  private async cleanupDataStage(
+    staged: string,
+    restoreRoot?: string,
+  ): Promise<void> {
+    if (this.disposed || this.commandRunnerTimedOut) return;
+    await this.execBash(
+      [
+        `rm -f ${shellQuote(`/data/${staged}`)}`,
+        ...(restoreRoot ? [`rm -rf ${shellQuote(restoreRoot)}`] : []),
+      ].join(' && '),
+      '/',
+      false,
+      false,
+      5_000,
+      false,
+    ).catch(() => undefined);
+  }
+
   async listDirectory(relativePath: string): Promise<DirectoryEntry[]> {
     const vmPath = toVmPath(normalizeSitePath(relativePath));
     const result = await this.execBash(
       `if [ -d ${shellQuote(vmPath)} ]; then find ${shellQuote(
         vmPath,
-      )} -mindepth 1 -maxdepth 1 -printf '%y %p\\n'; fi`,
+      )} -mindepth 1 -maxdepth 1 -printf '%y %s %p\\n'; fi`,
       SITE_ROOT,
       false,
       false,
     );
+    if (result.status !== 0) {
+      const message =
+        result.status === 124
+          ? 'Could not list the workspace directory because the VM command timed out (status 124). Restart the VM before continuing.'
+          : `Could not list the workspace directory because the VM command failed (status ${result.status}).`;
+      this.publishDebug({
+        phase: 'directory-list',
+        status: result.status,
+        output: message,
+      });
+      throw new Error(message);
+    }
     return result.output
       .split('\n')
       .map((line) => line.trim())
       .flatMap((line) => {
-        if (!line || !['f', 'd'].includes(line[0]) || line[1] !== ' ') {
+        const match = /^([fd]) ([0-9]+) (.+)$/.exec(line);
+        if (!match) {
           return [];
         }
-        const typeCode = line.slice(0, 1);
-        const fullPath = line.slice(2);
+        const [, typeCode, rawSize, fullPath] = match;
         if (fullPath !== SITE_ROOT && !fullPath.startsWith(`${SITE_ROOT}/`)) {
           return [];
         }
@@ -812,6 +1537,7 @@ export class WebVmBackend implements VmFileBackend {
         return {
           path: relative,
           type: typeCode === 'd' ? 'directory' : 'file',
+          ...(typeCode === 'f' ? { sizeBytes: Number(rawSize) } : {}),
         } satisfies DirectoryEntry;
       });
   }
@@ -819,39 +1545,242 @@ export class WebVmBackend implements VmFileBackend {
   async runCommand(
     command: string,
     options: {
-      cwd: string;
+      cwd?: string;
       background?: boolean;
       stream?: boolean;
       timeoutMs?: number;
-    },
+      signal?: AbortSignal;
+    } = {},
   ): Promise<VmCommandResult> {
+    const cwd = options.cwd ?? SITE_ROOT;
     const normalized = command.trim().replace(/\s+/g, ' ');
     if (normalized === SERVER_COMMAND) {
-      return this.startServer();
+      return this.awaitAbortable(this.startServer(), options.signal);
     }
     if (options.background) {
-      // Generic background command: detach it inside the VM so it returns
-      // immediately instead of blocking the runner until the exec timeout.
-      // Only the static server command routes through startServer(); other
-      // background work must not hijack the server lifecycle.
-      return this.execBash(
-        `(nohup ${command} > /dev/null 2>&1 &) ; echo 'started in background'`,
-        options.cwd,
-        true,
-        false,
-        options.timeoutMs,
-      );
+      return {
+        status: 1,
+        output:
+          'Detached commands are intentionally unsupported because SparkRun cannot verify their process lifetime or exit status. Run finite work in the foreground or use start_preview for a supervised server.',
+        background: false,
+      };
     }
-    return this.execBash(
-      command,
-      options.cwd,
-      false,
-      options.stream ?? false,
-      options.timeoutMs,
+    if (containsUnsupportedDetachment(command)) {
+      return {
+        status: 1,
+        output:
+          'Detached shell processes are intentionally unsupported because SparkRun cannot verify their lifetime or exit status. Run finite work in the foreground or use start_preview for a supervised server.',
+        background: false,
+      };
+    }
+    return this.awaitAbortable(
+      this.execBash(
+        command,
+        cwd,
+        false,
+        options.stream ?? false,
+        options.timeoutMs,
+      ),
+      options.signal,
     );
   }
 
+  async startPreview(
+    options: CodingRuntimePreviewOptions,
+  ): Promise<CodingRuntimePreviewResult> {
+    this.throwIfFatalNetworkFailure();
+    const command = options.command.trim();
+    const port = options.port;
+    const cwd = options.cwd?.trim() || SITE_ROOT;
+    if (!command) {
+      return {
+        status: 1,
+        output: 'A preview command is required.',
+        background: true,
+        port,
+        url: null,
+      };
+    }
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      return {
+        status: 1,
+        output: 'Preview port must be an integer between 1024 and 65535.',
+        background: true,
+        port,
+        url: null,
+      };
+    }
+    if (this.startServerPromise) {
+      const pending = await this.awaitAbortable(
+        this.startServerPromise,
+        options.signal,
+      );
+      return {
+        ...pending,
+        port: this.serverPort ?? port,
+        url: this.getPreviewUrl(),
+      };
+    }
+    const startPromise = this.startManagedPreviewInner(command, port, cwd);
+    this.startServerPromise = startPromise;
+    try {
+      const result = await this.awaitAbortable(startPromise, options.signal);
+      return {
+        ...result,
+        port: this.serverPort ?? port,
+        url: this.getPreviewUrl(),
+      };
+    } finally {
+      this.startServerPromise = null;
+    }
+  }
+
+  private async startManagedPreviewInner(
+    command: string,
+    port: number,
+    cwd: string,
+  ): Promise<VmCommandResult> {
+    this.throwIfFatalNetworkFailure();
+    if (this.commandRunnerTimedOut) {
+      return {
+        status: 124,
+        output:
+          'The VM command runner hit its catastrophic host watchdog. Restart the VM before launching a preview.',
+        background: true,
+      };
+    }
+
+    // Keep the same hard-won ordering as the static server: the agent finishes
+    // all workspace writes first, then we clean process state, activate the
+    // Tailnet, and launch using only /tmp state writes.
+    const cleanup = await this.execBash(
+      SERVER_CLEANUP_COMMAND,
+      SITE_ROOT,
+      false,
+      false,
+      15_000,
+    );
+    if (cleanup.status !== 0) {
+      return {
+        status: cleanup.status,
+        output: `Could not stop the previous preview.\n${cleanup.output}`,
+        background: true,
+      };
+    }
+    this.serverStarted = false;
+    this.serverLastExit = null;
+    this.serverPort = null;
+
+    this.throwIfFatalNetworkFailure();
+    await this.prepareTailnetForServer();
+    this.throwIfFatalNetworkFailure();
+    if (!this.getTailnetIp()) {
+      return {
+        status: 1,
+        output:
+          'Tailnet IP is not available. The preview process was not started because it could not expose a reachable address.',
+        background: true,
+      };
+    }
+
+    const state = await this.execBash(
+      [
+        `mkdir -p ${shellQuote(SERVER_STATE_DIR)}`,
+        `: > ${shellQuote(SERVER_LOG_PATH)}`,
+        `rm -f ${shellQuote(SERVER_READY_PATH)}`,
+        `printf '%s\\n' ${shellQuote(String(port))} > ${shellQuote(SERVER_PORT_PATH)}`,
+        `printf '%s\\n' '0.0.0.0' > ${shellQuote(SERVER_HOST_PATH)}`,
+        `printf '%s\\n' ${shellQuote(`http://${this.tailnetIp}:${port}`)} > ${shellQuote(SERVER_URL_PATH)}`,
+      ].join(' && '),
+      '/',
+      false,
+      false,
+      15_000,
+    );
+    if (state.status !== 0) {
+      return {
+        status: state.status,
+        output: `Could not initialize preview state.\n${state.output}`,
+        background: true,
+      };
+    }
+
+    this.throwIfFatalNetworkFailure();
+    const launch = this.launchTrackedServerProcess(command, cwd);
+    if (launch.status !== 0) return launch;
+
+    const health = await this.waitForHttpServer(port, 45_000);
+    if (health.status !== 0) {
+      const log = await this.readServerLog(60);
+      const lastExit = this.getServerLastExit();
+      await this.stopServer().catch(() => undefined);
+      return {
+        status: 1,
+        output: [
+          `Preview process did not accept HTTP connections on port ${port}.`,
+          health.output,
+          lastExit?.output,
+          log,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        background: true,
+      };
+    }
+    const interruptionAfterHealth = this.getPreviewStartupInterruption();
+    if (interruptionAfterHealth) return interruptionAfterHealth;
+
+    const readiness = await this.execBash(
+      `printf '%s\\n' ${shellQuote(health.output.trim())} > ${shellQuote(SERVER_READY_PATH)}`,
+      '/',
+      false,
+      false,
+      5_000,
+    );
+    if (readiness.status !== 0) {
+      const log = await this.readServerLog(60);
+      await this.stopServer().catch(() => undefined);
+      return {
+        status: readiness.status,
+        output: [
+          'Preview answered HTTP, but SparkRun could not persist its readiness certificate.',
+          readiness.output,
+          log,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        background: true,
+      };
+    }
+    const interruptionAfterReadiness = this.getPreviewStartupInterruption();
+    if (interruptionAfterReadiness) return interruptionAfterReadiness;
+
+    this.serverPort = port;
+    this.serverStarted = true;
+    this.publishStatus('server-running', `Preview process running on port ${port}`);
+    this.publishDebug({
+      phase: 'server',
+      command,
+      cwd,
+      status: 0,
+      output: `Managed preview started at ${this.getPreviewUrl() ?? `port ${port}`}.`,
+      background: true,
+    });
+    return {
+      status: 0,
+      output: `Managed preview accepted an HTTP connection on port ${port}. ${health.output}`,
+      background: true,
+    };
+  }
+
   startInteractiveShell(): VmCommandResult {
+    if (this.disposed) {
+      return {
+        status: 1,
+        output: 'The VM has been disposed. Start a fresh VM before opening a terminal.',
+        background: true,
+      };
+    }
     if (this.interactiveShellRunning) {
       return {
         status: 0,
@@ -879,6 +1808,7 @@ export class WebVmBackend implements VmFileBackend {
     this.interactiveShellPromise = this.cx
       .run('/bin/bash', ['-l'], this.runOptions(SITE_ROOT))
       .then((result) => {
+        if (this.disposed) return result;
         this.interactiveShellRunning = false;
         this.onConsole?.(`\n[vm] interactive shell exited with ${result.status}\n`);
         this.publishDebug({
@@ -912,6 +1842,13 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   writeTerminalInput(input: string): VmCommandResult {
+    if (this.disposed) {
+      return {
+        status: 1,
+        output: 'The VM has been disposed. Start a fresh VM before sending terminal input.',
+        background: false,
+      };
+    }
     if (!this.interactiveShellRunning) {
       const started = this.startInteractiveShell();
       if (started.status !== 0) {
@@ -938,13 +1875,43 @@ export class WebVmBackend implements VmFileBackend {
     };
   }
 
+  startDefaultPreview(): Promise<VmCommandResult> {
+    return this.startServer();
+  }
+
   async startServer(): Promise<VmCommandResult> {
-    if (this.serverStarted && this.serverPort) {
+    if (this.disposed) {
       return {
-        status: 0,
-        output: `Server is already running on port ${this.serverPort}.`,
+        status: 1,
+        output: 'The VM has been disposed. Start a fresh VM before launching the server.',
         background: true,
       };
+    }
+    this.throwIfFatalNetworkFailure();
+    if (this.serverStarted && this.serverPort) {
+      const cachedPort = this.serverPort;
+      const health = await this.checkServer();
+      if (this.disposed) {
+        return {
+          status: 1,
+          output: 'The VM was disposed while confirming the existing server.',
+          background: true,
+        };
+      }
+      this.throwIfFatalNetworkFailure();
+      const interruption = this.getPreviewStartupInterruption();
+      if (
+        health.status === 0 &&
+        !interruption &&
+        this.serverStarted &&
+        this.serverPort === cachedPort
+      ) {
+        return {
+          status: 0,
+          output: `Server is already running on port ${cachedPort}.`,
+          background: true,
+        };
+      }
     }
 
     // In-flight guard: the early "already running" check only flips true after
@@ -965,20 +1932,24 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private async startServerInner(): Promise<VmCommandResult> {
+    this.throwIfFatalNetworkFailure();
     if (this.commandRunnerTimedOut) {
+      const output =
+        'The VM command runner hit its catastrophic host watchdog. Start a fresh VM before launching the server.';
       this.publishDebug({
         phase: 'server',
-        output:
-          'Clearing stale commandRunnerTimedOut flag from a prior hiccup; retrying.',
+        status: 124,
+        output,
+        background: true,
       });
-      this.commandRunnerTimedOut = false;
+      return { status: 124, output, background: true };
     }
 
     // PHASE 1: All filesystem writes happen FIRST, before Tailnet activation.
     // On some machines, activating CheerpX's userspace Tailscale flips the
     // workspace IDB mount to read-only. So we stage everything beforehand.
 
-    await this.copyTextToVm(SERVER_SCRIPT_PATH, SERVER_SCRIPT, SITE_ROOT);
+    await this.copyContentToVm(SERVER_SCRIPT_PATH, SERVER_SCRIPT, SITE_ROOT);
     this.serverStarted = false;
     this.serverLastExit = null;
     this.serverPort = null;
@@ -989,7 +1960,22 @@ export class WebVmBackend implements VmFileBackend {
       background: true,
     });
 
-    await this.execBash(SERVER_CLEANUP_COMMAND, SITE_ROOT, false, false);
+    const cleanup = await this.execBash(
+      SERVER_CLEANUP_COMMAND,
+      SITE_ROOT,
+      false,
+      false,
+    );
+    if (cleanup.status !== 0) {
+      const output = `Could not clean up the previous server process.\n${cleanup.output}`;
+      this.publishDebug({
+        phase: 'server',
+        status: cleanup.status,
+        output,
+        background: true,
+      });
+      return { status: cleanup.status, output, background: true };
+    }
 
     const pythonCheck = await this.execBash(
       'command -v python3',
@@ -1017,8 +2003,10 @@ export class WebVmBackend implements VmFileBackend {
 
     // PHASE 2: Now activate Tailnet. After this point, /workspace may go
     // read-only on some machines, but /tmp (rootCache overlay) stays writable.
+    this.throwIfFatalNetworkFailure();
     await this.prepareTailnetForServer();
-    if (!this.tailnetIp) {
+    this.throwIfFatalNetworkFailure();
+    if (!this.getTailnetIp()) {
       const output =
         'Tailnet IP is not available yet. Skipping VM web server start because CheerpX cannot bind 0.0.0.0 until the browser-side Tailnet network is connected.';
       this.publishStatus('error', 'Tailnet unavailable');
@@ -1037,29 +2025,47 @@ export class WebVmBackend implements VmFileBackend {
       };
     }
 
-    // PHASE 3: Launch detached. CheerpX 1.3.9 can take tens of seconds to
-    // schedule the child after the parent shell reports success, so the port
-    // handshake deliberately waits longer than a normal native launch.
-    const command = `mkdir -p ${SERVER_STATE_DIR} && (nohup ${SERVER_COMMAND} > ${SERVER_LOG_PATH} 2>&1 &)`;
-    const launch = await this.execBash(command, SITE_ROOT, true, false);
+    // PHASE 3: Start the server as a foreground CheerpX process, but retain its
+    // Promise in JavaScript instead of awaiting it. A detached `nohup ... &`
+    // shell can report status 0 before CheerpX has scheduled the child (and in
+    // a real Chrome reproduction never produced server.port). Keeping cx.run
+    // attached gives CheerpX a concrete long-lived process to schedule while
+    // other cx.run calls continue on separate virtual terminals.
+    this.throwIfFatalNetworkFailure();
+    const launch = this.launchServerProcess();
     if (launch.status !== 0) {
       return launch;
     }
 
+    // ThreadingHTTPServer binds synchronously before the Python process writes
+    // server.ready and server.port. Do not perform a VM-internal loopback GET:
+    // CheerpX 1.3.9's Tailscale transport can wedge that connection. Outer
+    // Chrome provides the real Tailnet connection proof during E2E validation.
     const port = await this.waitForServerPort(45_000);
-    const log = await this.readServerLog(40);
-    const result: VmCommandResult = port
+    let interruption = this.getPreviewStartupInterruption();
+    const log = interruption ? '' : await this.readServerLog(40);
+    interruption ??= this.getPreviewStartupInterruption();
+    const lastExit = this.getServerLastExit();
+    const provenPort = interruption ? null : port;
+    const result: VmCommandResult = provenPort
       ? {
           status: 0,
-          output: [`Server started on port ${port}.`, log].filter(Boolean).join('\n'),
+          output: [
+            `Server bound port ${provenPort} and its tracked process is running.`,
+            log,
+          ]
+            .filter(Boolean)
+            .join('\n'),
           background: true,
         }
       : {
           status: 1,
           output: [
-            `Server port was not written.`,
+            'Server did not publish its bind-readiness certificate.',
+            interruption?.output,
+            lastExit?.output,
             log,
-            'Hint: this usually means the workspace mount is half-broken — the directory entry exists but writes inside it fail. Try Reset workspace and retry.',
+            'The preview process must bind its port and write /tmp/sparkrun/server.ready before SparkRun marks it live.',
           ]
             .filter(Boolean)
             .join('\n'),
@@ -1073,14 +2079,136 @@ export class WebVmBackend implements VmFileBackend {
       output: result.output,
       background: true,
     });
-    if (port) {
+    if (provenPort) {
       this.serverStarted = true;
-      this.publishStatus('booting', `VM web server started on port ${port}`);
+      this.publishStatus(
+        'server-running',
+        `VM web server started on port ${provenPort}`,
+      );
+    } else {
+      await this.stopServer().catch(() => undefined);
+      this.serverStarted = false;
+      this.serverPort = null;
     }
     return result;
   }
 
+  private launchServerProcess(): VmCommandResult {
+    return this.launchTrackedServerProcess(
+      `/usr/bin/python3 ${shellQuote(
+        SERVER_SCRIPT_PATH,
+      )} --host 0.0.0.0 --port auto`,
+      SITE_ROOT,
+      false,
+    );
+  }
+
+  private launchTrackedServerProcess(
+    serverCommand: string,
+    cwd: string,
+    throughShell = true,
+  ): VmCommandResult {
+    const processCommand = throughShell
+      ? `/bin/bash -c ${shellQuote(serverCommand)}`
+      : serverCommand;
+    const wrapperCommand = [
+      `echo $$ > ${SERVER_LAUNCH_PID_PATH}`,
+      `echo $$ > ${SERVER_PID_PATH}`,
+      `exec ${processCommand} >> ${SERVER_LOG_PATH} 2>&1`,
+    ].join(' ; ');
+    this.serverLastExit = null;
+    this.publishDebug({
+      phase: 'server-launch',
+      command: serverCommand,
+      cwd,
+      background: true,
+    });
+
+    try {
+      // util-linux `setsid -f -w` gives every preview its own session/process
+      // group while keeping cx.run attached until the preview exits. The PID
+      // written by the inner shell is therefore also the process-group ID.
+      // Cleanup can TERM the whole tree and then KILL the group after a bounded
+      // grace period, including npm/Vite children that ignore or outlive TERM.
+      const rawPromise = this.cx.run(
+        '/usr/bin/setsid',
+        ['-f', '-w', '/bin/bash', '-c', wrapperCommand],
+        this.runOptions(cwd),
+      );
+      const trackedPromise = rawPromise
+        .then((result) => {
+          if (!this.disposed && this.serverProcessPromise === trackedPromise) {
+            // A preview is a long-lived process. Exiting before explicit Stop
+            // is a startup/runtime failure even when the child returns 0 (for
+            // example a one-shot install command). Never treat that clean exit
+            // as an HTTP-health success.
+            const failureStatus = result.status === 0 ? 1 : result.status;
+            this.serverProcessPromise = null;
+            this.serverStarted = false;
+            this.serverPort = null;
+            this.serverLastExit = {
+              status: failureStatus,
+              output: `Server process exited before readiness with status ${result.status}.`,
+              background: true,
+            };
+            this.publishDebug({
+              phase: 'server-exit',
+              command: serverCommand,
+              cwd,
+              status: failureStatus,
+              output: this.serverLastExit.output,
+              background: true,
+            });
+            this.publishStatus(
+              'error',
+              `Preview process exited before readiness with status ${result.status}`,
+            );
+            return { status: failureStatus };
+          }
+          return result;
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!this.disposed && this.serverProcessPromise === trackedPromise) {
+            this.serverProcessPromise = null;
+            this.serverStarted = false;
+            this.serverPort = null;
+            this.serverLastExit = {
+              status: 1,
+              output: `Server process failed to launch: ${message}`,
+              background: true,
+            };
+            this.publishDebug({
+              phase: 'server-exit',
+              command: serverCommand,
+              cwd,
+              status: 1,
+              output: this.serverLastExit.output,
+              background: true,
+            });
+            this.publishStatus('error', 'Preview process stopped unexpectedly');
+          }
+          return { status: 1 };
+        });
+      this.serverProcessPromise = trackedPromise;
+      return {
+        status: 0,
+        output: 'Server process launch requested.',
+        background: true,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.serverLastExit = {
+        status: 1,
+        output: `Server process failed to launch: ${message}`,
+        background: true,
+      };
+      return this.serverLastExit;
+    }
+  }
+
   private async prepareTailnetForServer(): Promise<void> {
+    this.throwIfFatalNetworkFailure();
     if (
       this.tailnetIp ||
       !this.cx.networkLogin ||
@@ -1112,7 +2240,11 @@ export class WebVmBackend implements VmFileBackend {
         output: error instanceof Error ? error.message : String(error),
         background: false,
       });
+      if (error instanceof CheerpXNetworkReloadRequiredError) {
+        throw error;
+      }
     }
+    this.throwIfFatalNetworkFailure();
   }
 
   async dumpMountDiagnostics(): Promise<void> {
@@ -1188,14 +2320,28 @@ export class WebVmBackend implements VmFileBackend {
     const started = Date.now();
     let lastLogSize = 0;
     while (Date.now() - started < timeoutMs) {
+      if (this.disposed || this.getFatalNetworkFailure()) {
+        return null;
+      }
+      if (this.getServerLastExit() || this.commandRunnerTimedOut) {
+        return null;
+      }
       const result = await this.execBash(
-        `if [ -f ${SERVER_PORT_PATH} ]; then cat ${SERVER_PORT_PATH}; fi`,
+        `if [ -s ${SERVER_READY_PATH} ] && [ -f ${SERVER_PORT_PATH} ]; then cat ${SERVER_PORT_PATH}; fi`,
         SITE_ROOT,
         false,
         false,
         2_000,
         false,
       );
+      if (
+        this.disposed ||
+        this.getFatalNetworkFailure() ||
+        this.getServerLastExit() ||
+        this.commandRunnerTimedOut
+      ) {
+        return null;
+      }
       // The port file contains only the port number on its own line. Match a
       // line that is *entirely* a 2-5 digit number rather than the first digits
       // anywhere in the capture, so stray output (e.g. from a concurrent
@@ -1209,6 +2355,9 @@ export class WebVmBackend implements VmFileBackend {
         this.serverPort = port;
         return port;
       }
+      if (this.getServerLastExit() || this.commandRunnerTimedOut) {
+        return null;
+      }
 
       const sizeResult = await this.execBash(
         `if [ -f ${SERVER_LOG_PATH} ]; then wc -c < ${SERVER_LOG_PATH}; else echo 0; fi`,
@@ -1218,6 +2367,7 @@ export class WebVmBackend implements VmFileBackend {
         2_000,
         false,
       );
+      if (this.disposed || this.getFatalNetworkFailure()) return null;
       const currentSize = Number(sizeResult.output.trim());
       if (Number.isFinite(currentSize) && currentSize > lastLogSize) {
         const tail = await this.execBash(
@@ -1228,6 +2378,7 @@ export class WebVmBackend implements VmFileBackend {
           2_000,
           false,
         );
+        if (this.disposed || this.getFatalNetworkFailure()) return null;
         if (tail.output.trim().length > 0) {
           this.publishDebug({
             phase: 'server-log',
@@ -1243,6 +2394,68 @@ export class WebVmBackend implements VmFileBackend {
     return null;
   }
 
+  private async waitForHttpServer(
+    port: number,
+    timeoutMs: number,
+  ): Promise<VmCommandResult> {
+    const started = Date.now();
+    let lastOutput = '';
+    while (Date.now() - started < timeoutMs) {
+      if (this.disposed || this.getFatalNetworkFailure()) {
+        return {
+          status: 1,
+          output: this.getFatalNetworkFailure() ?? 'The VM was disposed.',
+          background: false,
+        };
+      }
+      const earlyExit = this.getServerLastExit();
+      if (earlyExit || this.commandRunnerTimedOut) {
+        return earlyExit ?? {
+          status: 124,
+          output: 'The command runner timed out while waiting for HTTP health.',
+          background: false,
+        };
+      }
+      const probe = await this.execBash(
+        buildInternalHttpProbeCommand(port),
+        '/',
+        false,
+        false,
+        HTTP_PROBE_COMMAND_TIMEOUT_MS,
+        false,
+      );
+      lastOutput = probe.output;
+      const exitAfterProbe = this.getServerLastExit();
+      if (this.disposed || this.getFatalNetworkFailure()) {
+        return {
+          status: 1,
+          output: this.getFatalNetworkFailure() ?? 'The VM was disposed.',
+          background: false,
+        };
+      }
+      if (exitAfterProbe || this.commandRunnerTimedOut) {
+        return exitAfterProbe ?? {
+          status: 124,
+          output: 'The command runner timed out while waiting for HTTP health.',
+          background: false,
+        };
+      }
+      if (probe.status === 0 && /SPARKRUN_HTTP_\d{3}/.test(probe.output)) {
+        return {
+          status: 0,
+          output: probe.output.trim(),
+          background: false,
+        };
+      }
+      await sleep(300);
+    }
+    return {
+      status: 1,
+      output: lastOutput.trim() || `No HTTP response from 127.0.0.1:${port}.`,
+      background: false,
+    };
+  }
+
   private async readServerLog(lines: number): Promise<string> {
     const result = await this.execBash(
       `if [ -f ${SERVER_LOG_PATH} ]; then tail -${lines} ${SERVER_LOG_PATH}; else echo "No server log found."; fi`,
@@ -1254,12 +2467,19 @@ export class WebVmBackend implements VmFileBackend {
     return result.output;
   }
 
+  stopPreview(): Promise<VmCommandResult> {
+    return this.stopServer();
+  }
+
   async stopServer(): Promise<VmCommandResult> {
     this.publishDebug({
       phase: 'server-stop',
       command: SERVER_CLEANUP_COMMAND,
       cwd: SITE_ROOT,
     });
+    // Disown the tracked process before killing it so its expected signal exit
+    // cannot race this explicit stop and republish stale failure state.
+    this.serverProcessPromise = null;
     const result = await this.execBash(
       SERVER_CLEANUP_COMMAND,
       SITE_ROOT,
@@ -1275,8 +2495,64 @@ export class WebVmBackend implements VmFileBackend {
     return result;
   }
 
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+
+    // Flip the public lifecycle state and publish the shared promise before
+    // running teardown. Project deletion and the command watchdog can reach
+    // this method concurrently; neither may queue a stop command behind the
+    // command that is itself waiting for disposal, and cx.delete() must run
+    // exactly once. Deleting the CheerpX instance is the process-tree cleanup
+    // boundary, so a guest-side stopServer() adds a deadlock risk without
+    // preserving anything that survives this operation.
+    this.disposed = true;
+    // Invalidate every public preview cache in the same turn as disposal. A
+    // caller can invoke startServer() before the teardown microtask runs; it
+    // must never observe a disposed VM as an already-running server.
+    this.serverProcessPromise = null;
+    this.startServerPromise = null;
+    this.serverStarted = false;
+    this.serverLastExit = null;
+    this.serverPort = null;
+    fatalTailnetRegistry.listeners.delete(this.fatalNetworkRuntimeListener);
+    this.disposePromise = Promise.resolve().then(() => {
+      this.interactiveShellPromise = null;
+      this.interactiveShellRunning = false;
+      this.consoleInput = null;
+      this.resolveTailnetSignal?.(null);
+      this.resolveTailnetSignal = null;
+      this.rejectTailnetSignal = null;
+      this.tailnetConnectPromise = null;
+      if (fatalTailnetRegistry.lastDebugSink === this.onDebug) {
+        fatalTailnetRegistry.lastDebugSink = null;
+      }
+      this.cx.delete();
+    });
+    return this.disposePromise;
+  }
+
+  checkPreview(): Promise<VmCommandResult> {
+    return this.checkServer();
+  }
+
   async checkServer(): Promise<VmCommandResult> {
+    if (this.disposed) {
+      return {
+        status: 1,
+        output: 'The VM has been disposed. Start a fresh VM before checking its preview.',
+        background: false,
+      };
+    }
+    this.throwIfFatalNetworkFailure();
     const port = this.serverPort ?? (await this.waitForServerPort(4_000));
+    this.throwIfFatalNetworkFailure();
+    if (this.disposed) {
+      return {
+        status: 1,
+        output: 'The VM was disposed while checking its preview.',
+        background: false,
+      };
+    }
     if (!port) {
       const log = await this.readServerLog(40);
       const result: VmCommandResult = {
@@ -1292,19 +2568,25 @@ export class WebVmBackend implements VmFileBackend {
       return result;
     }
 
-    // A port file alone is not proof of life — the startup script only deletes
-    // it on (re)start, so it survives a server that has since crashed. Confirm
-    // the recorded PID is still alive; if not, clear the cached state so a
-    // subsequent startServer() can actually relaunch instead of short-circuiting
-    // forever on "already running".
+    // The readiness file certifies that this process synchronously bound its
+    // socket. Pair it with PID liveness so stale files from a crashed process
+    // can never manufacture a healthy result.
     const liveness = await this.execBash(
-      `if [ -f ${SERVER_PID_PATH} ] && kill -0 "$(cat ${SERVER_PID_PATH})" 2>/dev/null; then echo SPARKRUN_ALIVE; else echo SPARKRUN_DEAD; fi`,
+      `if [ -f ${SERVER_PID_PATH} ] && kill -0 "$(cat ${SERVER_PID_PATH})" 2>/dev/null; then if [ -s ${SERVER_READY_PATH} ]; then echo SPARKRUN_ALIVE; cat ${SERVER_READY_PATH}; else echo SPARKRUN_NOT_READY; fi; else echo SPARKRUN_DEAD; fi`,
       SITE_ROOT,
       false,
       false,
       3_000,
     );
-    if (!liveness.output.includes('SPARKRUN_ALIVE')) {
+    this.throwIfFatalNetworkFailure();
+    if (this.disposed) {
+      return {
+        status: 1,
+        output: 'The VM was disposed while checking its preview.',
+        background: false,
+      };
+    }
+    if (liveness.output.includes('SPARKRUN_DEAD')) {
       this.serverStarted = false;
       this.serverPort = null;
       const log = await this.readServerLog(40);
@@ -1321,13 +2603,48 @@ export class WebVmBackend implements VmFileBackend {
       });
       return result;
     }
+    if (!liveness.output.includes('SPARKRUN_ALIVE')) {
+      this.serverStarted = false;
+      this.serverPort = null;
+      const log = await this.readServerLog(40);
+      const result: VmCommandResult = {
+        status: 1,
+        output: [
+          `Server process is alive but has not published a bind-readiness certificate for port ${port}.`,
+          log,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        background: false,
+      };
+      this.publishStatus('ready', 'VM web server is not ready');
+      this.publishDebug({
+        phase: 'health',
+        status: result.status,
+        output: result.output,
+      });
+      return result;
+    }
+    const exitAfterLiveness = this.getServerLastExit();
+    if (exitAfterLiveness) {
+      this.serverStarted = false;
+      this.serverPort = null;
+      return {
+        status: exitAfterLiveness.status,
+        output: exitAfterLiveness.output,
+        background: false,
+      };
+    }
 
     this.serverPort = port;
     this.serverStarted = true;
     this.publishStatus('server-running', `VM web server listening on port ${port}`);
     const result: VmCommandResult = {
       status: 0,
-      output: `internal: server process is listening on port ${port}`,
+      output: `internal: server process is alive and bound on port ${port} (${liveness.output
+        .split('\n')
+        .find((line) => /^SPARKRUN_(?:HTTP_\d{3}|BOUND)$/.test(line.trim()))
+        ?.trim() ?? 'readiness certificate present'})`,
       background: false,
     };
     this.publishDebug({
@@ -1339,6 +2656,7 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private publishDebug(entry: WebVmDebugEntry): void {
+    if (this.disposed) return;
     this.onDebug?.(entry);
   }
 
@@ -1346,21 +2664,43 @@ export class WebVmBackend implements VmFileBackend {
     return this.serverLastExit;
   }
 
+  private getPreviewStartupInterruption(): VmCommandResult | null {
+    this.throwIfFatalNetworkFailure();
+    if (this.disposed) {
+      return {
+        status: 1,
+        output: 'The VM was disposed while the preview was starting.',
+        background: true,
+      };
+    }
+    if (this.serverLastExit) return this.serverLastExit;
+    if (!this.serverProcessPromise) {
+      return {
+        status: 1,
+        output: 'The preview process is no longer tracked and was not marked live.',
+        background: true,
+      };
+    }
+    return null;
+  }
+
   private attachConsole(): void {
     const decoder = new TextDecoder();
     this.consoleInput = this.cx.setCustomConsole((buf, vt) => {
+      if (this.disposed) return;
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
       const text = decoder.decode(bytes);
-      // A long-lived process can occupy VT 1, causing later cx.run commands to
-      // execute on another virtual terminal. Capture the first VT that emits
-      // for the active command instead of discarding every non-default VT.
+      // A long-lived interactive shell and a managed cx.run command can emit
+      // concurrently on different VTs. Keep every VT separate; after cx.run
+      // settles, the nonce-bound completion marker identifies which buffer
+      // actually belongs to the managed command. Selecting the first VT would
+      // let an unrelated shell prompt manufacture a false timeout.
       if (this.activeCapture !== null) {
-        this.activeCapture.vt ??= vt;
-        if (this.activeCapture.vt === vt) {
-          this.activeCapture.output += text;
-          if (this.activeCapture.streamToConsole) {
-            this.onConsole?.(text);
-          }
+        const key = vt ?? 'default';
+        const previous = this.activeCapture.outputByVirtualTerminal.get(key) ?? '';
+        this.activeCapture.outputByVirtualTerminal.set(key, previous + text);
+        if (this.activeCapture.streamToConsole) {
+          this.onConsole?.(text);
         }
         return;
       }
@@ -1377,20 +2717,28 @@ export class WebVmBackend implements VmFileBackend {
     }, 100, 30);
   }
 
-  private async prepareWorkspace(): Promise<void> {
-    // Recreate the SITE_ROOT directory from scratch on every boot. The IDB
-    // workspace persists across reloads, and prior interrupted sessions can
+  private async prepareWorkspace(
+    mode: 'preserve' | 'clean-site' = 'clean-site',
+  ): Promise<void> {
+    // clean-site (the default) recreates SITE_ROOT from scratch on boot. The
+    // IDB workspace persists across reloads, and prior interrupted sessions can
     // leave per-directory corruption: the directory entry survives but its
     // inode contents are half-committed, so writes inside it return EROFS
     // ("Read-only file system") while reads still work and `mount` reports
     // rw. The corruption is confined to the subdir; the parent /workspace
     // mount itself is fine. Nuking the dir and recreating it clears the
     // corrupt entries and gives us a clean inode. User project files are
-    // restored from localStorage (App.tsx restoreProjectFiles) after this.
-    const cmd = [
-      `rm -rf ${shellQuote(SITE_ROOT)}`,
-      `mkdir -p ${shellQuote(SITE_ROOT)}`,
-    ].join(' && ');
+    // restored from the project's BrowserVault tar checkpoint after this.
+    // preserve is an explicit opt-in for resumable per-project workspaces; it
+    // only ensures the directory exists and deliberately accepts the caller's
+    // responsibility to recover a corrupt project database when needed.
+    const cmd =
+      mode === 'clean-site'
+        ? [
+            `rm -rf ${shellQuote(SITE_ROOT)}`,
+            `mkdir -p ${shellQuote(SITE_ROOT)}`,
+          ].join(' && ')
+        : `mkdir -p ${shellQuote(SITE_ROOT)}`;
     const result = await this.execBash(
       cmd,
       '/',
@@ -1420,6 +2768,13 @@ export class WebVmBackend implements VmFileBackend {
         'EDITOR=vi',
         'LANG=en_US.UTF-8',
         'LC_ALL=C',
+        ...(this.nodeCompatibility
+          ? [
+              `NODE_OPTIONS=--require=${this.nodeCompatibility.preloadPath}`,
+              `SPARKRUN_NODE_EXIT_ADDON=${this.nodeCompatibility.addonPath}`,
+              `NODE_COMPILE_CACHE=${this.nodeCompatibility.compileCachePath}`,
+            ]
+          : []),
       ],
     };
   }
@@ -1433,6 +2788,13 @@ export class WebVmBackend implements VmFileBackend {
     debug: boolean = true,
   ): Promise<VmCommandResult> {
     const run = async (): Promise<VmCommandResult> => {
+      if (this.disposed) {
+        return {
+          status: 1,
+          output: 'The VM has been disposed. Start a fresh VM before running commands.',
+          background,
+        };
+      }
       if (this.commandRunnerTimedOut) {
         return {
           status: 124,
@@ -1449,47 +2811,199 @@ export class WebVmBackend implements VmFileBackend {
           background,
         });
       }
-      this.activeCapture = { output: '', streamToConsole };
+      this.activeCapture = {
+        outputByVirtualTerminal: new Map<number | 'default', string>(),
+        streamToConsole,
+      };
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      let hostWatchdogFired = false;
       try {
-        const commandPromise = this.cx.run('/bin/bash', ['-lc', command], {
-          ...this.runOptions(cwd),
-        });
-        const result = await Promise.race([
+        // Terminate inside the VM before advancing the serialized queue. A
+        // JavaScript-only Promise.race abandons the actual shell process; its
+        // delayed output can then be captured as if it belonged to the next
+        // command. `setsid -f -w` isolates the command tree while keeping the
+        // timeout runner attached until the session leader exits. Some guest
+        // timeout implementations can still kill only that waiter or report a
+        // false zero, so their numeric status is never trusted: only the
+        // nonce-bound completion proof below establishes a normal finish. A
+        // missing proof disposes the whole VM, which is the final process-tree
+        // cleanup boundary available through CheerpX.
+        const durationSeconds = `${Math.max(timeoutMs, 1) / 1_000}s`;
+        const completionNonce = crypto.randomUUID().replaceAll('-', '');
+        const completionMarker = `${COMMAND_COMPLETION_PREFIX}${completionNonce}__:`;
+        const wrappedCommand = [
+          'sparkrun_cancel_command_group() {',
+          '  trap - TERM INT HUP',
+          '  kill -TERM -- "-$$" 2>/dev/null || true',
+          '}',
+          "trap 'sparkrun_cancel_command_group' TERM INT HUP",
+          `(
+${command}
+)`,
+          'sparkrun_command_status=$?',
+          `printf '\\n${completionMarker}%s\\n' "$sparkrun_command_status"`,
+          'exit "$sparkrun_command_status"',
+        ].join('\n');
+        const timeoutFile =
+          this.timeoutRunner === 'busybox' ? '/bin/busybox' : '/usr/bin/timeout';
+        const timeoutArgs =
+          this.timeoutRunner === 'busybox'
+            ? [
+                'timeout',
+                '-s',
+                'TERM',
+                '-k',
+                `${VM_TIMEOUT_KILL_GRACE_SECONDS}s`,
+                durationSeconds,
+                '/usr/bin/setsid',
+                '-f',
+                '-w',
+                '/bin/bash',
+                '-lc',
+                wrappedCommand,
+              ]
+            : [
+                '--signal=TERM',
+                `--kill-after=${VM_TIMEOUT_KILL_GRACE_SECONDS}s`,
+                durationSeconds,
+                '/usr/bin/setsid',
+                '-f',
+                '-w',
+                '/bin/bash',
+                '-lc',
+                wrappedCommand,
+              ];
+        const commandPromise = this.cx.run(
+          timeoutFile,
+          timeoutArgs,
+          this.runOptions(cwd),
+        );
+        const hostWatchdogMs =
+          timeoutMs +
+          VM_TIMEOUT_KILL_GRACE_SECONDS * 1_000 +
+          HOST_COMMAND_WATCHDOG_GRACE_MS;
+        await Promise.race([
           commandPromise,
           new Promise<{ status: number }>((resolve) => {
             timeoutId = globalThis.setTimeout(
-              () => resolve({ status: 124 }),
-              timeoutMs,
+              () => {
+                hostWatchdogFired = true;
+                resolve({ status: 124 });
+              },
+              hostWatchdogMs,
             );
           }),
         ]);
-        const output = this.activeCapture.output.trim();
-        const timedOut = result.status === 124;
-        if (timedOut) {
-          this.commandRunnerTimedOut = true;
+        if (!hostWatchdogFired && timeoutId) {
+          globalThis.clearTimeout(timeoutId);
+          timeoutId = null;
         }
-        const finalOutput = timedOut
-          ? [output, `Command timed out after ${timeoutMs}ms.`]
+        // CheerpX can settle cx.run before the Worker-delivered console event
+        // carrying the final nonce marker reaches this task. Wait only for the
+        // exact marker and only within a short bound; after it arrives, retain
+        // one final window for trailing bytes that belong to this capture.
+        if (!hostWatchdogFired) {
+          const completionDrainDeadline =
+            Date.now() + COMMAND_COMPLETION_DRAIN_TIMEOUT_MS;
+          while (
+            !Array.from(this.activeCapture.outputByVirtualTerminal.values()).some(
+              (value) => value.includes(completionMarker),
+            ) &&
+            Date.now() < completionDrainDeadline
+          ) {
+            await sleep(COMMAND_CONSOLE_DRAIN_POLL_MS);
+          }
+          if (
+            Array.from(this.activeCapture.outputByVirtualTerminal.values()).some(
+              (value) => value.includes(completionMarker),
+            )
+          ) {
+            await sleep(COMMAND_TRAILING_OUTPUT_DRAIN_MS);
+          }
+        }
+        const escapedMarker = completionMarker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const completionPattern = new RegExp(
+          `(?:^|\\n)${escapedMarker}(-?\\d+)(?:\\r?\\n|$)`,
+        );
+        const capturedBuffers = Array.from(
+          this.activeCapture.outputByVirtualTerminal.values(),
+          (value) => value.trim(),
+        );
+        const capturedOutput =
+          capturedBuffers.find((value) => completionPattern.test(value)) ??
+          capturedBuffers.sort((left, right) => right.length - left.length)[0] ??
+          '';
+        const completionMatch = capturedOutput.match(completionPattern);
+        const completionStatus = completionMatch
+          ? Number.parseInt(completionMatch[1] ?? '', 10)
+          : null;
+        const output = completionMatch
+          ? [
+              capturedOutput.slice(0, completionMatch.index).trim(),
+              capturedOutput
+                .slice(
+                  (completionMatch.index ?? 0) + completionMatch[0].length,
+                )
+                .trim(),
+            ]
               .filter(Boolean)
               .join('\n')
-          : output;
-        const commandResult = { status: result.status, output: finalOutput, background };
+          : capturedOutput;
+        const completionMissing = !hostWatchdogFired && completionStatus === null;
+        if (hostWatchdogFired || completionMissing) {
+          // There is no CheerpX process handle to terminate from JavaScript.
+          // BusyBox timeout is also known to report status 0 after killing its
+          // child. A nonce-bound completion marker is therefore the source of
+          // truth. Stop this VM when it is absent so surviving descendants and
+          // delayed output can never contaminate a later command capture.
+          this.commandRunnerTimedOut = true;
+        }
+        const finalOutput = hostWatchdogFired
+          ? [
+              output,
+              `VM command did not stop after its ${timeoutMs}ms limit; the command runner is disabled until a fresh VM is started.`,
+            ]
+              .filter(Boolean)
+              .join('\n')
+          : completionMissing
+            ? [
+                output,
+                `Command did not produce its completion proof within ${timeoutMs}ms. The VM was stopped to prevent false success or orphaned processes.`,
+              ]
+              .filter(Boolean)
+              .join('\n')
+            : output;
+        const finalStatus =
+          hostWatchdogFired || completionMissing
+            ? 124
+            : (completionStatus ?? 1);
+        const commandResult = { status: finalStatus, output: finalOutput, background };
         if (debug) {
           this.publishDebug({
             phase: 'exec-result',
             command,
             cwd,
-            status: result.status,
+            status: finalStatus,
             output: finalOutput,
             background,
           });
         }
+        if (this.commandRunnerTimedOut) {
+          await this.dispose();
+        }
         return { ...commandResult, output: finalOutput };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.error('[webvm] cx.run threw for command:', command, error);
-        const captured = this.activeCapture?.output.trim() ?? '';
+        // The command may contain credentials supplied to a package manager or
+        // HTTP client. Keep raw command text inside the redacted debug callback
+        // boundary instead of duplicating it into the browser console.
+        console.error('[webvm] cx.run failed', error);
+        const captured = this.activeCapture
+          ? Array.from(
+              this.activeCapture.outputByVirtualTerminal.values(),
+              (value) => value.trim(),
+            ).sort((left, right) => right.length - left.length)[0] ?? ''
+          : '';
         const finalOutput = [captured, `cx.run threw: ${message}`]
           .filter(Boolean)
           .join('\n');
@@ -1518,27 +3032,47 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private handleLoginUrl(url: string): void {
+    if (this.disposed || this.getFatalNetworkFailure()) return;
     let parsed: URL;
     try {
       parsed = new URL(url);
     } catch (error) {
-      console.error('[webvm] handleLoginUrl: invalid URL', url, error);
+      console.error('[webvm] handleLoginUrl: invalid URL', error);
       this.publishDebug({
         phase: 'tailnet-login-url',
         status: 1,
-        output: `Invalid Tailscale login URL: ${url}`,
+        output: 'Rejected an invalid Tailscale login URL.',
       });
-      this.rejectTailnetSignal?.(new Error('Invalid Tailscale login URL.'));
+      const reject = this.rejectTailnetSignal;
+      this.resolveTailnetSignal = null;
+      this.rejectTailnetSignal = null;
+      reject?.(new Error('Invalid Tailscale login URL.'));
       return;
     }
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-      console.error('[webvm] handleLoginUrl: bad scheme', parsed.protocol, url);
+
+    const rejection =
+      parsed.protocol !== 'https:'
+        ? 'Tailscale login URLs must use HTTPS.'
+        : !TAILSCALE_LOGIN_HOSTS.has(parsed.hostname)
+          ? 'Tailscale login URL host is not allowed.'
+          : parsed.username || parsed.password
+            ? 'Tailscale login URLs cannot contain credentials.'
+            : parsed.hash
+              ? 'Tailscale login URLs cannot contain a fragment.'
+              : parsed.port && parsed.port !== '443'
+                ? 'Tailscale login URLs cannot use a custom port.'
+                : null;
+    if (rejection) {
+      console.error('[webvm] handleLoginUrl rejected an unsafe URL:', rejection);
       this.publishDebug({
         phase: 'tailnet-login-url',
         status: 1,
-        output: `Invalid Tailscale login URL scheme: ${parsed.protocol}`,
+        output: rejection,
       });
-      this.rejectTailnetSignal?.(new Error('Invalid Tailscale login URL scheme.'));
+      const reject = this.rejectTailnetSignal;
+      this.resolveTailnetSignal = null;
+      this.rejectTailnetSignal = null;
+      reject?.(new Error(rejection));
       return;
     }
     this.loginUrl = parsed.href;
@@ -1549,6 +3083,7 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   recordTailnetState(state: number): void {
+    if (this.disposed || this.getFatalNetworkFailure()) return;
     if (this.highestTailnetState === null || state > this.highestTailnetState) {
       this.highestTailnetState = state;
     }
@@ -1559,6 +3094,7 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private setTailnetIp(ip: string | null): void {
+    if (this.disposed || this.getFatalNetworkFailure()) return;
     this.tailnetIp = ip;
     if (ip) {
       this.resolveTailnetSignal?.(null);
@@ -1569,6 +3105,10 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private publishTailnetState(): void {
+    if (this.getFatalNetworkFailure()) {
+      this.publishFatalNetworkFailure();
+      return;
+    }
     if (this.tailnetIp) {
       this.publishStatus('tailnet-connected', 'Tailnet connected');
       return;
@@ -1577,11 +3117,16 @@ export class WebVmBackend implements VmFileBackend {
   }
 
   private publishStatus(lifecycle: WebVmLifecycle, message: string): void {
+    if (this.disposed) return;
+    if (lifecycle !== 'error' && this.getFatalNetworkFailure()) {
+      this.publishFatalNetworkFailure();
+      return;
+    }
     this.onStatus?.({
       lifecycle,
       message,
-      tailnetIp: this.tailnetIp,
-      loginUrl: this.loginUrl,
+      tailnetIp: this.getTailnetIp(),
+      loginUrl: this.getFatalNetworkFailure() ? null : this.loginUrl,
       previewUrl: this.getPreviewUrl(),
       serverPort: this.serverPort,
     });

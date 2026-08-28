@@ -1,75 +1,10 @@
 export interface SourceFile {
   path: string;
-  content: string;
+  content: string | Uint8Array;
 }
-
-const DATABASE_NAME = 'sparkrun-local-folder';
-const STORE_NAME = 'handles';
-const HANDLE_KEY = 'source-directory';
 
 export function isLocalFolderSupported(): boolean {
   return typeof window !== 'undefined' && 'showDirectoryPicker' in window;
-}
-
-function openDatabase(): Promise<IDBDatabase | null> {
-  if (!('indexedDB' in window)) {
-    return Promise.resolve(null);
-  }
-
-  return new Promise((resolve, reject) => {
-    const request = window.indexedDB.open(DATABASE_NAME, 1);
-    request.onupgradeneeded = () => {
-      request.result.createObjectStore(STORE_NAME);
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('IndexedDB failed.'));
-  });
-}
-
-async function withStore<T>(
-  mode: IDBTransactionMode,
-  action: (store: IDBObjectStore) => IDBRequest<T> | void,
-): Promise<T | undefined> {
-  const database = await openDatabase();
-  if (!database) {
-    return undefined;
-  }
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(STORE_NAME, mode);
-    const store = transaction.objectStore(STORE_NAME);
-    const request = action(store);
-
-    transaction.oncomplete = () => {
-      database.close();
-      resolve(request ? request.result : undefined);
-    };
-    transaction.onerror = () => {
-      database.close();
-      reject(transaction.error ?? new Error('IndexedDB transaction failed.'));
-    };
-  });
-}
-
-export async function loadSavedDirectoryHandle(): Promise<FileSystemDirectoryHandle | null> {
-  const handle = await withStore<FileSystemDirectoryHandle>('readonly', (store) =>
-    store.get(HANDLE_KEY),
-  );
-  return handle ?? null;
-}
-
-export async function saveDirectoryHandle(
-  handle: FileSystemDirectoryHandle,
-): Promise<void> {
-  await withStore('readwrite', (store) => {
-    store.put(handle, HANDLE_KEY);
-  });
-}
-
-export async function clearDirectoryHandle(): Promise<void> {
-  await withStore('readwrite', (store) => {
-    store.delete(HANDLE_KEY);
-  });
 }
 
 export async function pickSourceDirectory(): Promise<FileSystemDirectoryHandle> {
@@ -148,7 +83,11 @@ export async function writeSourceFiles(
       const fileHandle = await directory.getFileHandle(fileName, { create: true });
       const writable = await fileHandle.createWritable();
       try {
-        await writable.write(file.content);
+        const content =
+          typeof file.content === 'string'
+            ? file.content
+            : Uint8Array.from(file.content);
+        await writable.write(content);
         await writable.close();
       } catch (error) {
         // Release the open writable so it doesn't leave a locked .crswap temp

@@ -1,32 +1,53 @@
 {
-  "name": "sparkrun-browser-built-website",
+  "name": "sparkrun",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "A browser-native coding workspace powered by Gemini, CheerpX, and Tailscale.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LyalinDotCom/SparkRun-Project.git"
+  },
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
+    "stage:vm-image": "node scripts/stage-vm-image.mjs",
+    "release:check-source": "node scripts/verify-release-dist.mjs --mode source",
+    "release:verify-built": "node scripts/verify-release-dist.mjs --mode built",
+    "release:verify": "node scripts/verify-release-dist.mjs --mode deploy",
+    "release:prepare": "npm run release:check-source && npm test && npm run build && npm run stage:vm-image && npm run release:verify",
+    "release:deploy": "npm run release:prepare && firebase deploy --only hosting",
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
     "@google/genai": "2.19.0",
     "@leaningtech/cheerpx": "1.3.9",
-    "@vitejs/plugin-react": "^6.1.0",
-    "lucide-react": "^1.34.0",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "@vitejs/plugin-react": "6.1.1",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-search": "0.16.0",
+    "@xterm/addon-web-links": "0.12.0",
+    "@xterm/xterm": "6.0.0",
+    "dexie": "4.4.5",
+    "lucide-react": "1.35.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
-    "@testing-library/jest-dom": "^7.0.1",
-    "@testing-library/react": "^16.3.3",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.5",
-    "jsdom": "^29.1.1",
-    "typescript": "^7.0.2",
-    "vite": "^8.2.2",
-    "vitest": "^4.1.11"
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "29.1.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
   }
 }

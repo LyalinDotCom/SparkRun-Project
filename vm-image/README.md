@@ -4,7 +4,7 @@ This directory defines the Linux filesystem that SparkRun runs inside CheerpX.
 It is source code, not a hand-maintained VM: the Dockerfile, image metadata,
 executable conformance test, and publishing workflow are the complete recipe.
 
-The current candidate is Alpine Linux 3.24.1 with musl for `linux/386`.
+The retained rc3 image is Alpine Linux 3.24.1 with musl for `linux/386`.
 CheerpX executes 32-bit x86 Linux programs, so the architecture is a runtime
 constraint rather than a compatibility preference. The architecture-specific
 base image digest and critical runtime package revisions are pinned in both
@@ -44,9 +44,12 @@ The ext2 container is 1600 MiB, below the Firebase Hosting 2 GB per-file limit
 and large enough for the development stack plus filesystem metadata and guest
 working space. Its measured rootfs usage is recorded by every image build.
 
-> **Candidate status:** the recipe and delivery path exist, but this image must
-> not be described as published, selected, or CheerpX-compatible until the
-> publication and real-Chrome gates pass.
+> **Rejected for promotion:** `vm-image/image.json` and
+> `src/lib/constants.ts` retain rc3's historical candidate identity. Its immutable GitHub
+> Release and Firebase byte-range mirror are published and verified; those facts
+> prove provenance and delivery only. Real-Chrome measurements found that its
+> modern Node/npm command lifecycle did not complete reliably, so the image is
+> not selected as SparkRun's default or fallback runtime.
 
 ## What belongs inside the image
 
@@ -59,12 +62,13 @@ therefore runs in the user's outer Chrome browser, controlled by SparkRun, while
 the application server runs inside the VM. This gives projects a current real
 browser without putting an obsolete browser binary in the image.
 
-The whole candidate is deliberately provisional. Container validation covers
+The rc3 artifact remains useful for diagnostics. Container validation covers
 exact Node exit statuses, exit handlers, workers, forked children, 200 KiB
 stdout delivery, package-manager versions, Python threads, POSIX threads and a
 parked condition-variable broadcast/join, C, Go, SQLite, and PTYs, but SparkRun
 will not advertise any custom-image runtime as supported until the same suite
-passes under CheerpX in Chrome. This gate exists because the rejected Debian 13
+passes under the selected runtime in Chrome. rc3 failed this gate for modern
+Node/npm. This gate also exists because an earlier glibc
 candidate passed Docker checks while Node and Go hung in the browser VM.
 
 ## Build provenance and publication
@@ -95,7 +99,7 @@ published image digest against `disk.sha256`. A filesystem-changing edit must
 bump the image version; documentation and workflow-only edits may re-verify the
 existing immutable Release.
 
-A successful Release will contain the ext2 file, `disk.sha256`,
+Each successful Release contains the ext2 file, `disk.sha256`,
 `manifest.json`, the package inventory, rootfs manifest, Docker version, and
 toolchain result. A successful container smoke or Release upload still does not
 prove the programs work under CheerpX.
@@ -112,7 +116,7 @@ directly:
 versioned GitHub Release asset
         |
         | scripts/stage-vm-image.mjs
-        | exactly 8 retries + size/SHA-256 verification
+        | initial attempt + exactly 8 retries + size/SHA-256 verification
         v
 dist/vm-images/<versioned-image>.ext2
         |
@@ -125,29 +129,35 @@ dist/vm-images/<versioned-image>.ext2
 CheerpX.HttpBytesDevice
 ```
 
-`npm run stage:vm-image` downloads `disk.sha256` and the disk from the matching
-Release. Each download has one initial attempt plus exactly eight retries. The
-script checks the checksum filename, exact 1600 MiB byte length, and SHA-256,
-then atomically moves the verified file into `dist/vm-images/`.
+`npm run stage:vm-image` downloads `disk.sha256`, `manifest.json`, and the disk
+from the matching Release. Each network download has one initial attempt plus
+exactly eight retries. The script requires the manifest to link the profile,
+version, filename, exact 1600 MiB byte length, disk SHA-256, source commit, and
+passing toolchain/Node conformance result. It then atomically moves the verified
+file into `dist/vm-images/` and finalizes the build-generated
+`dist/release.json` with the exact image provenance.
 
 Firebase Hosting is configured to supply cross-origin access, cross-origin
 resource policy, byte-range delivery, and immutable caching for
 `/vm-images/**`. The application loads the mirrored versioned URL through
-`HttpBytesDevice`. Promotion still requires the same bytes to boot and pass the
-full tool matrix in real Chrome; only then may the candidate become the default
-environment.
+`HttpBytesDevice`. rc3's delivery passed, but its modern Node/npm runtime gate
+did not; it is rejected for promotion. A future image must boot and pass the
+full tool matrix in real Chrome before becoming the default environment.
 
-The clean deployment sequence is:
+The hosting gate must also prove a nonexistent `.ext2` path returns 404. A
+catch-all single-page-app rewrite must never turn a missing image into HTTP 200
+HTML carrying the image's one-year immutable cache policy.
+
+The guarded deployment sequence is:
 
 ```sh
-rm -rf dist
-npm run build
-npm run stage:vm-image
-firebase deploy --only hosting
+npm run release:deploy
 ```
 
-Do not reverse the build and staging steps: `npm run build` recreates `dist`,
-and staging must add the verified image afterward.
+For a two-step release handoff, run `npm run release:prepare` and then
+`firebase deploy --only hosting`. Both require a committed, clean worktree.
+Firebase's predeploy hook reruns the release verifier and rejects a missing or
+changed app asset, image, or provenance field.
 
 ## Local inspection
 
