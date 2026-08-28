@@ -93,7 +93,7 @@ jobs:
             .tools.pipx.status == 0 and .tools.pipx.version == "1.14.0" and
             .tools.go.status == 0 and (.tools.go.version | startswith("go version go1.26.3 ")) and
             .nodeCompatibility.conformancePassed == true and
-            .nodeCompatibility.compileCacheUnavailableStatusVerified == 7 and
+            .nodeCompatibility.compileCacheDisabledStatusVerified == 7 and
             .nodeCompatibility.exitListenerStatusVerified == 9 and
             .nodeCompatibility.stdoutBytesVerified == 204800 and
             .nodeCompileCache.path == "/usr/local/lib/sparkrun/node-compile-cache" and

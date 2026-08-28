@@ -221,8 +221,8 @@ def node_compatibility_smoke(directory: pathlib.Path) -> dict[str, object]:
         ["node", "-e", "process.exitCode = 7"],
         7,
         cwd=directory,
-        label="Node exit with unavailable compile cache",
-        env={"NODE_COMPILE_CACHE": "/proc/sparkrun-unwritable-cache"},
+        label="Node exit with compile cache disabled",
+        env={"NODE_DISABLE_COMPILE_CACHE": "1"},
     )
     require_status(
         ["node", "-e", "throw new Error('expected-conformance-error')"],
@@ -341,7 +341,7 @@ def node_compatibility_smoke(directory: pathlib.Path) -> dict[str, object]:
         "conformancePassed": True,
         "preload": str(preload),
         "addon": str(addon),
-        "compileCacheUnavailableStatusVerified": 7,
+        "compileCacheDisabledStatusVerified": 7,
         "exitListenerStatusVerified": 9,
         "stdoutBytesVerified": output_size,
         "packageManagers": versions,
