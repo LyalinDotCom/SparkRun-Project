@@ -1,18 +1,33 @@
 {
   "schemaVersion": 1,
   "profileId": "sparkrun-coding",
-  "version": "2026.08.27-rc1",
+  "version": "2026.08.27-rc2",
   "status": "candidate",
   "architecture": "linux/386",
-  "distribution": "Debian GNU/Linux 13 (trixie)",
-  "baseImage": "docker.io/library/debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132",
-  "debianSnapshot": "20260827T000000Z",
+  "distribution": "Alpine Linux 3.24.1",
+  "baseImage": "docker.io/i386/alpine:3.24.1@sha256:95a35dbffc3da87221f8b4eea3ed90cb52c634fedfdf4d22f3eb50e8883656cd",
+  "alpineBranch": "v3.24",
+  "repositories": [
+    "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
+    "https://dl-cdn.alpinelinux.org/alpine/v3.24/community"
+  ],
+  "criticalPackages": {
+    "nodejs": "24.18.1-r0",
+    "npm": "11.12.1-r0",
+    "pnpm": "11.20.0-r0",
+    "yarn": "1.22.22-r1",
+    "python3": "3.14.7-r1",
+    "py3-pip": "26.1.2-r0",
+    "pipx": "1.14.0-r0",
+    "go": "1.26.3-r0"
+  },
   "imageSizeMiB": 1600,
   "filesystem": "ext2 revision 0",
-  "diskFile": "sparkrun-coding-2026.08.27-rc1.ext2",
+  "diskFile": "sparkrun-coding-2026.08.27-rc2.ext2",
   "notes": [
     "Candidate until the image passes the CheerpX Chrome runtime smoke suite.",
+    "Alpine musl replaces the Debian glibc runtime that failed CheerpX futex teardown under real Chrome.",
     "Modern Chrome is not available for linux/386; browser automation runs in the outer Chrome harness.",
-    "Go is installed but must pass the CheerpX runtime smoke suite before SparkRun advertises it as supported."
+    "Node, npm, Python threads, POSIX threads, and Go must pass both container and CheerpX runtime smoke suites before promotion."
   ]
 }

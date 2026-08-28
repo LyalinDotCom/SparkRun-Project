@@ -1,69 +1,54 @@
 # syntax=docker/dockerfile:1.7
 
-# CheerpX currently executes 32-bit x86 Linux binaries. Keep both the platform
-# and the multi-architecture manifest digest pinned so a rebuild cannot silently
-# change the base filesystem.
-FROM --platform=linux/386 docker.io/library/debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+# CheerpX executes 32-bit x86 Linux binaries. Pin the architecture-specific
+# Alpine image by digest so the libc and base filesystem cannot drift between
+# rebuilds.
+FROM --platform=linux/386 docker.io/i386/alpine:3.24.1@sha256:95a35dbffc3da87221f8b4eea3ed90cb52c634fedfdf4d22f3eb50e8883656cd
 
-ARG DEBIAN_FRONTEND=noninteractive
-ARG DEBIAN_SNAPSHOT=20260827T000000Z
-
-SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
-
-# A dated Debian snapshot makes package resolution repeatable. The slim base
-# does not yet contain the CA bundle, so this bootstrap transport is HTTP; APT
-# still authenticates the signed Debian Release metadata and package hashes.
-# The installed image includes ca-certificates for every later HTTPS client.
-RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* && \
+# Use only the versioned Alpine repositories. The base image digest pins the
+# bootstrap apk tooling; the release manifest records the exact installed
+# package revisions for every immutable image release.
+RUN set -eux; \
     printf '%s\n' \
-      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} trixie main" \
-      "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} trixie-security main" \
-      > /etc/apt/sources.list && \
-    printf '%s\n' \
-      'Acquire::Check-Valid-Until "false";' \
-      'Acquire::Retries "8";' \
-      'APT::Install-Recommends "false";' \
-      'APT::Install-Suggests "false";' \
-      > /etc/apt/apt.conf.d/99sparkrun
-
-# The core image favors broadly useful, independently testable command-line
-# tools. Browser automation deliberately stays in the outer Chrome process:
-# current Chrome/Chromium does not ship a safe, supported linux/386 binary.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+      "https://dl-cdn.alpinelinux.org/alpine/v3.24/main" \
+      "https://dl-cdn.alpinelinux.org/alpine/v3.24/community" \
+      > /etc/apk/repositories; \
+    apk add --no-cache \
       bash bash-completion zsh \
       ca-certificates curl wget openssl \
-      openssh-client dnsutils iproute2 netcat-openbsd socat \
+      openssh-client-default bind-tools iproute2 netcat-openbsd socat \
       git git-lfs rsync \
-      jq ripgrep fd-find tree file less \
-      nano vim-tiny tmux \
-      procps psmisc lsof \
+      jq ripgrep fd tree file less \
+      nano vim tmux \
+      procps-ng psmisc lsof \
       coreutils findutils grep sed gawk diffutils patch \
-      tar gzip bzip2 xz-utils zip unzip \
-      build-essential cmake ninja-build pkg-config gdb \
-      nodejs npm \
-      python3 python3-dev python3-pip python3-venv pipx \
-      golang-go \
-      sqlite3 \
-      locales tzdata && \
-    npm install --global \
-      pnpm@10.34.5 \
-      yarn@1.22.22 && \
-    npm cache clean --force && \
-    git lfs install --system --skip-repo && \
-    git config --system init.defaultBranch main && \
-    ln -s /usr/bin/fdfind /usr/local/bin/fd && \
-    ln -s /usr/bin/python3 /usr/local/bin/python && \
-    ln -s /usr/bin/pip3 /usr/local/bin/pip && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+      tar gzip bzip2 xz zip unzip \
+      build-base cmake samurai pkgconf gdb \
+      nodejs=24.18.1-r0 \
+      npm=11.12.1-r0 \
+      pnpm=11.20.0-r0 \
+      yarn=1.22.22-r1 \
+      python3=3.14.7-r1 python3-dev \
+      py3-pip=26.1.2-r0 \
+      pipx=1.14.0-r0 \
+      go=1.26.3-r0 \
+      sqlite \
+      util-linux; \
+    update-ca-certificates; \
+    git lfs install --system --skip-repo; \
+    git config --system init.defaultBranch main; \
+    ln -sf /usr/bin/python3 /usr/local/bin/python; \
+    ln -sf /usr/bin/pip3 /usr/local/bin/pip; \
+    adduser -D -s /bin/bash coder; \
+    mkdir -p /workspace/site /root/.config; \
+    chmod 0755 /workspace /workspace/site; \
+    rm -rf /tmp/* /var/tmp/*
+
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 COPY vm-image/bin/sparkrun-toolchain-check /usr/local/bin/sparkrun-toolchain-check
 
 RUN chmod 0755 /usr/local/bin/sparkrun-toolchain-check && \
-    useradd --create-home --shell /bin/bash coder && \
-    mkdir -p /workspace/site /root/.config && \
-    chmod 0755 /workspace /workspace/site && \
     sparkrun-toolchain-check --smoke
 
 ENV HOME=/root \

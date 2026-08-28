@@ -14,6 +14,9 @@ import subprocess
 import tempfile
 
 
+DEFAULT_TIMEOUT_SECONDS = 90
+BUILD_TIMEOUT_SECONDS = 180
+
 COMMANDS: dict[str, list[str]] = {
     "bash": ["bash", "--version"],
     "zsh": ["zsh", "--version"],
@@ -30,6 +33,7 @@ COMMANDS: dict[str, list[str]] = {
     "yarn": ["yarn", "--version"],
     "python": ["python3", "--version"],
     "pip": ["pip3", "--version"],
+    "pipx": ["pipx", "--version"],
     "go": ["go", "version"],
     "gcc": ["gcc", "--version"],
     "g++": ["g++", "--version"],
@@ -49,17 +53,55 @@ COMMANDS: dict[str, list[str]] = {
 }
 
 
-def run(command: list[str], *, cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def run(
+    command: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    merged_env = {**os.environ, "LC_ALL": "C.UTF-8", **(env or {})}
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_seconds,
+            check=False,
+            env=merged_env,
+        )
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            f"{output}\nTimed out after {timeout_seconds} seconds.",
+        )
+
+
+def require_success(
+    command: list[str],
+    expected_output: str,
+    *,
+    cwd: pathlib.Path,
+    label: str,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
+) -> None:
+    completed = run(
         command,
         cwd=cwd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=45,
-        check=False,
-        env={**os.environ, "LC_ALL": "C.UTF-8"},
+        timeout_seconds=timeout_seconds,
+        env=env,
     )
+    if completed.returncode != 0 or expected_output not in completed.stdout:
+        raise RuntimeError(
+            f"{label} failed with status {completed.returncode}: {completed.stdout}"
+        )
 
 
 def inventory() -> tuple[dict[str, dict[str, object]], list[str]]:
@@ -86,9 +128,90 @@ def smoke() -> None:
     with tempfile.TemporaryDirectory(prefix="sparkrun-toolchain-") as raw_directory:
         directory = pathlib.Path(raw_directory)
 
-        node = run(["node", "-e", "console.log('node-ok')"], cwd=directory)
-        if node.returncode != 0 or "node-ok" not in node.stdout:
-            raise RuntimeError(f"Node smoke failed: {node.stdout}")
+        require_success(
+            ["node", "-e", "console.log('node-ok')"],
+            "node-ok",
+            cwd=directory,
+            label="Node execution smoke",
+        )
+
+        dependency = directory / "fixture-message"
+        dependency.mkdir()
+        (dependency / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "fixture-message",
+                    "version": "1.0.0",
+                    "main": "index.js",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (dependency / "index.js").write_text(
+            "module.exports = () => 'npm-build-ok';\n",
+            encoding="utf-8",
+        )
+        (directory / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "sparkrun-node-smoke",
+                    "version": "1.0.0",
+                    "private": True,
+                    "scripts": {"build": "node build.js"},
+                    "dependencies": {"fixture-message": "file:./fixture-message"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / "build.js").write_text(
+            "const fs = require('node:fs');\n"
+            "const message = require('fixture-message')();\n"
+            "fs.mkdirSync('dist', { recursive: true });\n"
+            "fs.writeFileSync('dist/result.js', `console.log('${message}')\\n`);\n",
+            encoding="utf-8",
+        )
+        require_success(
+            [
+                "npm",
+                "install",
+                "--offline",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
+            "added 1 package",
+            cwd=directory,
+            label="npm local install smoke",
+            timeout_seconds=BUILD_TIMEOUT_SECONDS,
+        )
+        require_success(
+            ["npm", "run", "build", "--silent"],
+            "",
+            cwd=directory,
+            label="npm build smoke",
+            timeout_seconds=BUILD_TIMEOUT_SECONDS,
+        )
+        require_success(
+            ["node", "dist/result.js"],
+            "npm-build-ok",
+            cwd=directory,
+            label="npm build output smoke",
+        )
+
+        python_thread = run(
+            [
+                "python3",
+                "-c",
+                "import threading; values = []; "
+                "thread = threading.Thread(target=lambda: values.append('python-thread-ok')); "
+                "thread.start(); thread.join(10); "
+                "assert not thread.is_alive() and values == ['python-thread-ok']; "
+                "print(values[0])",
+            ],
+            cwd=directory,
+        )
+        if python_thread.returncode != 0 or "python-thread-ok" not in python_thread.stdout:
+            raise RuntimeError(f"Python thread smoke failed: {python_thread.stdout}")
 
         python = run(
             ["python3", "-c", "import sqlite3; print(sqlite3.sqlite_version)"],
@@ -102,20 +225,67 @@ def smoke() -> None:
             '#include <stdio.h>\nint main(void) { puts("c-ok"); return 0; }\n',
             encoding="utf-8",
         )
-        compile_c = run(["gcc", "hello.c", "-o", "hello-c"], cwd=directory)
-        execute_c = run([str(directory / "hello-c")], cwd=directory)
-        if compile_c.returncode != 0 or execute_c.stdout.strip() != "c-ok":
-            raise RuntimeError(f"C smoke failed: {compile_c.stdout}{execute_c.stdout}")
+        require_success(
+            ["gcc", "hello.c", "-o", "hello-c"],
+            "",
+            cwd=directory,
+            label="C compile smoke",
+            timeout_seconds=BUILD_TIMEOUT_SECONDS,
+        )
+        require_success(
+            [str(directory / "hello-c")],
+            "c-ok",
+            cwd=directory,
+            label="C execution smoke",
+        )
+
+        pthread_source = directory / "pthread-check.c"
+        pthread_source.write_text(
+            "#include <pthread.h>\n"
+            "#include <stdio.h>\n"
+            "static void *worker(void *raw) { *(int *)raw = 42; return raw; }\n"
+            "int main(void) {\n"
+            "  pthread_t thread; int value = 0; void *result = NULL;\n"
+            "  if (pthread_create(&thread, NULL, worker, &value) != 0) return 1;\n"
+            "  if (pthread_join(thread, &result) != 0) return 2;\n"
+            "  if (result != &value || value != 42) return 3;\n"
+            "  puts(\"pthread-ok\"); return 0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        require_success(
+            ["gcc", "-pthread", "pthread-check.c", "-o", "pthread-check"],
+            "",
+            cwd=directory,
+            label="pthread compile smoke",
+            timeout_seconds=BUILD_TIMEOUT_SECONDS,
+        )
+        require_success(
+            [str(directory / "pthread-check")],
+            "pthread-ok",
+            cwd=directory,
+            label="pthread create/join smoke",
+        )
 
         go_source = directory / "hello.go"
         go_source.write_text(
             'package main\nimport "fmt"\nfunc main() { fmt.Println("go-ok") }\n',
             encoding="utf-8",
         )
-        compile_go = run(["go", "build", "-o", "hello-go", "hello.go"], cwd=directory)
-        execute_go = run([str(directory / "hello-go")], cwd=directory)
-        if compile_go.returncode != 0 or execute_go.stdout.strip() != "go-ok":
-            raise RuntimeError(f"Go smoke failed: {compile_go.stdout}{execute_go.stdout}")
+        require_success(
+            ["go", "build", "-o", "hello-go", "hello.go"],
+            "",
+            cwd=directory,
+            label="Go compile smoke",
+            timeout_seconds=BUILD_TIMEOUT_SECONDS,
+            env={"GOCACHE": str(directory / ".go-cache")},
+        )
+        require_success(
+            [str(directory / "hello-go")],
+            "go-ok",
+            cwd=directory,
+            label="Go execution smoke",
+        )
 
         database = sqlite3.connect(directory / "smoke.sqlite")
         database.execute("create table smoke (value text not null)")
@@ -140,12 +310,14 @@ def main() -> int:
     if args.smoke:
         smoke()
 
-    userspace_architecture = run(["dpkg", "--print-architecture"]).stdout.strip()
+    userspace_architecture = run(["apk", "--print-arch"]).stdout.strip()
     bash_binary = run(["file", "-b", "/bin/bash"]).stdout.strip()
+    libc = run(["ldd", "--version"]).stdout.strip()
     report = {
         "schemaVersion": 1,
         "architecture": userspace_architecture,
         "kernelArchitecture": os.uname().machine,
+        "libc": libc,
         "bashBinary": bash_binary,
         "tools": tools,
         "smokePassed": bool(args.smoke),
