@@ -104,6 +104,194 @@ def require_success(
         )
 
 
+def require_status(
+    command: list[str],
+    expected_status: int,
+    *,
+    cwd: pathlib.Path,
+    label: str,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    completed = run(command, cwd=cwd, timeout_seconds=timeout_seconds)
+    if completed.returncode != expected_status:
+        raise RuntimeError(
+            f"{label} returned {completed.returncode}, expected {expected_status}: "
+            f"{completed.stdout}"
+        )
+    return completed
+
+
+def run_bytes(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+            env={**os.environ, "LC_ALL": "C.UTF-8"},
+        )
+    except subprocess.TimeoutExpired as error:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            (error.stdout or b"") + b"\nTimed out.",
+            error.stderr or b"",
+        )
+
+
+def node_compatibility_smoke(directory: pathlib.Path) -> dict[str, object]:
+    preload = pathlib.Path("/usr/local/lib/sparkrun/node-exit-preload.cjs")
+    addon = pathlib.Path("/usr/local/lib/sparkrun/node-exit-addon.node")
+    expected_option = f"--require={preload}"
+    if not preload.is_file() or not addon.is_file():
+        raise RuntimeError("Node exit compatibility files are missing")
+    if expected_option not in os.environ.get("NODE_OPTIONS", "").split():
+        raise RuntimeError(f"NODE_OPTIONS does not preload {preload}")
+
+    require_status(
+        ["node", "-e", "void 0"], 0, cwd=directory, label="natural Node exit"
+    )
+    require_status(
+        ["node", "-e", "process.exit(7)"],
+        7,
+        cwd=directory,
+        label="explicit Node exit",
+    )
+    require_status(
+        ["node", "-e", "process.exitCode = 7"],
+        7,
+        cwd=directory,
+        label="deferred Node exit code",
+    )
+    require_status(
+        ["node", "-e", "throw new Error('expected-conformance-error')"],
+        1,
+        cwd=directory,
+        label="uncaught Node exception",
+    )
+
+    exit_marker = directory / "node-exit-handler.txt"
+    require_status(
+        [
+            "node",
+            "-e",
+            "require('node:fs').writeFileSync(process.argv[1], 'exit-handler-ok'); "
+            "process.on('exit', () => "
+            "require('node:fs').appendFileSync(process.argv[1], ':ran'))",
+            str(exit_marker),
+        ],
+        0,
+        cwd=directory,
+        label="Node user exit handler",
+    )
+    if exit_marker.read_text(encoding="utf-8") != "exit-handler-ok:ran":
+        raise RuntimeError("Node user exit handler did not finish")
+
+    worker = require_status(
+        [
+            "node",
+            "-e",
+            "const { Worker } = require('node:worker_threads'); "
+            "const w = new Worker(\"require('node:worker_threads').parentPort"
+            ".postMessage('worker-ok')\", { eval: true }); "
+            "w.once('message', console.log); "
+            "w.once('error', (error) => { console.error(error); process.exitCode = 1; });",
+        ],
+        0,
+        cwd=directory,
+        label="Node worker_threads",
+    )
+    if "worker-ok" not in worker.stdout:
+        raise RuntimeError(f"Node worker output missing: {worker.stdout}")
+
+    fork_child = directory / "fork-child.cjs"
+    fork_parent = directory / "fork-parent.cjs"
+    fork_child.write_text(
+        "process.send('fork-ok');\n",
+        encoding="utf-8",
+    )
+    fork_parent.write_text(
+        "const { fork } = require('node:child_process');\n"
+        "const child = fork(process.argv[2], [], "
+        "{ stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });\n"
+        "child.once('message', (message) => console.log(message));\n"
+        "child.once('error', (error) => { console.error(error); process.exitCode = 1; });\n",
+        encoding="utf-8",
+    )
+    forked = require_status(
+        ["node", str(fork_parent), str(fork_child)],
+        0,
+        cwd=directory,
+        label="Node child_process fork",
+    )
+    if "fork-ok" not in forked.stdout:
+        raise RuntimeError(f"Node fork output missing: {forked.stdout}")
+
+    output_size = 200 * 1024
+    large_output = run_bytes(
+        [
+            "node",
+            "-e",
+            f"process.stdout.write(Buffer.alloc({output_size}, 120))",
+        ],
+        cwd=directory,
+    )
+    if (
+        large_output.returncode != 0
+        or len(large_output.stdout) != output_size
+        or large_output.stdout != b"x" * output_size
+    ):
+        raise RuntimeError(
+            "Node 200 KiB stdout integrity failed: "
+            f"status={large_output.returncode}, bytes={len(large_output.stdout)}, "
+            f"stderr={large_output.stderr.decode(errors='replace')}"
+        )
+
+    subsequent = require_status(
+        ["node", "-e", "console.log('subsequent-node-ok')"],
+        0,
+        cwd=directory,
+        label="subsequent Node command",
+    )
+    if "subsequent-node-ok" not in subsequent.stdout:
+        raise RuntimeError("Subsequent Node command output missing")
+
+    expected_versions = {
+        "npm": "11.12.1",
+        "pnpm": "11.20.0",
+        "yarn": "1.22.22",
+    }
+    versions: dict[str, str] = {}
+    for executable, expected in expected_versions.items():
+        result = require_status(
+            [executable, "--version"],
+            0,
+            cwd=directory,
+            label=f"{executable} version",
+        )
+        version = result.stdout.strip()
+        if version != expected:
+            raise RuntimeError(
+                f"{executable} version is {version!r}, expected {expected!r}"
+            )
+        versions[executable] = version
+
+    return {
+        "conformancePassed": True,
+        "preload": str(preload),
+        "addon": str(addon),
+        "stdoutBytesVerified": output_size,
+        "packageManagers": versions,
+    }
+
+
 def inventory() -> tuple[dict[str, dict[str, object]], list[str]]:
     result: dict[str, dict[str, object]] = {}
     missing: list[str] = []
@@ -124,9 +312,11 @@ def inventory() -> tuple[dict[str, dict[str, object]], list[str]]:
     return result, missing
 
 
-def smoke() -> None:
+def smoke() -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="sparkrun-toolchain-") as raw_directory:
         directory = pathlib.Path(raw_directory)
+
+        node_compatibility = node_compatibility_smoke(directory)
 
         require_success(
             ["node", "-e", "console.log('node-ok')"],
@@ -267,6 +457,50 @@ def smoke() -> None:
             label="pthread create/join smoke",
         )
 
+        pthread_condition_source = directory / "pthread-condition-check.c"
+        pthread_condition_source.write_text(
+            "#include <pthread.h>\n"
+            "#include <stdio.h>\n"
+            "static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;\n"
+            "static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;\n"
+            "static int ready = 0; static int released = 0;\n"
+            "static void *worker(void *unused) {\n"
+            "  (void)unused; pthread_mutex_lock(&mutex); ready = 1;\n"
+            "  pthread_cond_broadcast(&condition);\n"
+            "  while (!released) pthread_cond_wait(&condition, &mutex);\n"
+            "  pthread_mutex_unlock(&mutex); return NULL;\n"
+            "}\n"
+            "int main(void) {\n"
+            "  pthread_t thread; if (pthread_create(&thread, NULL, worker, NULL)) return 1;\n"
+            "  pthread_mutex_lock(&mutex);\n"
+            "  while (!ready) pthread_cond_wait(&condition, &mutex);\n"
+            "  released = 1; pthread_cond_broadcast(&condition);\n"
+            "  pthread_mutex_unlock(&mutex);\n"
+            "  if (pthread_join(thread, NULL)) return 2;\n"
+            "  puts(\"pthread-condition-ok\"); return 0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        require_success(
+            [
+                "gcc",
+                "-pthread",
+                "pthread-condition-check.c",
+                "-o",
+                "pthread-condition-check",
+            ],
+            "",
+            cwd=directory,
+            label="parked pthread condition-variable compile",
+            timeout_seconds=BUILD_TIMEOUT_SECONDS,
+        )
+        require_success(
+            [str(directory / "pthread-condition-check")],
+            "pthread-condition-ok",
+            cwd=directory,
+            label="parked pthread condition-variable broadcast/join",
+        )
+
         go_source = directory / "hello.go"
         go_source.write_text(
             'package main\nimport "fmt"\nfunc main() { fmt.Println("go-ok") }\n',
@@ -299,6 +533,8 @@ def smoke() -> None:
         os.close(master)
         os.close(slave)
 
+        return node_compatibility
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -307,12 +543,24 @@ def main() -> int:
     args = parser.parse_args()
 
     tools, missing = inventory()
+    node_compatibility: dict[str, object] = {"conformancePassed": False}
     if args.smoke:
-        smoke()
+        node_compatibility = smoke()
 
     userspace_architecture = run(["apk", "--print-arch"]).stdout.strip()
     bash_binary = run(["file", "-b", "/bin/bash"]).stdout.strip()
     libc = run(["ldd", "--version"]).stdout.strip()
+    compile_cache = pathlib.Path(
+        os.environ.get(
+            "NODE_COMPILE_CACHE",
+            "/usr/local/lib/sparkrun/node-compile-cache",
+        )
+    )
+    compile_cache_files = (
+        sum(1 for path in compile_cache.rglob("*") if path.is_file())
+        if compile_cache.is_dir()
+        else 0
+    )
     report = {
         "schemaVersion": 1,
         "architecture": userspace_architecture,
@@ -320,6 +568,14 @@ def main() -> int:
         "libc": libc,
         "bashBinary": bash_binary,
         "tools": tools,
+        "nodeCompatibility": node_compatibility,
+        "nodeCompileCache": {
+            "path": str(compile_cache),
+            "mode": oct(compile_cache.stat().st_mode & 0o777)
+            if compile_cache.exists()
+            else None,
+            "fileCount": compile_cache_files,
+        },
         "smokePassed": bool(args.smoke),
     }
     if args.json:

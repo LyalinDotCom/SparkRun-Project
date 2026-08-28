@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "profileId": "sparkrun-coding",
-  "version": "2026.08.27-rc2",
+  "version": "2026.08.27-rc3",
   "status": "candidate",
   "architecture": "linux/386",
   "distribution": "Alpine Linux 3.24.1",
@@ -23,11 +23,18 @@
   },
   "imageSizeMiB": 1600,
   "filesystem": "ext2 revision 0",
-  "diskFile": "sparkrun-coding-2026.08.27-rc2.ext2",
+  "diskFile": "sparkrun-coding-2026.08.27-rc3.ext2",
+  "nodeCompatibility": {
+    "mechanism": "N-API environment cleanup hook with exact-status _exit",
+    "preload": "/usr/local/lib/sparkrun/node-exit-preload.cjs",
+    "addon": "/usr/local/lib/sparkrun/node-exit-addon.node",
+    "profileScript": "/etc/profile.d/sparkrun-node.sh"
+  },
   "notes": [
     "Candidate until the image passes the CheerpX Chrome runtime smoke suite.",
-    "Alpine musl replaces the Debian glibc runtime that failed CheerpX futex teardown under real Chrome.",
+    "Alpine musl replaces the Debian glibc userspace, but musl alone did not fix Node's CheerpX native teardown hang.",
+    "A root-owned N-API cleanup addon preserves Node's resolved exit status and exits before the broken native teardown path.",
     "Modern Chrome is not available for linux/386; browser automation runs in the outer Chrome harness.",
-    "Node, npm, Python threads, POSIX threads, and Go must pass both container and CheerpX runtime smoke suites before promotion."
+    "Node exit semantics, package managers, process and worker behavior, output integrity, Python threads, POSIX condition variables, and Go must pass both container and CheerpX runtime smoke suites before promotion."
   ]
 }

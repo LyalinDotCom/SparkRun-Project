@@ -46,10 +46,42 @@ RUN set -eux; \
 
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
+COPY vm-image/compat/node-exit-addon.c /tmp/sparkrun-node-exit-addon.c
+COPY vm-image/compat/node-exit-preload.cjs /usr/local/lib/sparkrun/node-exit-preload.cjs
+COPY vm-image/compat/sparkrun-node.sh /etc/profile.d/sparkrun-node.sh
+
+RUN install -d -o root -g root -m 0755 /usr/local/lib/sparkrun && \
+    gcc -shared -fPIC -O2 -Wall -Wextra -Werror \
+      -Wl,-z,relro,-z,now \
+      -o /usr/local/lib/sparkrun/node-exit-addon.node \
+      /tmp/sparkrun-node-exit-addon.c && \
+    strip /usr/local/lib/sparkrun/node-exit-addon.node && \
+    chown root:root \
+      /usr/local/lib/sparkrun/node-exit-addon.node \
+      /usr/local/lib/sparkrun/node-exit-preload.cjs \
+      /etc/profile.d/sparkrun-node.sh && \
+    chmod 0444 \
+      /usr/local/lib/sparkrun/node-exit-addon.node \
+      /usr/local/lib/sparkrun/node-exit-preload.cjs \
+      /etc/profile.d/sparkrun-node.sh && \
+    install -d -o root -g root -m 0700 \
+      /usr/local/lib/sparkrun/node-compile-cache && \
+    rm /tmp/sparkrun-node-exit-addon.c
+
+ENV NODE_OPTIONS=--require=/usr/local/lib/sparkrun/node-exit-preload.cjs \
+    NODE_COMPILE_CACHE=/usr/local/lib/sparkrun/node-compile-cache
+
 COPY vm-image/bin/sparkrun-toolchain-check /usr/local/bin/sparkrun-toolchain-check
 
 RUN chmod 0755 /usr/local/bin/sparkrun-toolchain-check && \
     sparkrun-toolchain-check --smoke
+
+# The smoke run above populates the root-only cache. Also prewarm stable,
+# image-owned entry points that do not depend on its temporary fixture path.
+RUN node -e "require('node:fs'); require('node:path'); require('node:worker_threads')" && \
+    npm --version >/dev/null && \
+    pnpm --version >/dev/null && \
+    yarn --version >/dev/null
 
 ENV HOME=/root \
     USER=root \

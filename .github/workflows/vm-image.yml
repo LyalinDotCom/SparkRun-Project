@@ -29,6 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           jq -e '
+            .version as $version |
             .schemaVersion == 1 and
             .status == "candidate" and
             .architecture == "linux/386" and
@@ -44,6 +45,14 @@ jobs:
               "pipx": "1.14.0-r0",
               "go": "1.26.3-r0"
             } and
+            .nodeCompatibility == {
+              "mechanism": "N-API environment cleanup hook with exact-status _exit",
+              "preload": "/usr/local/lib/sparkrun/node-exit-preload.cjs",
+              "addon": "/usr/local/lib/sparkrun/node-exit-addon.node",
+              "profileScript": "/etc/profile.d/sparkrun-node.sh"
+            } and
+            (.version | endswith("-rc3")) and
+            (.diskFile | contains($version)) and
             (.imageSizeMiB >= 600 and .imageSizeMiB <= 1900) and
             (.diskFile | endswith(".ext2"))
           ' vm-image/image.json >/dev/null
@@ -82,7 +91,17 @@ jobs:
             .tools.python.status == 0 and .tools.python.version == "Python 3.14.7" and
             .tools.pip.status == 0 and (.tools.pip.version | startswith("pip 26.1.2 ")) and
             .tools.pipx.status == 0 and .tools.pipx.version == "1.14.0" and
-            .tools.go.status == 0 and (.tools.go.version | startswith("go version go1.26.3 "))
+            .tools.go.status == 0 and (.tools.go.version | startswith("go version go1.26.3 ")) and
+            .nodeCompatibility.conformancePassed == true and
+            .nodeCompatibility.stdoutBytesVerified == 204800 and
+            .nodeCompileCache.path == "/usr/local/lib/sparkrun/node-compile-cache" and
+            .nodeCompileCache.mode == "0o700" and
+            .nodeCompileCache.fileCount > 0 and
+            .nodeCompatibility.packageManagers == {
+              "npm": "11.12.1",
+              "pnpm": "11.20.0",
+              "yarn": "1.22.22"
+            }
           ' vm-image-build/toolchain.json >/dev/null
           docker run --rm --platform linux/386 \
             sparkrun-coding:${{ steps.metadata.outputs.image_version }} \
@@ -113,6 +132,20 @@ jobs:
           find vm-image-build/rootfs -xdev \
             -printf '%P\t%y\t%m\t%U\t%G\t%s\t%l\n' \
             | LC_ALL=C sort > vm-image-build/rootfs-manifest.txt
+          [[ "$(stat -c '%U:%G:%a' \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-addon.node)" \
+            == "root:root:444" ]]
+          [[ "$(stat -c '%U:%G:%a' \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-preload.cjs)" \
+            == "root:root:444" ]]
+          [[ "$(stat -c '%U:%G:%a' \
+            vm-image-build/rootfs/etc/profile.d/sparkrun-node.sh)" \
+            == "root:root:444" ]]
+          [[ "$(stat -c '%U:%G:%a' \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-compile-cache)" \
+            == "root:root:700" ]]
+          find vm-image-build/rootfs/usr/local/lib/sparkrun/node-compile-cache \
+            -type f -print -quit | grep -q .
 
       - name: Create and validate the CheerpX ext2 image
         shell: bash
@@ -129,6 +162,15 @@ jobs:
           debugfs -R 'stat /usr/local/bin/sparkrun-toolchain-check' "$disk_path" \
             | tee vm-image-build/ext2-check.txt
           grep -q 'Type: regular' vm-image-build/ext2-check.txt
+          debugfs -R 'stat /usr/local/lib/sparkrun/node-exit-addon.node' "$disk_path" \
+            | tee vm-image-build/ext2-node-addon-check.txt
+          grep -q 'Type: regular' vm-image-build/ext2-node-addon-check.txt
+          debugfs -R 'stat /usr/local/lib/sparkrun/node-exit-preload.cjs' "$disk_path" \
+            | tee vm-image-build/ext2-node-preload-check.txt
+          grep -q 'Type: regular' vm-image-build/ext2-node-preload-check.txt
+          debugfs -R 'stat /etc/profile.d/sparkrun-node.sh' "$disk_path" \
+            | tee vm-image-build/ext2-node-profile-check.txt
+          grep -q 'Type: regular' vm-image-build/ext2-node-profile-check.txt
           (cd vm-image-build && sha256sum "$DISK_FILE") \
             | tee vm-image-build/disk.sha256
 
@@ -142,11 +184,26 @@ jobs:
           dockerfile_sha=$(sha256sum vm-image/Dockerfile | cut -d' ' -f1)
           packages_sha=$(sha256sum vm-image-build/packages.txt | cut -d' ' -f1)
           rootfs_manifest_sha=$(sha256sum vm-image-build/rootfs-manifest.txt | cut -d' ' -f1)
+          sha256sum \
+            vm-image/compat/node-exit-addon.c \
+            vm-image/compat/node-exit-preload.cjs \
+            vm-image/compat/sparkrun-node.sh \
+            > vm-image-build/compat-sources.sha256
+          compat_sources_sha=$(sha256sum vm-image-build/compat-sources.sha256 | cut -d' ' -f1)
+          node_addon_sha=$(sha256sum \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-addon.node \
+            | cut -d' ' -f1)
+          node_preload_sha=$(sha256sum \
+            vm-image-build/rootfs/usr/local/lib/sparkrun/node-exit-preload.cjs \
+            | cut -d' ' -f1)
           jq \
             --arg diskSha256 "$disk_sha" \
             --arg dockerfileSha256 "$dockerfile_sha" \
             --arg packageInventorySha256 "$packages_sha" \
             --arg rootfsManifestSha256 "$rootfs_manifest_sha" \
+            --arg compatibilitySourcesSha256 "$compat_sources_sha" \
+            --arg nodeExitAddonSha256 "$node_addon_sha" \
+            --arg nodeExitPreloadSha256 "$node_preload_sha" \
             --arg sourceCommit "$GITHUB_SHA" \
             --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson rootfsUsedKiB "$(cat vm-image-build/rootfs-used-kib.txt)" \
@@ -156,6 +213,9 @@ jobs:
               dockerfileSha256: $dockerfileSha256,
               packageInventorySha256: $packageInventorySha256,
               rootfsManifestSha256: $rootfsManifestSha256,
+              compatibilitySourcesSha256: $compatibilitySourcesSha256,
+              nodeExitAddonSha256: $nodeExitAddonSha256,
+              nodeExitPreloadSha256: $nodeExitPreloadSha256,
               sourceCommit: $sourceCommit,
               publishedAt: $publishedAt,
               rootfsUsedKiB: $rootfsUsedKiB,
@@ -166,7 +226,8 @@ jobs:
 
           This immutable release contains the 32-bit x86 ext2 base image plus its
           SHA-256, exact Alpine package inventory, normalized filesystem manifest,
-          Docker builder version, toolchain smoke result, and build provenance.
+          Docker builder version, compatibility-source inventory, Node exit
+          conformance result, toolchain smoke result, and build provenance.
 
           The browser-readable copy is promoted to Firebase Hosting only after the
           same image passes the CheerpX-in-Chrome runtime gate.
@@ -189,6 +250,7 @@ jobs:
             "vm-image-build/rootfs-manifest.txt"
             "vm-image-build/docker-version.txt"
             "vm-image-build/toolchain.json"
+            "vm-image-build/compat-sources.sha256"
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
@@ -203,7 +265,10 @@ jobs:
             if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
               git fetch --no-tags --depth=1 origin "$tag_sha"
               if ! git diff --quiet "$tag_sha" "$GITHUB_SHA" -- \
-                vm-image/Dockerfile vm-image/image.json vm-image/bin; then
+                vm-image/Dockerfile vm-image/image.json vm-image/bin \
+                vm-image/compat/node-exit-addon.c \
+                vm-image/compat/node-exit-preload.cjs \
+                vm-image/compat/sparkrun-node.sh; then
                 echo "Release ${tag} points to different filesystem recipe inputs; bump image version." >&2
                 exit 1
               fi
