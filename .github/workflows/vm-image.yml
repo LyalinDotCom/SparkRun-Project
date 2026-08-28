@@ -192,8 +192,14 @@ jobs:
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,assets > vm-image-build/existing-release.json 2>/dev/null; then
-            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha)
+            --json isDraft,assets,targetCommitish \
+            > vm-image-build/existing-release.json 2>/dev/null; then
+            if [[ "$(jq -r .isDraft vm-image-build/existing-release.json)" == "true" ]]; then
+              tag_sha=$(jq -r .targetCommitish vm-image-build/existing-release.json)
+            else
+              tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq .object.sha)
+            fi
+            [[ "$tag_sha" =~ ^[a-f0-9]{40}$ ]]
             if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
               git fetch --no-tags --depth=1 origin "$tag_sha"
               if ! git diff --quiet "$tag_sha" "$GITHUB_SHA" -- \
@@ -255,7 +261,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+          gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets,targetCommitish \
             > vm-image-build/draft-release.json
           for asset in "${assets[@]}"; do
             asset_name=$(basename "$asset")
@@ -273,10 +281,10 @@ jobs:
             fi
           done
 
-          disk_asset_id=$(jq -r --arg name "$DISK_FILE" \
-            '.assets[] | select(.name == $name) | .id' \
+          disk_asset_api_url=$(jq -r --arg name "$DISK_FILE" \
+            '.assets[] | select(.name == $name) | .apiUrl' \
             vm-image-build/draft-release.json)
-          [[ "$disk_asset_id" =~ ^[0-9]+$ ]]
+          [[ "$disk_asset_api_url" =~ ^https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/[0-9]+$ ]]
           draft_status=$(curl --silent --show-error --fail --location \
             --header "Accept: application/octet-stream" \
             --header "Authorization: Bearer ${GH_TOKEN}" \
@@ -284,7 +292,7 @@ jobs:
             --range 1024-1087 \
             --output vm-image-build/draft-superblock.bin \
             --write-out '%{http_code}' \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${disk_asset_id}")
+            "$disk_asset_api_url")
           [[ "$draft_status" == "206" ]]
           [[ "$(stat --format=%s vm-image-build/draft-superblock.bin)" == "64" ]]
           [[ "$(od -An -tx1 -j56 -N2 vm-image-build/draft-superblock.bin | tr -d ' \n')" == "53ef" ]]
