@@ -15,6 +15,11 @@ import {
 const servers: Server[] = [];
 const temporaryRoots: string[] = [];
 const FIXTURE_COMMIT = 'a'.repeat(40);
+// These release-staging cases intentionally exercise real localhost HTTP,
+// streaming, hashing, atomic filesystem writes, and cleanup. Shared CI runners
+// can take longer than Vitest's 5 s unit-test default while the full suite runs
+// in parallel, even though no production timeout has fired.
+const RELEASE_STAGING_TEST_TIMEOUT_MS = 20_000;
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
@@ -202,31 +207,35 @@ describe('VM image staging retries', () => {
 });
 
 describe('VM image release staging', () => {
-  it('links checksum, manifest, exact image bytes, cache, and dist/release.json', async () => {
-    const fixture = await createReleaseFixture();
+  it(
+    'links checksum, manifest, exact image bytes, cache, and dist/release.json',
+    async () => {
+      const fixture = await createReleaseFixture();
 
-    const result = await stageVmImage(fixture.stageOptions);
+      const result = await stageVmImage(fixture.stageOptions);
 
-    expect(await fs.readFile(result.destinationPath)).toEqual(fixture.diskBody);
-    expect(await fs.readFile(result.cachePath)).toEqual(fixture.diskBody);
-    expect(result.expectedSha256).toBe(sha256(fixture.diskBody));
-    const release = JSON.parse(
-      await fs.readFile(fixture.releaseManifestPath, 'utf8'),
-    );
-    expect(release).toMatchObject({
-      state: 'staged',
-      image: {
-        version: fixture.metadata.version,
-        diskFile: fixture.metadata.diskFile,
-        sizeBytes: fixture.diskBody.length,
-        sha256: sha256(fixture.diskBody),
-        sourceCommit: FIXTURE_COMMIT,
-        releaseTag: `vm-image-${fixture.metadata.version}`,
-        stagedPath: `vm-images/${fixture.metadata.diskFile}`,
-      },
-    });
-    expect(release.image.releaseManifestSha256).toMatch(/^[a-f0-9]{64}$/);
-  });
+      expect(await fs.readFile(result.destinationPath)).toEqual(fixture.diskBody);
+      expect(await fs.readFile(result.cachePath)).toEqual(fixture.diskBody);
+      expect(result.expectedSha256).toBe(sha256(fixture.diskBody));
+      const release = JSON.parse(
+        await fs.readFile(fixture.releaseManifestPath, 'utf8'),
+      );
+      expect(release).toMatchObject({
+        state: 'staged',
+        image: {
+          version: fixture.metadata.version,
+          diskFile: fixture.metadata.diskFile,
+          sizeBytes: fixture.diskBody.length,
+          sha256: sha256(fixture.diskBody),
+          sourceCommit: FIXTURE_COMMIT,
+          releaseTag: `vm-image-${fixture.metadata.version}`,
+          stagedPath: `vm-images/${fixture.metadata.diskFile}`,
+        },
+      });
+      expect(release.image.releaseManifestSha256).toMatch(/^[a-f0-9]{64}$/);
+    },
+    RELEASE_STAGING_TEST_TIMEOUT_MS,
+  );
 
   it('rejects a checksum filename that does not match image metadata', async () => {
     const fixture = await createReleaseFixture({ checksumFile: 'other.ext2' });
@@ -283,15 +292,22 @@ describe('VM image release staging', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('reuses a verified cache without downloading the image again', async () => {
-    const fixture = await createReleaseFixture();
-    await stageVmImage(fixture.stageOptions);
-    const destination = join(fixture.destinationRoot, fixture.metadata.diskFile);
-    await fs.rm(destination);
+  it(
+    'reuses a verified cache without downloading the image again',
+    async () => {
+      const fixture = await createReleaseFixture();
+      await stageVmImage(fixture.stageOptions);
+      const destination = join(
+        fixture.destinationRoot,
+        fixture.metadata.diskFile,
+      );
+      await fs.rm(destination);
 
-    await stageVmImage(fixture.stageOptions);
+      await stageVmImage(fixture.stageOptions);
 
-    expect(fixture.requests.get(`/${fixture.metadata.diskFile}`)).toBe(1);
-    expect(await fs.readFile(destination)).toEqual(fixture.diskBody);
-  });
+      expect(fixture.requests.get(`/${fixture.metadata.diskFile}`)).toBe(1);
+      expect(await fs.readFile(destination)).toEqual(fixture.diskBody);
+    },
+    RELEASE_STAGING_TEST_TIMEOUT_MS,
+  );
 });
