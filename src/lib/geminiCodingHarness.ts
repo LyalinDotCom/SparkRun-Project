@@ -148,6 +148,19 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   throw error;
 }
 
+/**
+ * Circuit breaker for a runtime that died mid-run (command-proof disposal,
+ * fatal network failure, teardown). Without it every remaining tool call
+ * returns "the VM has been disposed" as an ordinary tool error and the loop
+ * keeps buying model turns against a machine that can never recover.
+ */
+function throwIfRuntimeDisposed(runtime: CodingHarnessRunOptions['runtime']): void {
+  if (!runtime.isDisposed?.()) return;
+  throw new Error(
+    'The VM stopped while this coding run was active, so the run was ended instead of retrying against a dead machine. The durable workspace checkpoint is preserved — start the VM again (or send a new prompt) to continue from it.',
+  );
+}
+
 function isAbortError(error: unknown): boolean {
   const name =
     error instanceof Error
@@ -203,7 +216,12 @@ function isRetryableApiError(error: unknown): boolean {
     /^(?:APIConnectionError|APIConnectionTimeoutError|APITimeoutError|ConnectionError|RequestTimeoutError|TimeoutError)$/i.test(
       name,
     ) ||
-    /\b(?:408|429|5\d\d)\b/.test(message) ||
+    // Only treat a bare status number as retryable when it appears in a
+    // status-like position; "line 500 of app.js" in an error message must not
+    // trigger nine retries of a permanent failure.
+    /(?:\b(?:status|code|http)\b\s*:?\s*|\[|\()(?:408|429|5\d\d)(?:\]|\)|\b)/i.test(
+      message,
+    ) ||
     /\b(?:UNAVAILABLE|RESOURCE_EXHAUSTED)\b/i.test(message) ||
     /network\s*error|failed to fetch|fetch failed|load failed|unable to make request|high demand|temporarily unavailable|request timed out|timed out/i.test(
       message,
@@ -1151,6 +1169,12 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
     const prompt = options.prompt.trim();
     if (!prompt) throw new Error('Describe the coding task first.');
 
+    // Validate the stored session shape before dereferencing providerState so
+    // a corrupt or legacy record fails with the intended message, not a
+    // TypeError.
+    if (options.session) {
+      assertCompatibleSession(options.session, GEMINI_INTERACTIONS_PROVIDER);
+    }
     const pendingInteractionId =
       typeof options.session?.providerState.pendingInteractionId === 'string'
         ? options.session.providerState.pendingInteractionId
@@ -1216,6 +1240,7 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
 
     for (let turn = 1; turn <= maxTurns; turn++) {
       throwIfAborted(options.abortSignal);
+      throwIfRuntimeDisposed(options.runtime);
       emit(options, {
         type: 'model',
         message: `Calling ${this.model}, turn ${turn}`,
@@ -1384,6 +1409,7 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
       const functionResults: GeminiFunctionResult[] = [];
       for (const call of calls) {
         throwIfAborted(options.abortSignal);
+        throwIfRuntimeDisposed(options.runtime);
         const fingerprint = inspectionFingerprint(
           call,
           options.runtime.workspaceRoot,

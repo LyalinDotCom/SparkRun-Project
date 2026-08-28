@@ -708,7 +708,7 @@ describe('SparkRun setup screen', () => {
 
     render(<App />);
 
-    expect(await screen.findByText(/Reconnect and keep building/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Workspace settings/i)).toBeInTheDocument();
     const backButton = screen.getByRole('button', { name: /Back to project/i });
     expect(backButton).toBeEnabled();
     fireEvent.change(screen.getByRole('textbox', { name: /^Project name$/i }), {
@@ -1213,10 +1213,9 @@ describe('SparkRun chat screen', () => {
       output: 'preview unavailable',
       background: false,
     });
-    const secondBackend = fakeBackend();
-    appMocks.createBackend
-      .mockResolvedValueOnce(firstBackend)
-      .mockResolvedValueOnce(secondBackend);
+    // A healthy same-project VM is reused across prompts, so both runs share
+    // one backend and createBackend is called exactly once.
+    appMocks.createBackend.mockResolvedValue(firstBackend);
     let secondRunOptions: CodingHarnessRunOptions | undefined;
     const secondRunGate = deferred<void>();
     appMocks.runHarness
@@ -2008,7 +2007,9 @@ describe('SparkRun chat screen', () => {
           content: '{"status":0}',
           interactionId: 'interaction-stop-race',
           toolCallId: 'late-call',
-          toolName: 'list_directory',
+          // A mutating tool: read-only inspections no longer trigger
+          // workspace checkpoints.
+          toolName: 'run_command',
         },
       ],
     };
@@ -2283,11 +2284,10 @@ describe('SparkRun chat screen', () => {
   });
 
   it('refreshes an open file preview when an update rewrites the same path', async () => {
+    // A healthy same-project VM is reused across prompts, so both runs share
+    // one backend and createBackend is called exactly once.
     const firstBackend = fakeBackend();
-    const secondBackend = fakeBackend();
-    appMocks.createBackend
-      .mockResolvedValueOnce(firstBackend)
-      .mockResolvedValueOnce(secondBackend);
+    appMocks.createBackend.mockResolvedValue(firstBackend);
     let turn = 0;
     appMocks.runHarness.mockImplementation(
       async (options: CodingHarnessRunOptions) => {

@@ -127,7 +127,38 @@
       const meta = document.getElementById('meta');
       const results = document.getElementById('results');
       const runBtn = document.getElementById('run');
+      const runAppBtn = document.getElementById('run-app');
+      const runTsBtn = document.getElementById('run-ts');
+      const runRaceBtn = document.getElementById('run-race');
+      const runNoWebBtn = document.getElementById('run-noweb');
       const wipeBtn = document.getElementById('wipe');
+
+      // Every run/wipe handler must take all of these controls for its full
+      // duration: two concurrent runs would race each other against the same
+      // shared IDB cache.
+      const controlButtons = [
+        runBtn,
+        runAppBtn,
+        runTsBtn,
+        runRaceBtn,
+        runNoWebBtn,
+        wipeBtn,
+      ];
+      function setControlsDisabled(disabled) {
+        for (const button of controlButtons) {
+          button.disabled = disabled;
+        }
+      }
+
+      // Every IndexedDB database this page can create, across all run modes.
+      const DIAG_IDB_NAMES = [
+        'sparkrun-diag-cache-139',
+        'sparkrun-diag-workspace-139',
+        'sparkrun-diag-app-ws-139',
+        'sparkrun-diag-ts-ws-139',
+        'sparkrun-diag-race-ws-139',
+        'sparkrun-diag-noweb-ws-139',
+      ];
 
       const ua = navigator.userAgent;
       const platform = navigator.platform;
@@ -177,28 +208,24 @@
       });
 
       wipeBtn.addEventListener('click', async () => {
-        wipeBtn.disabled = true;
-        await new Promise((resolve, reject) => {
-          const r = indexedDB.deleteDatabase('sparkrun-diag-cache-139');
-          r.onsuccess = () => resolve();
-          r.onerror = () => reject(r.error);
-          r.onblocked = () => resolve();
-        });
-        await new Promise((resolve, reject) => {
-          const r = indexedDB.deleteDatabase('sparkrun-diag-workspace-139');
-          r.onsuccess = () => resolve();
-          r.onerror = () => reject(r.error);
-          r.onblocked = () => resolve();
-        });
-        wipeBtn.disabled = false;
-        wipeBtn.textContent = 'Wiped — reload to start fresh';
+        setControlsDisabled(true);
+        try {
+          for (const name of DIAG_IDB_NAMES) {
+            await new Promise((resolve, reject) => {
+              const r = indexedDB.deleteDatabase(name);
+              r.onsuccess = () => resolve();
+              r.onerror = () => reject(r.error);
+              r.onblocked = () => resolve();
+            });
+          }
+          wipeBtn.textContent = 'Wiped — reload to start fresh';
+        } finally {
+          setControlsDisabled(false);
+        }
       });
 
-      const runNoWebBtn = document.getElementById('run-noweb');
       runNoWebBtn.addEventListener('click', async () => {
-        runBtn.disabled = true;
-        runNoWebBtn.disabled = true;
-        wipeBtn.disabled = true;
+        setControlsDisabled(true);
         results.innerHTML = '';
         errorBuffer.length = 0;
 
@@ -344,22 +371,17 @@
             const errRow = addRow('Window-level errors captured');
             errRow.fail(errorBuffer.slice(0, 5).join('\n\n'));
           }
-          runBtn.disabled = false;
-          runNoWebBtn.disabled = false;
-          wipeBtn.disabled = false;
+          setControlsDisabled(false);
         }
       });
 
-      const runRaceBtn = document.getElementById('run-race');
       runRaceBtn.addEventListener('click', async () => {
         const key = (document.getElementById('ts-key').value || '').trim();
         if (!key) {
           alert('Paste a Tailscale auth key first.');
           return;
         }
-        runBtn.disabled = true;
-        runRaceBtn.disabled = true;
-        wipeBtn.disabled = true;
+        setControlsDisabled(true);
         results.innerHTML = '';
         errorBuffer.length = 0;
 
@@ -561,22 +583,17 @@
             const errRow = addRow('Window-level errors captured');
             errRow.fail(errorBuffer.slice(0, 5).join('\n\n'));
           }
-          runBtn.disabled = false;
-          runRaceBtn.disabled = false;
-          wipeBtn.disabled = false;
+          setControlsDisabled(false);
         }
       });
 
-      const runTsBtn = document.getElementById('run-ts');
       runTsBtn.addEventListener('click', async () => {
         const key = (document.getElementById('ts-key').value || '').trim();
         if (!key) {
           alert('Paste a Tailscale auth key first.');
           return;
         }
-        runBtn.disabled = true;
-        runTsBtn.disabled = true;
-        wipeBtn.disabled = true;
+        setControlsDisabled(true);
         results.innerHTML = '';
         errorBuffer.length = 0;
 
@@ -767,17 +784,12 @@
             const errRow = addRow('Window-level errors captured');
             errRow.fail(errorBuffer.slice(0, 5).join('\n\n'));
           }
-          runBtn.disabled = false;
-          runTsBtn.disabled = false;
-          wipeBtn.disabled = false;
+          setControlsDisabled(false);
         }
       });
 
-      const runAppBtn = document.getElementById('run-app');
       runAppBtn.addEventListener('click', async () => {
-        runBtn.disabled = true;
-        runAppBtn.disabled = true;
-        wipeBtn.disabled = true;
+        setControlsDisabled(true);
         results.innerHTML = '';
 
         const a1 = addRow('Import CheerpX');
@@ -932,15 +944,12 @@
             const errRow = addRow('Window-level errors captured');
             errRow.fail(errorBuffer.slice(0, 3).join('\n\n'));
           }
-          runBtn.disabled = false;
-          runAppBtn.disabled = false;
-          wipeBtn.disabled = false;
+          setControlsDisabled(false);
         }
       });
 
       runBtn.addEventListener('click', async () => {
-        runBtn.disabled = true;
-        wipeBtn.disabled = true;
+        setControlsDisabled(true);
         results.innerHTML = '';
 
         const t1 = addRow('Import CheerpX module');
@@ -1137,8 +1146,7 @@
             const errRow = addRow('Window-level errors captured');
             errRow.fail(errorBuffer.join('\n\n'));
           }
-          runBtn.disabled = false;
-          wipeBtn.disabled = false;
+          setControlsDisabled(false);
         }
       });
     </script>

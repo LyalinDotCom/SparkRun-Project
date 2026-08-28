@@ -394,7 +394,7 @@ export class BrowserVault {
     return Promise.race([
       deletion,
       new Promise<boolean>((resolve) => {
-        window.setTimeout(() => resolve(false), timeoutMs);
+        globalThis.setTimeout(() => resolve(false), timeoutMs);
       }),
     ]);
   }
@@ -533,6 +533,12 @@ export class BrowserVault {
               `Checkpoint conflict for ${input.projectId}: the head changed while saving.`,
             );
           }
+          // Deliberately a full put, not Table.update({ state }): Dexie's
+          // update/modify path re-reads the stored record, deep-clones it, and
+          // writes the clone back — and that clone step mangles the stored
+          // ArrayBuffer payload into a plain object. Re-putting the canonical
+          // in-memory record keeps archiveBytes intact and also resurrects the
+          // row if a concurrent recovery pass deleted the writing marker.
           await this.db.checkpoints.put(checkpoint);
           await this.db.projects.put({
             ...current,
@@ -697,17 +703,28 @@ export class BrowserVault {
     conversationId: string,
     title: string,
   ): Promise<VaultConversation> {
-    const conversation = await this.db.conversations.get(conversationId);
-    if (!conversation) {
-      throw new Error(`Unknown conversation: ${conversationId}`);
-    }
-    const renamed: VaultConversation = {
-      ...conversation,
-      title: title.trim() || 'New conversation',
-      updatedAt: now(),
-    };
-    await this.db.conversations.put(renamed);
-    return renamed;
+    return this.db.transaction(
+      'rw',
+      [this.db.projects, this.db.conversations],
+      async () => {
+        const conversation = await this.db.conversations.get(conversationId);
+        if (!conversation) {
+          throw new Error(`Unknown conversation: ${conversationId}`);
+        }
+        if (!(await this.db.projects.get(conversation.projectId))) {
+          throw new Error(`Unknown project: ${conversation.projectId}`);
+        }
+        // Patch only the renamed fields. Writing the whole record back would
+        // clobber fields a concurrent writer just advanced (lastEventSequence,
+        // harnessSession, previousInteractionId, ...).
+        const patch = {
+          title: title.trim() || 'New conversation',
+          updatedAt: now(),
+        };
+        await this.db.conversations.update(conversationId, patch);
+        return { ...conversation, ...patch };
+      },
+    );
   }
 
   async getOrCreateActiveConversation(input: {
@@ -1007,8 +1024,17 @@ export class BrowserVault {
   }
 
   async recoverIncompleteWrites(): Promise<number> {
-    const incomplete = await this.db.checkpoints.where('state').equals('writing').toArray();
-    await this.db.checkpoints.bulkDelete(incomplete.map((checkpoint) => checkpoint.id));
+    // Query and delete must share one transaction: with separate implicit
+    // transactions, a concurrent tab's commit can promote a queried record to
+    // 'committed' (and make it the project head) between the read and the
+    // delete. The state-conditional delete removes only records still in
+    // 'writing' state at delete time, so a committed head is never removed.
+    const incomplete = await this.db.transaction(
+      'rw',
+      [this.db.checkpoints],
+      async () =>
+        this.db.checkpoints.where('state').equals('writing').delete(),
+    );
     const pendingWorkspaceDeletes = await this.db.settings
       .filter((setting) => setting.key.startsWith(PENDING_WORKSPACE_DELETE_PREFIX))
       .toArray();
@@ -1017,7 +1043,7 @@ export class BrowserVault {
         await this.deleteWorkspaceDatabase(pending.value, 250);
       }
     }
-    return incomplete.length;
+    return incomplete;
   }
 }
 

@@ -29,6 +29,7 @@ async function createReleaseFixture(options: {
   diskBody?: Buffer;
   checksumSha?: string;
   checksumFile?: string;
+  checksumBody?: string;
   manifestOverrides?: Record<string, unknown>;
 } = {}) {
   const root = await fs.mkdtemp(join(tmpdir(), 'sparkrun-stage-main-test-'));
@@ -92,7 +93,8 @@ async function createReleaseFixture(options: {
     requests.set(path, (requests.get(path) ?? 0) + 1);
     if (path === '/disk.sha256') {
       response.end(
-        `${checksumSha}  ${options.checksumFile ?? metadata.diskFile}\n`,
+        options.checksumBody ??
+          `${checksumSha}  ${options.checksumFile ?? metadata.diskFile}\n`,
       );
       return;
     }
@@ -248,6 +250,36 @@ describe('VM image release staging', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it(
+    'selects the checksum entry whose filename matches the disk file',
+    async () => {
+      const diskBody = Buffer.alloc(1024 * 1024, 0x5a);
+      const fixture = await createReleaseFixture({
+        diskBody,
+        checksumBody:
+          `${'e'.repeat(64)}  other.ext2\n` +
+          `${sha256(diskBody)}  fixture-rc1.ext2\n`,
+      });
+
+      const result = await stageVmImage(fixture.stageOptions);
+
+      expect(result.expectedSha256).toBe(sha256(diskBody));
+    },
+    RELEASE_STAGING_TEST_TIMEOUT_MS,
+  );
+
+  it('rejects a checksum whose hash and filename only pair across lines', async () => {
+    const diskBody = Buffer.alloc(1024 * 1024, 0x5a);
+    const fixture = await createReleaseFixture({
+      diskBody,
+      checksumBody: `${sha256(diskBody)}\nfixture-rc1.ext2\n`,
+    });
+
+    await expect(stageVmImage(fixture.stageOptions)).rejects.toThrow(
+      'checksum does not match',
+    );
+  });
+
   it('rejects a manifest that is not linked to the checksum and image metadata', async () => {
     const fixture = await createReleaseFixture({
       manifestOverrides: { diskSha256: 'f'.repeat(64) },
@@ -291,6 +323,25 @@ describe('VM image release staging', () => {
       fs.stat(join(fixture.destinationRoot, fixture.metadata.diskFile)),
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it(
+    'stages an independent dist copy that later cache writes cannot mutate',
+    async () => {
+      const fixture = await createReleaseFixture();
+
+      const result = await stageVmImage(fixture.stageOptions);
+
+      const cacheStat = await fs.stat(result.cachePath);
+      const destinationStat = await fs.stat(result.destinationPath);
+      expect(destinationStat.ino).not.toBe(cacheStat.ino);
+
+      await fs.writeFile(result.cachePath, 'corrupted-cache-bytes');
+      expect(await fs.readFile(result.destinationPath)).toEqual(
+        fixture.diskBody,
+      );
+    },
+    RELEASE_STAGING_TEST_TIMEOUT_MS,
+  );
 
   it(
     'reuses a verified cache without downloading the image again',

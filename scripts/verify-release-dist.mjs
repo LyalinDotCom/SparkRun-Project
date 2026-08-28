@@ -110,12 +110,19 @@ function headerMapForUniqueRule(firebaseConfig, source) {
     matchingRules.length === 1,
     `Firebase Hosting must define exactly one header rule for ${source}`,
   );
-  return new Map(
-    (matchingRules[0].headers ?? []).map((header) => [
-      String(header?.key ?? '').toLowerCase(),
-      String(header?.value ?? ''),
-    ]),
-  );
+  const headerEntries = (matchingRules[0].headers ?? []).map((header) => [
+    String(header?.key ?? '').toLowerCase(),
+    String(header?.value ?? ''),
+  ]);
+  const seenKeys = new Set();
+  for (const [key] of headerEntries) {
+    invariant(
+      !seenKeys.has(key),
+      `Firebase ${source} header rule declares ${key} more than once`,
+    );
+    seenKeys.add(key);
+  }
+  return new Map(headerEntries);
 }
 
 function assertExactHeader(headers, key, expectedValue, message) {
@@ -373,13 +380,19 @@ async function loadExpectedRelease(projectRoot) {
 }
 
 async function listFiles(root, directory = root) {
-  const entries = await fs.readdir(directory, { withFileTypes: true }).catch(
-    (error) => {
+  let entries;
+  try {
+    entries = await fs.readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (directory === root && error?.code === 'ENOENT') {
       throw new Error(`Release output directory is missing: ${root}`, {
         cause: error,
       });
-    },
-  );
+    }
+    throw new Error(`Could not read release output directory: ${directory}`, {
+      cause: error,
+    });
+  }
   const result = [];
   for (const entry of entries) {
     const path = join(directory, entry.name);

@@ -21,6 +21,17 @@ describe('VM file contract paths', () => {
     expect(() => normalizeSitePath('bad\0path')).toThrow('null bytes');
   });
 
+  it('rejects the bare workspace root instead of rewriting it as relative', () => {
+    // '/workspace' must not silently become the relative path 'workspace'
+    // (which would fabricate /workspace/site/workspace).
+    expect(() => normalizeSitePath('/workspace')).toThrow(
+      `outside ${SITE_ROOT}`,
+    );
+    expect(() => normalizeSitePath('/workspace/')).toThrow(
+      `outside ${SITE_ROOT}`,
+    );
+  });
+
   it('resolves normalized paths under the managed VM site root', () => {
     expect(toVmPath('src/main.ts')).toBe(`${SITE_ROOT}/src/main.ts`);
     expect(toVmPath('')).toBe(SITE_ROOT);

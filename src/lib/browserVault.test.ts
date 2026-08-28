@@ -279,6 +279,33 @@ describe('BrowserVault', () => {
     );
   });
 
+  it('does not clobber concurrent conversation progress while renaming', async () => {
+    const project = await vault.createProject({
+      name: 'Rename race',
+      prompt: '',
+    });
+    const conversation = await vault.createConversation({
+      projectId: project.id,
+      title: 'New conversation',
+      model: 'gemini-3.7-flash',
+    });
+
+    await Promise.all([
+      vault.renameConversation(conversation.id, 'Renamed mid-flight'),
+      vault.appendConversationEvent({
+        conversationId: conversation.id,
+        role: 'assistant',
+        kind: 'message',
+        payload: { text: 'Progress' },
+      }),
+    ]);
+
+    const stored = await vault.getConversation(conversation.id);
+    expect(stored?.title).toBe('Renamed mid-flight');
+    expect(stored?.lastEventSequence).toBe(1);
+    expect(await vault.listConversationEvents(conversation.id)).toHaveLength(1);
+  });
+
   it('does not let a late metadata update roll back active-project selection', async () => {
     const earlier = await vault.createProject({
       id: 'earlier-project',
@@ -571,6 +598,58 @@ describe('BrowserVault', () => {
 
     expect(await vault.recoverIncompleteWrites()).toBe(1);
     expect((await vault.getHeadCheckpoint(project.id))?.id).toBe(head.id);
+  });
+
+  it('never leaves a dangling head when recovery races a concurrent promotion', async () => {
+    const project = await vault.createProject({
+      name: 'Recovery race',
+      prompt: '',
+    });
+    const head = await vault.commitCheckpoint({
+      projectId: project.id,
+      archive: new Blob(['committed-head']),
+      reason: 'manual',
+    });
+    const storedHead = await vault.db.checkpoints.get(head.id);
+    expect(storedHead).toBeDefined();
+    // Phase 1 of a concurrent tab's commit: a durable writing marker.
+    const marker = {
+      ...storedHead!,
+      id: 'checkpoint-promoting',
+      state: 'writing' as const,
+      parentId: head.id,
+    };
+    await vault.db.checkpoints.add(marker);
+    // Phase 2 of that commit racing recovery: promote the marker and advance
+    // the project head, mirroring commitCheckpoint's second transaction.
+    const promotion = () =>
+      vault.db.transaction(
+        'rw',
+        [vault.db.projects, vault.db.checkpoints],
+        async () => {
+          const current = await vault.db.projects.get(project.id);
+          await vault.db.checkpoints.put({ ...marker, state: 'committed' });
+          await vault.db.projects.put({
+            ...current!,
+            headCheckpointId: marker.id,
+            updatedAt: new Date().toISOString(),
+          });
+        },
+      );
+
+    await Promise.all([vault.recoverIncompleteWrites(), promotion()]);
+
+    // Whichever transaction serialized first, the recorded head must resolve
+    // to an existing committed checkpoint — never a deleted id.
+    const storedProject = await vault.getProject(project.id);
+    expect(storedProject?.headCheckpointId).toBeTruthy();
+    const recordedHead = await vault.db.checkpoints.get(
+      storedProject!.headCheckpointId!,
+    );
+    expect(recordedHead?.state).toBe('committed');
+    expect((await vault.getHeadCheckpoint(project.id))?.id).toBe(
+      storedProject!.headCheckpointId,
+    );
   });
 
   it('removes project-scoped settings with the project', async () => {

@@ -32,9 +32,12 @@ export async function ensureDirectoryWritePermission(
   let requested: PermissionState | undefined;
   try {
     requested = await handle.requestPermission?.(descriptor);
-  } catch {
+  } catch (error) {
     throw new Error(
-      'Local folder write permission needs to be re-granted. Re-attach the source folder, then build again.',
+      `Local folder write permission needs to be re-granted (${
+        error instanceof Error ? error.message : String(error)
+      }). Re-attach the source folder, then build again.`,
+      { cause: error },
     );
   }
   if (requested !== 'granted') {

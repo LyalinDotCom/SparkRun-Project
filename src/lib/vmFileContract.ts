@@ -1,9 +1,9 @@
-import { SITE_ROOT } from './constants';
+import { SITE_ROOT, WORKSPACE_ROOT } from './constants';
 
 /** A file-browser entry relative to the VM's managed site directory. */
 export interface DirectoryEntry {
   path: string;
-  type: 'file' | 'directory';
+  type: 'file' | 'directory' | 'symlink' | 'other';
   sizeBytes?: number;
 }
 
@@ -44,7 +44,10 @@ export function normalizeSitePath(rawPath: string | undefined): string {
   }
   if (path.startsWith(`${SITE_ROOT}/`)) {
     path = path.slice(SITE_ROOT.length + 1);
-  } else if (path.startsWith('/workspace/')) {
+  } else if (
+    path === WORKSPACE_ROOT ||
+    path.startsWith(`${WORKSPACE_ROOT}/`)
+  ) {
     throw new Error(`Path is outside ${SITE_ROOT}: ${rawPath}`);
   } else {
     path = path.replace(/^\/+/, '');

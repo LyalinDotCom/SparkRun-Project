@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  constants as fsConstants,
   createReadStream,
   createWriteStream,
   promises as fs,
@@ -168,11 +169,13 @@ function validateImageMetadata(imageMetadata) {
 }
 
 function parseChecksum(checksumText, imageMetadata) {
-  const checksumMatch = checksumText.match(/^([a-f0-9]{64})\s+\*?(.+)$/m);
-  if (!checksumMatch || checksumMatch[2].trim() !== imageMetadata.diskFile) {
-    throw new Error('Release checksum does not match vm-image/image.json');
+  for (const line of checksumText.split('\n')) {
+    const checksumMatch = line.match(/^([a-f0-9]{64})[ \t]+\*?(.+)$/);
+    if (checksumMatch && checksumMatch[2].trim() === imageMetadata.diskFile) {
+      return checksumMatch[1];
+    }
   }
-  return checksumMatch[1];
+  throw new Error('Release checksum does not match vm-image/image.json');
 }
 
 function validatePublishedManifest(
@@ -392,8 +395,15 @@ export async function stageVmImage(options = {}) {
   const destinationTempPath = `${destinationPath}.staging-${process.pid}`;
   await fs.rm(destinationTempPath, { force: true });
   try {
+    // A real copy (clone-on-write when the filesystem supports it), never a
+    // hard link: the cache file stays mutable, and a link would let later
+    // cache writes silently rewrite the verified dist bytes.
     try {
-      await fs.link(cachePath, destinationTempPath);
+      await fs.copyFile(
+        cachePath,
+        destinationTempPath,
+        fsConstants.COPYFILE_FICLONE | fsConstants.COPYFILE_EXCL,
+      );
     } catch {
       await fs.copyFile(cachePath, destinationTempPath);
     }

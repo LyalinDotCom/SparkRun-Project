@@ -268,6 +268,17 @@ function stageName(): string {
   return `stage-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
 }
 
+/**
+ * The CodingRuntime contract documents cwd as "absolute VM path, or a path
+ * relative to workspaceRoot"; resolve the relative form here instead of
+ * handing it to cx.run unresolved.
+ */
+function resolveRuntimeCwd(rawCwd: string | undefined): string {
+  const trimmed = rawCwd?.trim();
+  if (!trimmed) return SITE_ROOT;
+  return trimmed.startsWith('/') ? trimmed : `${SITE_ROOT}/${trimmed}`;
+}
+
 function commandAbortError(): Error {
   const error = new Error('VM command was stopped.');
   error.name = 'AbortError';
@@ -376,7 +387,13 @@ server.serve_forever()
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const BOOTSTRAP_COMMAND_TIMEOUT_MS = 60_000;
 const VM_TIMEOUT_KILL_GRACE_SECONDS = 2;
-const COMMAND_COMPLETION_DRAIN_TIMEOUT_MS = 250;
+// The completion marker travels through the Worker->main console pipeline and
+// can trail cx.run settling by however long the queued output takes to drain.
+// The drain is therefore progress-based: keep waiting while bytes are still
+// arriving, give up only after a quiet period with no marker, and always stop
+// at a hard cap so a truly wedged pipeline still fails closed.
+const COMMAND_COMPLETION_QUIET_DRAIN_MS = 1_000;
+const COMMAND_COMPLETION_DRAIN_HARD_LIMIT_MS = 30_000;
 const COMMAND_CONSOLE_DRAIN_POLL_MS = 5;
 const COMMAND_TRAILING_OUTPUT_DRAIN_MS = 20;
 const HOST_COMMAND_WATCHDOG_GRACE_MS = 15_000;
@@ -987,7 +1004,9 @@ export class WebVmBackend
         }
         if (backend) {
           backend.setTailnetIp(ip);
-        } else {
+        } else if (ip || !pendingTailnetIp) {
+          // Mirror the live-backend guard: a transient empty netmap must not
+          // wipe an address captured before the backend was constructed.
           pendingTailnetIp = ip;
         }
       },
@@ -1462,8 +1481,17 @@ export class WebVmBackend
     );
     if (result.status !== 0) {
       await this.cleanupDataStage(staged);
+      // The boot-time write probe was removed (it caused the corruption it
+      // detected), so the known phantom read-only workspace state surfaces
+      // here on the first write. Name the recovery path instead of letting
+      // the agent retry a permanently failing write.
+      const readOnlyWorkspace = /read-?only file ?system/i.test(result.output);
       const message = `Failed to write ${destination}: ${
         result.output || `cp exited with status ${result.status}`
+      }${
+        readOnlyWorkspace
+          ? '\nThe workspace mount is in the known read-only corruption state and no retry can succeed. Use "Reset workspace" in SparkRun to restore the latest durable checkpoint.'
+          : ''
       }`;
       this.publishDebug({
         phase: 'write',
@@ -1518,7 +1546,10 @@ export class WebVmBackend
       .split('\n')
       .map((line) => line.trim())
       .flatMap((line) => {
-        const match = /^([fd]) ([0-9]+) (.+)$/.exec(line);
+        // Accept every find(1) type code: the agent contract includes
+        // symlinks and other entries, and silently hiding them previously let
+        // the model clobber links it could not see.
+        const match = /^([a-z]) ([0-9]+) (.+)$/.exec(line);
         if (!match) {
           return [];
         }
@@ -1534,9 +1565,17 @@ export class WebVmBackend
         if (!relative) {
           return [];
         }
+        const type =
+          typeCode === 'd'
+            ? 'directory'
+            : typeCode === 'f'
+              ? 'file'
+              : typeCode === 'l'
+                ? 'symlink'
+                : 'other';
         return {
           path: relative,
-          type: typeCode === 'd' ? 'directory' : 'file',
+          type,
           ...(typeCode === 'f' ? { sizeBytes: Number(rawSize) } : {}),
         } satisfies DirectoryEntry;
       });
@@ -1552,7 +1591,7 @@ export class WebVmBackend
       signal?: AbortSignal;
     } = {},
   ): Promise<VmCommandResult> {
-    const cwd = options.cwd ?? SITE_ROOT;
+    const cwd = resolveRuntimeCwd(options.cwd);
     const normalized = command.trim().replace(/\s+/g, ' ');
     if (normalized === SERVER_COMMAND) {
       return this.awaitAbortable(this.startServer(), options.signal);
@@ -1591,7 +1630,7 @@ export class WebVmBackend
     this.throwIfFatalNetworkFailure();
     const command = options.command.trim();
     const port = options.port;
-    const cwd = options.cwd?.trim() || SITE_ROOT;
+    const cwd = resolveRuntimeCwd(options.cwd);
     if (!command) {
       return {
         status: 1,
@@ -1610,16 +1649,20 @@ export class WebVmBackend
         url: null,
       };
     }
-    if (this.startServerPromise) {
-      const pending = await this.awaitAbortable(
-        this.startServerPromise,
+    // A different start (another command/port, or the default static server)
+    // may be in flight. Wait for it to settle, then launch the requested
+    // preview — returning the other start's result here previously reported
+    // the wrong server's port and URL as this preview's success.
+    while (this.startServerPromise) {
+      const pending = this.startServerPromise;
+      await this.awaitAbortable(
+        pending.then(
+          () => undefined,
+          () => undefined,
+        ),
         options.signal,
       );
-      return {
-        ...pending,
-        port: this.serverPort ?? port,
-        url: this.getPreviewUrl(),
-      };
+      if (this.startServerPromise === pending) break;
     }
     const startPromise = this.startManagedPreviewInner(command, port, cwd);
     this.startServerPromise = startPromise;
@@ -1631,7 +1674,10 @@ export class WebVmBackend
         url: this.getPreviewUrl(),
       };
     } finally {
-      this.startServerPromise = null;
+      // Identity-guarded: a stop or a newer start may already own the slot.
+      if (this.startServerPromise === startPromise) {
+        this.startServerPromise = null;
+      }
     }
   }
 
@@ -1927,7 +1973,10 @@ export class WebVmBackend
     try {
       return await startPromise;
     } finally {
-      this.startServerPromise = null;
+      // Identity-guarded: a stop or a newer start may already own the slot.
+      if (this.startServerPromise === startPromise) {
+        this.startServerPromise = null;
+      }
     }
   }
 
@@ -2685,11 +2734,22 @@ export class WebVmBackend
   }
 
   private attachConsole(): void {
-    const decoder = new TextDecoder();
+    // One streaming decoder per virtual terminal: a multi-byte UTF-8 sequence
+    // can be split across console callbacks (and VTs interleave), so a single
+    // non-streaming decoder corrupts exactly the output the agent reads.
+    const decoders = new Map<number | 'default', TextDecoder>();
+    const decodeChunk = (key: number | 'default', bytes: Uint8Array): string => {
+      let decoder = decoders.get(key);
+      if (!decoder) {
+        decoder = new TextDecoder();
+        decoders.set(key, decoder);
+      }
+      return decoder.decode(bytes, { stream: true });
+    };
     this.consoleInput = this.cx.setCustomConsole((buf, vt) => {
       if (this.disposed) return;
       const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-      const text = decoder.decode(bytes);
+      const text = decodeChunk(vt ?? 'default', bytes);
       // A long-lived interactive shell and a managed cx.run command can emit
       // concurrently on different VTs. Keep every VT separate; after cx.run
       // settles, the nonce-bound completion marker identifies which buffer
@@ -2828,7 +2888,10 @@ export class WebVmBackend
         // nonce-bound completion proof below establishes a normal finish. A
         // missing proof disposes the whole VM, which is the final process-tree
         // cleanup boundary available through CheerpX.
-        const durationSeconds = `${Math.max(timeoutMs, 1) / 1_000}s`;
+        // Whole seconds only: busybox `timeout` rejects fractional durations
+        // unless built with FEATURE_FLOAT_DURATION, and a rejected duration
+        // means no completion proof — which would dispose the entire VM.
+        const durationSeconds = `${Math.max(Math.ceil(timeoutMs / 1_000), 1)}s`;
         const completionNonce = crypto.randomUUID().replaceAll('-', '');
         const completionMarker = `${COMMAND_COMPLETION_PREFIX}${completionNonce}__:`;
         const wrappedCommand = [
@@ -2898,26 +2961,42 @@ ${command}
           globalThis.clearTimeout(timeoutId);
           timeoutId = null;
         }
-        // CheerpX can settle cx.run before the Worker-delivered console event
-        // carrying the final nonce marker reaches this task. Wait only for the
-        // exact marker and only within a short bound; after it arrives, retain
-        // one final window for trailing bytes that belong to this capture.
+        // CheerpX can settle cx.run before the Worker-delivered console events
+        // carrying the final nonce marker reach this task. For output-heavy
+        // commands the marker sits behind a queue of chunks, so a fixed short
+        // deadline would fail-close (and dispose the VM) on commands that
+        // actually succeeded. Drain while progress is still being made, stop
+        // after a quiet window with no marker, and enforce a hard cap.
         if (!hostWatchdogFired) {
-          const completionDrainDeadline =
-            Date.now() + COMMAND_COMPLETION_DRAIN_TIMEOUT_MS;
-          while (
-            !Array.from(this.activeCapture.outputByVirtualTerminal.values()).some(
+          const capture = this.activeCapture;
+          const markerArrived = () =>
+            Array.from(capture.outputByVirtualTerminal.values()).some(
               (value) => value.includes(completionMarker),
-            ) &&
-            Date.now() < completionDrainDeadline
+            );
+          const capturedBytes = () => {
+            let total = 0;
+            for (const value of capture.outputByVirtualTerminal.values()) {
+              total += value.length;
+            }
+            return total;
+          };
+          const drainHardDeadline =
+            Date.now() + COMMAND_COMPLETION_DRAIN_HARD_LIMIT_MS;
+          let lastProgressAt = Date.now();
+          let lastCapturedBytes = capturedBytes();
+          while (
+            !markerArrived() &&
+            Date.now() < drainHardDeadline &&
+            Date.now() - lastProgressAt < COMMAND_COMPLETION_QUIET_DRAIN_MS
           ) {
             await sleep(COMMAND_CONSOLE_DRAIN_POLL_MS);
+            const captured = capturedBytes();
+            if (captured !== lastCapturedBytes) {
+              lastCapturedBytes = captured;
+              lastProgressAt = Date.now();
+            }
           }
-          if (
-            Array.from(this.activeCapture.outputByVirtualTerminal.values()).some(
-              (value) => value.includes(completionMarker),
-            )
-          ) {
+          if (markerArrived()) {
             await sleep(COMMAND_TRAILING_OUTPUT_DRAIN_MS);
           }
         }
@@ -3046,6 +3125,9 @@ ${command}
       const reject = this.rejectTailnetSignal;
       this.resolveTailnetSignal = null;
       this.rejectTailnetSignal = null;
+      // Allow a later connectTailnet() to retry networkLogin instead of
+      // silently waiting out its timeout with no login URL.
+      this.tailnetLoginStarted = false;
       reject?.(new Error('Invalid Tailscale login URL.'));
       return;
     }
@@ -3072,6 +3154,7 @@ ${command}
       const reject = this.rejectTailnetSignal;
       this.resolveTailnetSignal = null;
       this.rejectTailnetSignal = null;
+      this.tailnetLoginStarted = false;
       reject?.(new Error(rejection));
       return;
     }

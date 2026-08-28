@@ -1286,7 +1286,10 @@ export async function executeCodingToolCall(
       error instanceof Error ? error.message : String(error),
     );
     return {
-      content: redactCodingSecrets(`Tool ${call.name} failed: ${message}`),
+      // Failure output gets the same size cap as success output: a failing
+      // build can emit megabytes that would otherwise be persisted per event
+      // and replayed to the provider on every subsequent request.
+      content: truncateToolOutput(`Tool ${call.name} failed: ${message}`),
       display: redactCodingSecrets(`Failed ${call.name}`),
       isError: true,
       changedFiles: [],

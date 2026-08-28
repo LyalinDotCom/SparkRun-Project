@@ -109,6 +109,13 @@ export interface CodingRuntime {
   startPreview?(
     options: CodingRuntimePreviewOptions,
   ): Promise<CodingRuntimePreviewResult>;
+  /**
+   * True once the runtime has been torn down and can never execute another
+   * operation. The harness uses this as a circuit breaker so a run fails fast
+   * with a clear error instead of feeding dead-runtime tool failures back to
+   * the model turn after turn.
+   */
+  isDisposed?(): boolean;
 }
 
 export interface CodingHarnessRunOptions {
@@ -146,7 +153,10 @@ export function cloneCodingSession(
   return {
     ...session,
     transcript: session.transcript.map((entry) => ({ ...entry })),
-    providerState: { ...session.providerState },
+    // Deep-copy: providerState holds nested records (telemetry snapshots,
+    // unconfirmed cancellation ids) that must not alias across persisted
+    // session snapshots.
+    providerState: structuredClone(session.providerState),
   };
 }
 
@@ -166,5 +176,12 @@ export function assertCompatibleSession(
   }
   if (!Array.isArray(session.transcript)) {
     throw new Error('Coding session transcript is invalid.');
+  }
+  if (
+    !session.providerState ||
+    typeof session.providerState !== 'object' ||
+    Array.isArray(session.providerState)
+  ) {
+    throw new Error('Coding session provider state is invalid.');
   }
 }

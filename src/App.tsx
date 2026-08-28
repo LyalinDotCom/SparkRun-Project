@@ -46,7 +46,11 @@ import type {
   CodingHarnessEvent,
   CodingHarnessSession,
 } from './lib/codingHarness';
-import { redactCodingSecrets } from './lib/codingHarnessTools';
+import {
+  CODING_LIST_DIRECTORY_TOOL,
+  CODING_READ_FILE_TOOL,
+  redactCodingSecrets,
+} from './lib/codingHarnessTools';
 import {
   ACTIVE_PROJECT_SETTING_KEY,
   createVaultProjectDraft,
@@ -819,55 +823,22 @@ function SetupScreen(props: SetupScreenProps) {
       {!props.hasOpenedBefore ? (
       <section className="setup-hero" aria-labelledby="setup-title">
         <div className="setup-hero-copy">
-          <p className="eyebrow">Your machine, inside the browser</p>
           <h2 className="display" id="setup-title">
-            A Linux workspace and terminal,{' '}
-            <span className="gemini-grad">without leaving Chrome.</span>
+            A Linux workspace,{' '}
+            <span className="gemini-grad">in your browser.</span>
           </h2>
           <p className="lede">
-            SparkRun boots Linux with CheerpX, gives Gemini a real workspace
-            and terminal, then publishes the running app privately through
-            your tailnet. The Browser Vault keeps committed work available
-            even when the VM cache is reset.
+            Gemini codes in a private Linux VM and previews the result on your
+            tailnet. Name the project, paste a key, go.
           </p>
-        </div>
-        <div className="setup-system-map" aria-label="SparkRun system overview">
-          <div>
-            <span className="system-step">01</span>
-            <Cpu size={16} aria-hidden="true" />
-            <strong>Browser Linux</strong>
-            <small>
-              The configured Linux environment runs locally through WebAssembly.
-            </small>
-          </div>
-          <div>
-            <span className="system-step">02</span>
-            <Sparkles size={16} aria-hidden="true" />
-            <strong>Gemini agent</strong>
-            <small>Plans, edits, installs, tests, and runs code.</small>
-          </div>
-          <div>
-            <span className="system-step">03</span>
-            <HardDrive size={16} aria-hidden="true" />
-            <strong>Browser Vault</strong>
-            <small>Checkpoints and conversations survive VM resets.</small>
-          </div>
-          <div>
-            <span className="system-step">04</span>
-            <Globe2 size={16} aria-hidden="true" />
-            <strong>Private preview</strong>
-            <small>Tailscale connects the running app to your devices.</small>
-          </div>
         </div>
       </section>
       ) : (
         <section className="setup-returning" aria-labelledby="setup-title">
-          <p className="eyebrow">Workspace settings</p>
-          <h2 id="setup-title">Reconnect and keep building.</h2>
+          <h2 id="setup-title">Workspace settings</h2>
           <p>
-            Update credentials or workspace details here. Your project,
-            conversations, terminal history, and checkpoints remain in the
-            Browser Vault.
+            Projects, conversations, and checkpoints stay in the Browser
+            Vault.
           </p>
         </section>
       )}
@@ -970,7 +941,6 @@ function SetupScreen(props: SetupScreenProps) {
             validate={validateGoogleApiKey}
           />
           <p className="field-hint" id="setup-google-key-hint">
-            Used to call Gemini for code generation.{' '}
             <a
               className="field-link"
               href="https://aistudio.google.com/api-keys"
@@ -979,7 +949,6 @@ function SetupScreen(props: SetupScreenProps) {
             >
               Create one in AI Studio
             </a>
-            .
           </p>
         </div>
 
@@ -1024,11 +993,8 @@ function SetupScreen(props: SetupScreenProps) {
             validate={validateTailscaleAuthKey}
           />
           <p className="field-hint" id="setup-tail-key-hint">
-            Used so the in-browser VM can join your tailnet and serve a preview
-            URL. This must be a <strong>device auth key</strong>, not a
-            Tailscale API access token. Use a <strong>reusable</strong>, <strong>ephemeral</strong>,{' '}
-            <strong>pre-approved</strong> key.
-            <br />
+            A reusable, ephemeral, pre-approved <strong>device auth key</strong> —
+            not an API access token.{' '}
             <a
               className="field-link"
               href="https://login.tailscale.com/admin/settings/keys"
@@ -1036,15 +1002,6 @@ function SetupScreen(props: SetupScreenProps) {
               target="_blank"
             >
               Create a key
-            </a>{' '}
-            ·{' '}
-            <a
-              className="field-link"
-              href="https://tailscale.com/docs/features/access-control/auth-keys"
-              rel="noreferrer"
-              target="_blank"
-            >
-              How auth keys work
             </a>
           </p>
         </div>
@@ -3491,7 +3448,15 @@ export default function App() {
     return promise;
   };
 
-  const appendEvent = (event: Omit<LogEvent, 'id' | 'time'>) => {
+  const appendEvent = (
+    event: Omit<LogEvent, 'id' | 'time'>,
+    // A long-running build's late callbacks (harness status, cancellation
+    // reconciliation) must land in the conversation that produced them, not
+    // whichever conversation the user has since selected. Callers with a
+    // captured origin pass it here; UI rendering happens only while that
+    // origin is still the visible conversation.
+    target?: { projectId: string; conversationId: string | null },
+  ) => {
     const sanitizedEvent: Omit<LogEvent, 'id' | 'time'> = {
       ...event,
       ...(event.label
@@ -3508,9 +3473,17 @@ export default function App() {
       id: makeId(),
       time: clock(),
     };
-    setEvents((current) => [...current, completeEvent].slice(-200));
-    const conversationId = activeConversationIdRef.current;
-    const projectId = activeProject.id;
+    const isCurrentView =
+      !target ||
+      (activeProjectIdRef.current === target.projectId &&
+        activeConversationIdRef.current === target.conversationId);
+    if (isCurrentView) {
+      setEvents((current) => [...current, completeEvent].slice(-200));
+    }
+    const conversationId = target
+      ? target.conversationId
+      : activeConversationIdRef.current;
+    const projectId = target ? target.projectId : activeProject.id;
     if (
       conversationId &&
       !invalidatedProjectIdsRef.current.has(projectId)
@@ -3691,6 +3664,11 @@ export default function App() {
       changed &&
       backend &&
       !building &&
+      // A background Tailnet retry (or an in-flight Stop) is actively driving
+      // this VM; disposing it underneath that operation produced spurious
+      // mid-flight failures and checkpoints of in-flux state.
+      !networkRetrying &&
+      !stopping &&
       backendResetScheduledForRef.current !== backend
     ) {
       const mountedBackend = backend;
@@ -4029,7 +4007,14 @@ export default function App() {
           await saveVaultCheckpoint(mountedBackend, 'before-reset');
         } catch {
           // A required final checkpoint failed. Keep every visible surface on
-          // the current project so the user can inspect and retry safely.
+          // the current project so the user can inspect and retry safely —
+          // but restore interactivity: the build was already aborted above
+          // and its own finally lost ownership of the controller, so nothing
+          // else will ever clear these flags.
+          setBuilding(false);
+          setStopping(false);
+          setStoppingOperation(null);
+          setNetworkRetrying(false);
           return;
         }
       }
@@ -4762,6 +4747,37 @@ export default function App() {
   const bootVmCritical = async (
     signal?: AbortSignal,
   ): Promise<WorkspaceRuntime> => {
+    // Reuse a healthy VM that already owns this project's workspace lease.
+    // Rebooting on every prompt made each follow-up request pay a full
+    // checkpoint + CheerpX teardown + boot + reconcile before the first
+    // model call, and killed any running preview with it.
+    const activeLease = workspaceLeaseRef.current;
+    if (
+      backend &&
+      !backend.isDisposed() &&
+      activeLease?.backend === backend &&
+      activeLease.projectId === activeProject.id &&
+      !backend.getFatalNetworkFailure?.()
+    ) {
+      // Same superseded guard as the fresh-boot path: an aborted or
+      // project-switched build must not sail through here and keep running
+      // against the reused VM.
+      if (
+        signal?.aborted ||
+        !componentActiveRef.current ||
+        activeProjectIdRef.current !== activeProject.id
+      ) {
+        const abortError = new Error('VM boot was superseded.');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+      appendEvent({
+        kind: 'status',
+        label: 'VM ready',
+        text: 'Reusing the running VM and workspace.',
+      });
+      return backend;
+    }
     if (backend) {
       if (!backend.isDisposed()) {
         appendEvent({
@@ -4959,7 +4975,17 @@ export default function App() {
     buildAbortControllerRef.current?.abort();
     const abortController = new AbortController();
     buildAbortControllerRef.current = abortController;
-    appendEvent({ kind: 'chat', text: buildPrompt });
+    // Every event this run produces is pinned to the conversation that
+    // started it. Late callbacks (harness status, cancellation
+    // reconciliation) then persist to the right conversation instead of
+    // leaking into whichever one the user has since opened.
+    const runOrigin = {
+      projectId: conversation.projectId,
+      conversationId: conversation.id,
+    };
+    const appendRunEvent = (event: Omit<LogEvent, 'id' | 'time'>) =>
+      appendEvent(event, runOrigin);
+    appendRunEvent({ kind: 'chat', text: buildPrompt });
     setDraft('');
 
     const ensureNotAborted = () => {
@@ -4978,7 +5004,7 @@ export default function App() {
       try {
         await ensureDirectoryWritePermission(sourceDirectory);
       } catch (error) {
-        appendEvent({
+        appendRunEvent({
           kind: 'status',
           label: 'Folder sync',
           text: error instanceof Error ? error.message : String(error),
@@ -4996,7 +5022,7 @@ export default function App() {
       // the agent. We let writes finish on a clean (no-Tailnet) workspace,
       // then startServer() activates Tailnet right before launching python.
 
-      appendEvent({
+      appendRunEvent({
         kind: 'status',
         label: 'Gemini',
         text: `Building with ${model}`,
@@ -5027,10 +5053,23 @@ export default function App() {
         session: priorSession,
         abortSignal: abortController.signal,
         onSession: async (session) => {
+          const lastEntry = session.transcript.at(-1);
           const hasNewToolResult =
-            session.transcript.at(-1)?.kind === 'tool-result' &&
+            lastEntry?.kind === 'tool-result' &&
             session.transcript.length > checkpointedToolTranscriptLength;
-          if (hasNewToolResult) {
+          // Pure inspections (read_file/list_directory) cannot have changed
+          // the workspace, so they don't justify archiving it; per-result
+          // archives dominated run time once a project grew dependencies.
+          // Any other (or unknown) tool is conservatively treated as
+          // mutating.
+          const canHaveMutatedWorkspace = !(
+            lastEntry?.toolName === CODING_READ_FILE_TOOL ||
+            lastEntry?.toolName === CODING_LIST_DIRECTORY_TOOL
+          );
+          if (hasNewToolResult && !canHaveMutatedWorkspace) {
+            checkpointedToolTranscriptLength = session.transcript.length;
+          }
+          if (hasNewToolResult && canHaveMutatedWorkspace) {
             // Register the workspace checkpoint on its serialized chain before
             // this callback's first await. Stop can then see and drain it even
             // while Browser Vault persistence is still in flight. Persist the
@@ -5057,7 +5096,7 @@ export default function App() {
           }
           const logEvent = eventFromAgentEvent(event);
           if (logEvent) {
-            appendEvent(logEvent);
+            appendRunEvent(logEvent);
           }
         },
       });
@@ -5083,14 +5122,14 @@ export default function App() {
         );
         if (hasStaticEntry) {
           previewAttempted = true;
-          appendEvent({
+          appendRunEvent({
             kind: 'status',
             label: 'Static preview',
             text: 'No managed preview was running, so SparkRun is starting the built-in static server.',
           });
           const startResult = await vm.startDefaultPreview();
           if (startResult.status !== 0) {
-            appendEvent({
+            appendRunEvent({
               kind: 'error',
               label: 'Preview start failed',
               text:
@@ -5105,7 +5144,7 @@ export default function App() {
       if (previewAttempted) {
         const health = await vm.checkPreview();
         serverHealthy = health.status === 0;
-        appendEvent({
+        appendRunEvent({
           kind: serverHealthy ? 'status' : 'error',
           label: serverHealthy ? 'Server ready' : 'Server failed',
           text:
@@ -5115,7 +5154,7 @@ export default function App() {
       }
 
       if (previewAttempted && serverHealthy && !url) {
-        appendEvent({
+        appendRunEvent({
           kind: 'status',
           label: 'Tailnet',
           text: 'Waiting for the VM Tailnet IP before exposing the server URL.',
@@ -5138,19 +5177,19 @@ export default function App() {
         url,
       );
       if (url && serverHealthy) {
-        appendEvent({
+        appendRunEvent({
           kind: 'ready',
           text: `**Server is ready at:** ${url}\n\nOpen the URL in Chrome to prove the outer-browser connection.\n\n${finalText}`,
         });
         setReady(true);
       } else if (!previewAttempted) {
-        appendEvent({
+        appendRunEvent({
           kind: 'ready',
           label: 'Complete',
           text: `**Task complete.**\n\n${finalText}`,
         });
       } else {
-        appendEvent({
+        appendRunEvent({
           kind: 'error',
           label: !serverHealthy ? 'Preview unavailable' : 'Tailnet unavailable',
           text: !serverHealthy
@@ -5167,7 +5206,7 @@ export default function App() {
       await saveVaultCheckpoint(vm, 'agent-tool');
 
       if (result.reachedTurnBudget) {
-        appendEvent({
+        appendRunEvent({
           kind: 'status',
           label: 'Turn budget reached',
           text: 'Agent hit the turn budget. Send a new prompt to keep iterating.',
@@ -5183,7 +5222,7 @@ export default function App() {
           // Preserve the stopped request as a ready-to-edit retry. If the user
           // already typed a replacement while the run was stopping, keep it.
           setDraft((current) => (current.trim() ? current : buildPrompt));
-          appendEvent({
+          appendRunEvent({
             kind: 'status',
             label: 'Stopped',
             text: 'The active request and VM process tree stopped. Send another prompt to resume from the latest durable checkpoint.',
@@ -5194,7 +5233,7 @@ export default function App() {
       if (runVm && ownsCurrentRun && !runVm.isDisposed()) {
         await saveVaultCheckpoint(runVm, 'agent-tool').catch(() => undefined);
       }
-      appendEvent({
+      appendRunEvent({
         kind: 'error',
         text: error instanceof Error ? error.message : String(error),
       });
@@ -5657,7 +5696,7 @@ export default function App() {
           });
           if (
             activeProjectIdRef.current === projectId &&
-            backend === vm &&
+            workspaceLeaseRef.current?.backend === vm &&
             !vm.isDisposed() &&
             !quiescingBackendsRef.current.has(vm)
           ) {
@@ -5721,7 +5760,7 @@ export default function App() {
           });
           if (
             activeProjectIdRef.current === projectId &&
-            backend === vm &&
+            workspaceLeaseRef.current?.backend === vm &&
             !vm.isDisposed() &&
             !quiescingBackendsRef.current.has(vm)
           ) {
@@ -5775,7 +5814,7 @@ export default function App() {
 
   const subtitle =
     screen === 'setup'
-      ? 'Browser Linux · Gemini · Browser Vault · Tailscale'
+      ? ''
       : previewReady
         ? `server ready · ${hostFromPreviewUrl(previewUrl) ?? `${vmStatus.tailnetIp ?? '—'}:${activeServerPort ?? 'auto'}`}`
         : building
@@ -5783,7 +5822,7 @@ export default function App() {
           : `ready · ${model}`;
 
   const title =
-    screen === 'setup' ? 'System setup' : activeProject.name || 'Untitled';
+    screen === 'setup' ? 'Setup' : activeProject.name || 'Untitled';
 
   return (
     <>

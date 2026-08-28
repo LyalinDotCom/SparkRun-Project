@@ -292,6 +292,14 @@ describe('release dist verification', () => {
       '/assets/** cache policy',
     );
 
+    const duplicateHeaderKey = structuredClone(config);
+    duplicateHeaderKey.hosting.headers.find(
+      ({ source }) => source === '/diag.html',
+    )!.headers.push({ key: 'cache-control', value: 'max-age=3600' });
+    expect(() => validateFirebaseHostingConfig(duplicateHeaderKey)).toThrow(
+      'declares cache-control more than once',
+    );
+
     const missingVmCors = structuredClone(config);
     missingVmCors.hosting.headers.find(({ source }) => source === '/vm-images/**')!
       .headers = [];
@@ -356,6 +364,25 @@ describe('release dist verification', () => {
       }),
     ).rejects.toThrow('clean Git worktree');
   });
+
+  it.skipIf(process.getuid?.() === 0)(
+    'propagates dist listing failures with the failing path instead of a missing-root report',
+    async () => {
+      const fixture = await createFixture('built');
+      const assetsDir = join(fixture.distRoot, 'assets');
+      await fs.chmod(assetsDir, 0o000);
+
+      try {
+        await expect(
+          verifyReleaseDist(options(fixture, 'built')),
+        ).rejects.toThrow(
+          `Could not read release output directory: ${assetsDir}`,
+        );
+      } finally {
+        await fs.chmod(assetsDir, 0o755);
+      }
+    },
+  );
 
   it('rejects app files changed after the build manifest was generated', async () => {
     const fixture = await createFixture('built');

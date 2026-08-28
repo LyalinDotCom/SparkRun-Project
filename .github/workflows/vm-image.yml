@@ -312,9 +312,16 @@ jobs:
             "vm-image-build/compat-sources.sha256"
           )
 
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+          # Distinguish "release does not exist" from transient gh/API
+          # failures: only a genuine not-found may fall through to draft
+          # creation, otherwise a flaky probe could recreate the tag and
+          # clobber a published immutable release's assets.
+          view_status=0
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
             --json isDraft,assets,targetCommitish \
-            > vm-image-build/existing-release.json 2>/dev/null; then
+            > vm-image-build/existing-release.json \
+            2> vm-image-build/existing-release.err || view_status=$?
+          if [[ "$view_status" -eq 0 ]]; then
             if [[ "$(jq -r .isDraft vm-image-build/existing-release.json)" == "true" ]]; then
               tag_sha=$(jq -r .targetCommitish vm-image-build/existing-release.json)
             else
@@ -373,6 +380,12 @@ jobs:
               exit 0
             fi
           else
+            if ! grep -Eqi 'release not found|HTTP 404' \
+              vm-image-build/existing-release.err; then
+              cat vm-image-build/existing-release.err >&2
+              echo "Could not determine whether release ${tag} exists (gh exit ${view_status}); failing instead of creating or overwriting it." >&2
+              exit 1
+            fi
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \

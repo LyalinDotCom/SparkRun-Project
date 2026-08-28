@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
+# Without nullglob an empty status directory would run the manifest and
+# exit-code loops on the literal glob and misreport a failure.
+shopt -s nullglob
 
 PROJECT_DIR="${1:-$(pwd)}"
 OUT_DIR="${2:-$PROJECT_DIR/docs/bug-bash/2026-08-28-release-candidate}"
@@ -43,8 +46,13 @@ run_one() {
     return
   fi
   if [[ -f "$status_file" ]]; then
-    [[ -f "$report" ]] && cp "$report" "$OUT_DIR/logs/$label.report-attempt-1.log"
-    [[ -f "$log" ]] && cp "$log" "$OUT_DIR/logs/$label.attempt-1.log"
+    local attempt=1
+    while [[ -e "$OUT_DIR/logs/$label.report-attempt-$attempt.log" || \
+      -e "$OUT_DIR/logs/$label.attempt-$attempt.log" ]]; do
+      attempt=$((attempt + 1))
+    done
+    [[ -f "$report" ]] && cp "$report" "$OUT_DIR/logs/$label.report-attempt-$attempt.log"
+    [[ -f "$log" ]] && cp "$log" "$OUT_DIR/logs/$label.attempt-$attempt.log"
   fi
 
   echo "[$label] $agent / $model / $effort"
