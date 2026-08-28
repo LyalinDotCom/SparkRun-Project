@@ -187,8 +187,10 @@ private `100.x.x.x` address.
 The workbench shows Tailnet and bind/PID readiness while the terminal tails the
 guest server log. `GET / HTTP/1.1` returned `200`, independently proving that
 outer Chrome reached the VM rather than merely displaying a URL. This capture
-predates the final copy change from “Site is live” to the more precise “Server
-is ready at”; the application now asks the user to open the URL for this proof.
+predates the final preview-truth fix: its “Live” labels, green pulse, and “Site
+is live” message represented bind/PID readiness only. The current application
+uses neutral “Server ready” language and asks the user to open the URL; the
+resulting guest request log is the actual connection proof.
 
 ![Outer Chrome GET recorded by the VM server](screenshots/21-live-connection-proof.png)
 

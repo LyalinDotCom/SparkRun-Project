@@ -251,7 +251,7 @@ Open the printed `127.0.0.1` URL in current Chrome.
 - [Curated bug-bash disposition](BUG_BASH.md)
 
 The strongest current screenshots are the [live terminal](screenshots/18-live-terminal-proof.png),
-[restart restore](screenshots/19-live-restart-restore.png), [private Chrome
+[restart persistence](screenshots/19-live-restart-restore.png), [private Chrome
 preview](screenshots/20-live-tailnet-preview.png), and [guest request-log
 proof](screenshots/21-live-connection-proof.png). The [provider timeout
 capture](screenshots/17-live-provider-timeout.png) is included deliberately so
