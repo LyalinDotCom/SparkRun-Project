@@ -673,7 +673,10 @@ describe('SparkRun setup screen', () => {
     expect(
       screen.getByRole('button', { name: /Saved conversation/i }),
     ).toHaveAttribute('aria-current', 'page');
-    expect(appMocks.createBackend).not.toHaveBeenCalled();
+    // Entering the workbench boots the VM automatically, but a restored
+    // conversation must never start a model run on its own.
+    expect(appMocks.runHarness).not.toHaveBeenCalled();
+    expect(appMocks.createHarness).not.toHaveBeenCalled();
     expect(await testVault.db.conversations.count()).toBe(1);
   });
 
@@ -731,7 +734,8 @@ describe('SparkRun setup screen', () => {
     expect(
       await screen.findByText(/does not look like a Google API key/i),
     ).toBeInTheDocument();
-    expect(appMocks.createBackend).not.toHaveBeenCalled();
+    // The VM boots on workbench entry regardless of the model key; only the
+    // model request must be refused.
     expect(appMocks.createHarness).not.toHaveBeenCalled();
   });
 });
@@ -923,8 +927,10 @@ describe('SparkRun chat screen', () => {
     fireEvent.click(buildButton);
 
     await waitFor(() => expect(conversationSpy).toHaveBeenCalledTimes(1));
-    expect(appMocks.acquireWorkspaceLease).not.toHaveBeenCalled();
-    expect(appMocks.createBackend).not.toHaveBeenCalled();
+    // Workbench entry already booted the VM once; Build must not add a boot
+    // or a model run while conversation creation is still pending.
+    expect(appMocks.acquireWorkspaceLease).toHaveBeenCalledTimes(1);
+    expect(appMocks.createBackend).toHaveBeenCalledTimes(1);
     expect(appMocks.runHarness).not.toHaveBeenCalled();
 
     conversationGate.resolve(undefined);
@@ -1018,7 +1024,7 @@ describe('SparkRun chat screen', () => {
     fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'pwd' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
     await waitFor(() =>
       expect(view.container.querySelector('.term-head-meta')).toHaveTextContent(
         '2 lines',
@@ -1180,13 +1186,13 @@ describe('SparkRun chat screen', () => {
     fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
     await waitFor(() => expect(appMocks.runHarness).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
-    expect(screen.getByLabelText(/Inline VM command/i)).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
+    expect(screen.getByLabelText(/VM command/i)).toBeDisabled();
     expect(
       screen.getByText(/Terminal input is paused while the coding agent owns the VM/i),
     ).toBeInTheDocument();
     expect(
-      screen.queryByText(/Terminal starts with the VM/i),
+      screen.queryByText(/The VM is not running/i),
     ).not.toBeInTheDocument();
     expect(document.querySelector('.xterm-host')).toBeInTheDocument();
     expect(backend.startInteractiveShell).not.toHaveBeenCalled();
@@ -1195,9 +1201,9 @@ describe('SparkRun chat screen', () => {
     finishRun?.();
     await screen.findByText(/Server is ready at/i);
     await waitForManagedRunToFinish();
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
     expect(backend.startInteractiveShell).toHaveBeenCalledTimes(1);
-    expect(screen.getByLabelText(/Inline VM command/i)).toBeEnabled();
+    expect(screen.getByLabelText(/VM command/i)).toBeEnabled();
   });
 
   it('hides nonfatal Retry Tailnet during an agent run without aborting that run', async () => {
@@ -1291,7 +1297,7 @@ describe('SparkRun chat screen', () => {
     ).not.toBeInTheDocument();
     expect(appMocks.runHarness).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
     expect(
       screen.getByText(/paused while SparkRun reconnects Tailnet/i),
     ).toBeInTheDocument();
@@ -1374,7 +1380,7 @@ describe('SparkRun chat screen', () => {
     expect(screen.getByRole('button', { name: /^Update$/i })).toBeEnabled();
   });
 
-  it('starts the inline terminal without opening the drawer and can maximize it', async () => {
+  it('opens the docked terminal, runs a command, and can maximize and resize it', async () => {
     const backend = fakeBackend();
     appMocks.createBackend.mockResolvedValue(backend);
 
@@ -1387,20 +1393,38 @@ describe('SparkRun chat screen', () => {
     await screen.findByText(/Server is ready at/i);
     await waitForManagedRunToFinish();
 
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
+    expect(screen.queryByRole('region', { name: /^Terminal$/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
+    const dock = screen.getByRole('region', { name: /^Terminal$/i });
     expect(backend.startInteractiveShell).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText(/Interactive VM terminal/i)).not.toBeInTheDocument();
+    expect(dock.querySelector('.xterm-host')).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: /Terminal/i })).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText(/Inline VM command/i), {
+    fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'pwd' },
     });
     fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
     expect(backend.writeTerminalInput).toHaveBeenCalledWith('pwd\n');
-    expect(screen.queryByText(/Interactive VM terminal/i)).not.toBeInTheDocument();
+
+    const separator = screen.getByRole('separator', { name: /Resize terminal/i });
+    const before = Number(separator.getAttribute('aria-valuenow'));
+    fireEvent.keyDown(separator, { key: 'ArrowUp' });
+    expect(Number(separator.getAttribute('aria-valuenow'))).toBe(before + 40);
+    expect(window.localStorage.getItem('sparkrun.terminalDock.v1')).toBe(
+      String(before + 40),
+    );
 
     fireEvent.click(screen.getByRole('button', { name: /Maximize terminal/i }));
-    expect(backend.startInteractiveShell).toHaveBeenCalledTimes(2);
-    expect(screen.getByText(/Interactive VM terminal/i)).toBeInTheDocument();
+    expect(dock).toHaveClass('maximized');
+    fireEvent.click(screen.getByRole('button', { name: /Restore terminal size/i }));
+    expect(dock).not.toHaveClass('maximized');
+
+    fireEvent.keyDown(window, { key: '`', ctrlKey: true });
+    expect(screen.queryByRole('region', { name: /^Terminal$/i })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: '`', ctrlKey: true });
+    expect(screen.getByRole('region', { name: /^Terminal$/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Close terminal/i }));
+    expect(screen.queryByRole('region', { name: /^Terminal$/i })).not.toBeInTheDocument();
   });
 
   it('refreshes the Files surface after a manual checkpoint without restarting the VM', async () => {
@@ -1492,8 +1516,8 @@ describe('SparkRun chat screen', () => {
     await waitForManagedRunToFinish();
 
     await backend.writeText('js/app.js', 'console.log("ready");\n');
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
-    fireEvent.change(screen.getByLabelText(/Inline VM command/i), {
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
+    fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'touch js/app.js' },
     });
     fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
@@ -1585,8 +1609,8 @@ describe('SparkRun chat screen', () => {
     await screen.findByText(/Server is ready at/i);
     await waitForManagedRunToFinish();
 
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
-    fireEvent.change(screen.getByLabelText(/Inline VM command/i), {
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
+    fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'slow-output' },
     });
     fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
@@ -1690,8 +1714,11 @@ describe('SparkRun chat screen', () => {
 
     await waitFor(() => expect(runSignal?.aborted).toBe(true));
     await waitFor(() => expect(backend.createWorkspaceArchive).toHaveBeenCalled());
-    await waitFor(() => expect(backend.dispose).toHaveBeenCalledTimes(1));
-    expect(reload).toHaveBeenCalledTimes(1);
+    // This fake reports the network crash from the moment it boots, so the
+    // automatic workbench boot is replaced before the run and disposed again
+    // by recovery; recovery itself must still reload exactly once.
+    await waitFor(() => expect(backend.dispose).toHaveBeenCalled());
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
     expect(backend.connectPrivateNetwork).not.toHaveBeenCalled();
     reload.mockRestore();
   });
@@ -1753,7 +1780,7 @@ describe('SparkRun chat screen', () => {
     fireEvent.click(screen.getByRole('button', { name: /^Build$/i }));
     await screen.findByText(/Server is ready at/i);
     await waitForManagedRunToFinish();
-    fireEvent.click(screen.getByRole('tab', { name: /Terminal/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
 
     const firstState = 'a'.repeat(200_000);
     await act(async () => {
@@ -1840,7 +1867,7 @@ describe('SparkRun chat screen', () => {
     fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'pwd' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
     expect(backend.startInteractiveShell).toHaveBeenCalledTimes(1);
     expect(backend.writeTerminalInput).toHaveBeenCalledWith('pwd\n');
     expect(screen.queryByText(/ttyname failed/i)).not.toBeInTheDocument();
@@ -2185,7 +2212,7 @@ describe('SparkRun chat screen', () => {
     fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: `printf '%s' '${rawSecrets}'` },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
     const [project] = await testVault.listProjects();
     await waitFor(async () => {
       const [session] = await testVault.listTerminalSessions(project.id);
@@ -2197,7 +2224,7 @@ describe('SparkRun chat screen', () => {
     fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'pwd' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
 
     await waitFor(async () => {
       const [session] = await testVault.listTerminalSessions(project.id);
@@ -2383,11 +2410,14 @@ describe('SparkRun chat screen', () => {
       /Close files/i,
     );
     await checkDrawer(/Open logs/i, /Diagnostics log/i, /Close logs/i);
-    await checkDrawer(
-      /Open terminal/i,
-      /Interactive VM terminal/i,
-      /Close terminal/i,
-    );
+    // The terminal is a docked, non-modal panel: it must not trap focus or
+    // claim Escape like the modal drawers do.
+    fireEvent.click(screen.getByRole('button', { name: /Open terminal/i }));
+    expect(screen.getByRole('region', { name: /^Terminal$/i })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('region', { name: /^Terminal$/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Close terminal/i }));
+    expect(screen.queryByRole('region', { name: /^Terminal$/i })).not.toBeInTheDocument();
   });
 
   it('keeps a writable matching-head cache with newer uncheckpointed files', async () => {
@@ -3146,7 +3176,7 @@ describe('SparkRun chat screen', () => {
     fireEvent.change(screen.getByLabelText(/VM command/i), {
       target: { value: 'pwd' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^Send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^Run$/i }));
     const checkpointTimerIndex = timeoutSpy.mock.calls.findIndex(
       ([, delay]) => delay === 2_500,
     );

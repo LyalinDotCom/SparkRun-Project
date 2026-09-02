@@ -3934,3 +3934,150 @@ summary:focus-visible,
     max-width: 150px;
   }
 }
+
+/* ----- Docked bottom terminal ----- */
+.terminal-dock {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 160px;
+  max-height: calc(100% - 96px);
+  border-top: 1px solid var(--line);
+  background: #050608;
+  box-shadow: 0 -14px 40px rgba(0, 0, 0, 0.35);
+}
+.terminal-dock.maximized {
+  flex: 1 1 auto;
+  height: auto !important;
+  max-height: none;
+}
+.terminal-dock-resize {
+  position: absolute;
+  top: -4px;
+  left: 0;
+  right: 0;
+  height: 9px;
+  cursor: row-resize;
+  z-index: 3;
+  touch-action: none;
+}
+.terminal-dock-resize::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 3px;
+  width: 44px;
+  height: 3px;
+  margin-left: -22px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  transition: background 120ms ease;
+}
+.terminal-dock-resize:hover::after,
+.terminal-dock-resize:focus-visible::after {
+  background: var(--accent, #ff8a6e);
+}
+.terminal-dock-resize:focus-visible {
+  outline: none;
+}
+.terminal-dock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 38px;
+  padding: 4px 10px 4px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: #0b0c0e;
+}
+.terminal-dock-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink);
+  min-width: 0;
+}
+.terminal-dock-title .term-head-meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.terminal-dock-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.terminal-dock-actions .term-close,
+.terminal-dock-action {
+  height: 28px;
+  min-width: 28px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.terminal-dock-actions .term-close:hover,
+.terminal-dock-action:hover {
+  color: var(--ink);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+.terminal-dock-action.primary {
+  color: #fff;
+  background: var(--accent, #ff8a6e);
+  border-color: transparent;
+}
+.terminal-dock-action.primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.terminal-dock-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  background: #050608;
+}
+.terminal-dock-body .terminal-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 16px 18px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: #6b7a70;
+}
+.terminal-dock-body .terminal-paused {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(255, 138, 110, 0.14);
+  color: #ffb39f;
+  font-size: 11.5px;
+}
+.terminal-dock-form {
+  padding: 6px 10px 8px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  background: #0b0c0e;
+}
+.terminal-dock-form input {
+  font-family: var(--mono);
+}
+@media (max-width: 960px) {
+  .terminal-dock {
+    max-height: 60vh;
+  }
+}

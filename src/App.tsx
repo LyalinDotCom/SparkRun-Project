@@ -25,12 +25,14 @@ import {
   KeyRound,
   LayoutDashboard,
   Maximize2,
+  Minimize2,
   MessageSquarePlus,
   Monitor,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Play,
   RotateCcw,
   Save,
   Send,
@@ -98,7 +100,7 @@ import {
 import '@xterm/xterm/css/xterm.css';
 
 type Screen = 'setup' | 'chat';
-type WorkspaceSurface = 'preview' | 'files' | 'terminal' | 'activity';
+type WorkspaceSurface = 'preview' | 'files' | 'activity';
 type ActiveOperation = 'coding' | 'tailnet';
 
 type EventKind =
@@ -1246,7 +1248,11 @@ interface ChatScreenProps {
   onFiles: () => void;
   onLogs: () => void;
   onTerminal: () => void;
-  onPrepareTerminal: () => void;
+  onCloseTerminal: () => void;
+  onStartVm: () => void;
+  terminalOpen: boolean;
+  terminalDockHeight: number;
+  onTerminalDockHeight: (height: number) => void;
   terminalText: string;
   terminalInput: string;
   terminalAvailable: boolean;
@@ -1541,21 +1547,11 @@ interface WorkspaceStageProps {
   building: boolean;
   networkRetrying: boolean;
   vmStatus: WebVmStatus;
-  terminalText: string;
-  terminalInput: string;
-  terminalAvailable: boolean;
-  terminalDisabled: boolean;
-  terminalPauseReason: ActiveOperation | null;
   debugLog: string;
   onOpenPreview: () => void;
   onOpenFiles: () => void;
-  onOpenTerminal: () => void;
   onOpenActivity: () => void;
   onClose: () => void;
-  onPrepareTerminal: () => void;
-  onTerminalInput: (value: string) => void;
-  onSendTerminalInput: (inputOverride?: string) => void;
-  onRawTerminalInput: (value: string) => void;
   onReadFile: (path: string) => Promise<string>;
 }
 
@@ -1624,21 +1620,11 @@ function WorkspaceStage({
   building,
   networkRetrying,
   vmStatus,
-  terminalText,
-  terminalInput,
-  terminalAvailable,
-  terminalDisabled,
-  terminalPauseReason,
   debugLog,
   onOpenPreview,
   onOpenFiles,
-  onOpenTerminal,
   onOpenActivity,
   onClose,
-  onPrepareTerminal,
-  onTerminalInput,
-  onSendTerminalInput,
-  onRawTerminalInput,
   onReadFile,
 }: WorkspaceStageProps) {
   const [surface, setSurface] = useState<WorkspaceSurface>('preview');
@@ -1648,12 +1634,7 @@ function WorkspaceStage({
     () => (debugLog ? debugLog.split('\n').slice(-220) : []),
     [debugLog],
   );
-  const surfaceOrder: WorkspaceSurface[] = [
-    'preview',
-    'files',
-    'terminal',
-    'activity',
-  ];
+  const surfaceOrder: WorkspaceSurface[] = ['preview', 'files', 'activity'];
   const canEmbedPreview = useMemo(() => {
     if (!previewUrl) return false;
     try {
@@ -1676,9 +1657,6 @@ function WorkspaceStage({
 
   const selectSurface = (next: WorkspaceSurface) => {
     setSurface(next);
-    if (next === 'terminal') {
-      onPrepareTerminal();
-    }
   };
 
   const moveSurfaceFocus = (
@@ -1705,7 +1683,6 @@ function WorkspaceStage({
   const maximize = () => {
     if (surface === 'preview') onOpenPreview();
     else if (surface === 'files') onOpenFiles();
-    else if (surface === 'terminal') onOpenTerminal();
     else onOpenActivity();
   };
 
@@ -1714,9 +1691,7 @@ function WorkspaceStage({
       ? 'Open preview in new tab'
       : surface === 'files'
         ? 'Expand files'
-        : surface === 'terminal'
-          ? 'Maximize terminal'
-          : 'Expand diagnostics';
+        : 'Expand diagnostics';
 
   return (
     <section className="workspace-stage" aria-label="Browser workspace">
@@ -1761,7 +1736,6 @@ function WorkspaceStage({
           [
             ['preview', 'Preview', <Monitor size={13} key="preview" />],
             ['files', 'Files', <Files size={13} key="files" />],
-            ['terminal', 'Terminal', <TerminalIcon size={13} key="terminal" />],
             ['activity', 'Activity', <Activity size={13} key="activity" />],
           ] as const
         ).map(([id, label, icon]) => (
@@ -1920,73 +1894,6 @@ function WorkspaceStage({
       </div>
 
       <div
-        aria-labelledby="workspace-terminal-tab"
-        className="workspace-surface terminal"
-        hidden={surface !== 'terminal'}
-        id="workspace-terminal"
-        role="tabpanel"
-      >
-        {surface === 'terminal' ? (
-          <div className="stage-terminal">
-            <div className="stage-terminal-screen">
-              {!terminalAvailable ? (
-                <div className="stage-empty compact terminal-empty">
-                  <span className="stage-empty-icon"><TerminalIcon size={24} /></span>
-                  <strong>Terminal starts with the VM</strong>
-                  <p>Run the first build to boot Linux, then return here for a live shell in {SITE_ROOT}.</p>
-                </div>
-              ) : (
-                <>
-                  <XtermConsole
-                    disabled={terminalDisabled}
-                    onData={onRawTerminalInput}
-                    text={terminalText}
-                  />
-                  {terminalDisabled ? (
-                    <div className="terminal-paused" role="status">
-                      {terminalPauseReason === 'tailnet'
-                        ? 'Terminal input is paused while SparkRun reconnects Tailnet.'
-                        : 'Terminal input is paused while the coding agent owns the VM.'}
-                    </div>
-                  ) : null}
-                </>
-              )}
-            </div>
-            <form
-              className="stage-terminal-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (!terminalDisabled && terminalInput.trim()) {
-                  onSendTerminalInput();
-                }
-              }}
-            >
-              <span aria-hidden="true">$</span>
-              <input
-                aria-label="Inline VM command"
-                autoCapitalize="off"
-                autoCorrect="off"
-                disabled={terminalDisabled}
-                onChange={(event) => onTerminalInput(event.target.value)}
-                placeholder={
-                  !terminalAvailable
-                    ? 'Boot the VM first'
-                    : terminalDisabled
-                      ? 'Terminal paused while the coding agent runs'
-                      : 'Run a command in /workspace/site'
-                }
-                spellCheck={false}
-                value={terminalInput}
-              />
-              <button disabled={terminalDisabled || !terminalInput.trim()} type="submit">
-                Run
-              </button>
-            </form>
-          </div>
-        ) : null}
-      </div>
-
-      <div
         aria-labelledby="workspace-activity-tab"
         className="workspace-surface activity"
         hidden={surface !== 'activity'}
@@ -2042,7 +1949,11 @@ function ChatScreen({
   onFiles,
   onLogs,
   onTerminal,
-  onPrepareTerminal,
+  onCloseTerminal,
+  onStartVm,
+  terminalOpen,
+  terminalDockHeight,
+  onTerminalDockHeight,
   terminalText,
   terminalInput,
   terminalAvailable,
@@ -2445,29 +2356,30 @@ function ChatScreen({
               if (inspectorIsModal) setInspectorOpen(false);
               onOpenWebsite();
             }}
-            onOpenTerminal={() => {
-              if (inspectorIsModal) setInspectorOpen(false);
-              onTerminal();
-            }}
-            onPrepareTerminal={onPrepareTerminal}
-            onRawTerminalInput={onRawTerminalInput}
             onReadFile={onReadFile}
-            onSendTerminalInput={onSendTerminalInput}
-            onTerminalInput={onTerminalInput}
             previewUrl={previewUrl}
             ready={ready}
             networkRetrying={networkRetrying}
-            terminalAvailable={terminalAvailable}
-            terminalDisabled={terminalDisabled}
-            terminalPauseReason={
-              networkRetrying ? 'tailnet' : building ? 'coding' : null
-            }
-            terminalInput={terminalInput}
-            terminalText={terminalText}
             vmStatus={vmStatus}
           />
         </aside>
       </div>
+      <TerminalDock
+        available={terminalAvailable}
+        disabled={terminalDisabled}
+        height={terminalDockHeight}
+        input={terminalInput}
+        onClose={onCloseTerminal}
+        onHeightChange={onTerminalDockHeight}
+        onInput={onTerminalInput}
+        onRawInput={onRawTerminalInput}
+        onSendInput={onSendTerminalInput}
+        onStartVm={onStartVm}
+        open={terminalOpen}
+        pauseReason={networkRetrying ? 'tailnet' : building ? 'coding' : null}
+        text={terminalText}
+        vmStatus={vmStatus}
+      />
     </div>
   );
 }
@@ -2660,17 +2572,36 @@ function iconForKind(kind: EventKind) {
   }
 }
 
-interface TerminalDrawerProps {
+interface TerminalDockProps {
   open: boolean;
+  height: number;
+  onHeightChange: (height: number) => void;
   onClose: () => void;
+  onStartVm: () => void;
   text: string;
   input: string;
   available: boolean;
   disabled: boolean;
   pauseReason: ActiveOperation | null;
+  vmStatus: WebVmStatus;
   onInput: (value: string) => void;
   onSendInput: (inputOverride?: string) => void;
   onRawInput: (value: string) => void;
+}
+
+const TERMINAL_DOCK_MIN_HEIGHT = 160;
+const TERMINAL_DOCK_DEFAULT_HEIGHT = 300;
+const TERMINAL_DOCK_STORAGE_KEY = 'sparkrun.terminalDock.v1';
+
+function readTerminalDockHeight(): number {
+  try {
+    const stored = Number(window.localStorage.getItem(TERMINAL_DOCK_STORAGE_KEY));
+    return Number.isFinite(stored) && stored >= TERMINAL_DOCK_MIN_HEIGHT
+      ? stored
+      : TERMINAL_DOCK_DEFAULT_HEIGHT;
+  } catch {
+    return TERMINAL_DOCK_DEFAULT_HEIGHT;
+  }
 }
 
 interface FileDrawerProps {
@@ -3081,135 +3012,185 @@ function XtermConsole({
   return <div className="xterm-host" ref={hostRef} />;
 }
 
-function TerminalDrawer({
+function TerminalDock({
   open,
+  height,
+  onHeightChange,
   onClose,
+  onStartVm,
   text,
   input,
   available,
   disabled,
   pauseReason,
+  vmStatus,
   onInput,
   onSendInput,
   onRawInput,
-}: TerminalDrawerProps) {
-  const lines = text ? text.split('\n') : [];
-  const bodyRef = useRef<HTMLDivElement | null>(null);
-  const dialogRef = useDrawerDialog<HTMLDivElement>(open, onClose);
-  const presets = [
-    'pwd',
-    'ls -la',
-    'ps aux',
-    'cat /tmp/sparkrun/server.log',
-    "port=$(cat /tmp/sparkrun/server.port) && curl --silent --show-error --output /dev/null --write-out 'HTTP %{http_code} http://127.0.0.1:%{remote_port}/\\n' --connect-timeout 2 --max-time 4 \"http://127.0.0.1:$port/\"",
-  ];
+}: TerminalDockProps) {
+  const [maximized, setMaximized] = useState(false);
+  const dockRef = useRef<HTMLElement | null>(null);
+  const lines = text ? text.split('\n').length : 0;
+  const booting = vmStatus.lifecycle === 'booting';
 
-  useEffect(() => {
-    const el = bodyRef.current;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [text, open]);
+  const clampHeight = (next: number) => {
+    const parentHeight =
+      dockRef.current?.parentElement?.getBoundingClientRect().height ?? 0;
+    // Layout may not have measured yet (or is not real, as in jsdom); only
+    // clamp against a parent that actually has a height.
+    const maxHeight =
+      parentHeight > 0
+        ? Math.max(TERMINAL_DOCK_MIN_HEIGHT, parentHeight - 96)
+        : Number.POSITIVE_INFINITY;
+    return Math.round(Math.min(maxHeight, Math.max(TERMINAL_DOCK_MIN_HEIGHT, next)));
+  };
+
+  const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (maximized) return;
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight =
+      dockRef.current?.getBoundingClientRect().height || height;
+    const onMove = (move: PointerEvent) => {
+      onHeightChange(clampHeight(startHeight + (startY - move.clientY)));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  const resizeByKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    event.preventDefault();
+    if (maximized) setMaximized(false);
+    onHeightChange(clampHeight(height + (event.key === 'ArrowUp' ? 40 : -40)));
+  };
 
   if (!open) {
     return null;
   }
 
+  const stateLabel = available
+    ? disabled
+      ? 'paused'
+      : 'live root shell'
+    : booting
+      ? 'VM booting'
+      : 'VM stopped';
+
   return (
-    <>
+    <section
+      aria-label="Terminal"
+      className={`terminal-dock ${maximized ? 'maximized' : ''}`}
+      ref={dockRef}
+      style={maximized ? undefined : { height }}
+    >
       <div
-        aria-hidden="true"
-        className="term-overlay terminal-overlay open"
-        onClick={onClose}
+        aria-label="Resize terminal"
+        aria-orientation="horizontal"
+        aria-valuemin={TERMINAL_DOCK_MIN_HEIGHT}
+        aria-valuenow={height}
+        className="terminal-dock-resize"
+        onKeyDown={resizeByKey}
+        onPointerDown={startResize}
+        role="separator"
+        tabIndex={0}
       />
-      <div
-        aria-modal="true"
-        aria-labelledby="terminal-dialog-title"
-        className="term-drawer terminal-drawer open"
-        ref={dialogRef}
-        role="dialog"
-        tabIndex={-1}
-      >
-        <div className="term-head">
-          <div className="term-head-title" id="terminal-dialog-title">
-            <TerminalIcon size={14} aria-hidden="true" /> Interactive VM terminal
-            <span className="term-head-meta">· {lines.length} lines</span>
-          </div>
+      <div className="terminal-dock-head">
+        <div className="terminal-dock-title">
+          <TerminalIcon size={14} aria-hidden="true" /> Terminal
+          <span className="term-head-meta">
+            · {stateLabel} · {SITE_ROOT} · {lines} lines
+          </span>
+        </div>
+        <div className="terminal-dock-actions">
+          {!available ? (
+            <button
+              className="terminal-dock-action primary"
+              disabled={booting}
+              onClick={onStartVm}
+              type="button"
+            >
+              <Play size={12} aria-hidden="true" />
+              {booting ? 'Starting VM…' : 'Start VM'}
+            </button>
+          ) : null}
+          <button
+            aria-label={maximized ? 'Restore terminal size' : 'Maximize terminal'}
+            className="terminal-dock-action"
+            onClick={() => setMaximized((current) => !current)}
+            type="button"
+          >
+            {maximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+          </button>
           <button
             aria-label="Close terminal"
             className="term-close"
-            data-dialog-initial-focus=""
             onClick={onClose}
             type="button"
           >
             ✕
           </button>
         </div>
-        <div className="term-body xterm-body" ref={bodyRef}>
-          {!available ? (
-            <div className="empty">
-              Boot the VM to open a live terminal in {SITE_ROOT}.
-            </div>
-          ) : (
-            <>
-              <XtermConsole text={text} disabled={disabled} onData={onRawInput} />
-              {disabled ? (
-                <div className="terminal-paused" role="status">
-                  {pauseReason === 'tailnet'
-                    ? 'Terminal input is paused while SparkRun reconnects Tailnet.'
-                    : 'Terminal input is paused while the coding agent owns the VM.'}
-                </div>
-              ) : null}
-            </>
-          )}
-        </div>
-        <div className="term-presets" aria-label="VM diagnostics">
-          {presets.map((preset) => (
-            <button
-              disabled={disabled}
-              key={preset}
-              onClick={() => onSendInput(preset)}
-              type="button"
-            >
-              {preset.split('\n')[0].replace("python3 - <<'PY'", 'health')}
-            </button>
-          ))}
-        </div>
-        <form
-          className="term-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!disabled && input.trim()) {
-              onSendInput();
-            }
-          }}
-        >
-          <span className="term-prompt">$</span>
-          <input
-            aria-label="VM command"
-            autoCapitalize="off"
-            autoCorrect="off"
-            disabled={disabled}
-            onChange={(event) => onInput(event.target.value)}
-            placeholder={
-              !available
-                ? 'Boot the VM first'
-                : disabled
-                  ? 'Terminal paused while the coding agent runs'
-                  : 'pwd, ls -la, cat /tmp/sparkrun/server.log'
-            }
-            spellCheck={false}
-            value={input}
-          />
-          <button
-            disabled={disabled || !input.trim()}
-            type="submit"
-          >
-            Send
-          </button>
-        </form>
       </div>
-    </>
+      <div className="terminal-dock-body">
+        {!available ? (
+          <div className="terminal-empty">
+            <span>
+              {booting
+                ? 'Starting the Linux VM…'
+                : `The VM is not running. Start it to open a live root shell in ${SITE_ROOT}.`}
+            </span>
+          </div>
+        ) : (
+          <>
+            <XtermConsole text={text} disabled={disabled} onData={onRawInput} />
+            {disabled ? (
+              <div className="terminal-paused" role="status">
+                {pauseReason === 'tailnet'
+                  ? 'Terminal input is paused while SparkRun reconnects Tailnet.'
+                  : 'Terminal input is paused while the coding agent owns the VM.'}
+              </div>
+            ) : null}
+          </>
+        )}
+      </div>
+      <form
+        className="term-form terminal-dock-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!disabled && input.trim()) {
+            onSendInput();
+          }
+        }}
+      >
+        <span className="term-prompt">$</span>
+        <input
+          aria-label="VM command"
+          autoCapitalize="off"
+          autoCorrect="off"
+          disabled={disabled}
+          onChange={(event) => onInput(event.target.value)}
+          placeholder={
+            !available
+              ? 'Start the VM first'
+              : disabled
+                ? 'Terminal paused while the coding agent runs'
+                : `Run a command in ${SITE_ROOT}`
+          }
+          spellCheck={false}
+          value={input}
+        />
+        <button disabled={disabled || !input.trim()} type="submit">
+          Run
+        </button>
+      </form>
+    </section>
   );
 }
 
@@ -3226,6 +3207,21 @@ export default function App() {
   const [draft, setDraft] = useState(DEFAULT_PROMPT);
   const [hasStarted, setHasStarted] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
+  /** Tailscale key the running VM was created with; a change forces a reboot. */
+  const bootedTailscaleKeyRef = useRef<string>('');
+  /** Boots currently queued or running; the auto-boot effect must not add one. */
+  const vmBootInFlightRef = useRef(0);
+  const [terminalDockHeight, setTerminalDockHeight] = useState(
+    readTerminalDockHeight,
+  );
+  const updateTerminalDockHeight = (height: number) => {
+    setTerminalDockHeight(height);
+    try {
+      window.localStorage.setItem(TERMINAL_DOCK_STORAGE_KEY, String(height));
+    } catch {
+      // Storage can be unavailable; the height still applies for this session.
+    }
+  };
   const [showLogs, setShowLogs] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [railModalOpen, setRailModalOpen] = useState(false);
@@ -4734,11 +4730,13 @@ export default function App() {
     vmBootChainRef.current = new Promise<void>((resolve) => {
       releaseBoot = resolve;
     });
+    vmBootInFlightRef.current += 1;
     try {
       await priorBoot.catch(() => undefined);
       await backendResetChainRef.current.catch(() => undefined);
       return await bootVmCritical(signal);
     } finally {
+      vmBootInFlightRef.current -= 1;
       releaseBoot();
     }
   };
@@ -4751,12 +4749,18 @@ export default function App() {
     // checkpoint + CheerpX teardown + boot + reconcile before the first
     // model call, and killed any running preview with it.
     const activeLease = workspaceLeaseRef.current;
+    // The lease is the synchronous source of truth: a VM booted moments ago
+    // (auto-boot on workbench entry) may not be committed to React state yet
+    // when the user presses Build.
+    const mountedBackend = backend ?? activeLease?.backend ?? null;
+    const currentTailscaleKey = tailscaleAuthKey.trim();
     if (
-      backend &&
-      !backend.isDisposed() &&
-      activeLease?.backend === backend &&
+      mountedBackend &&
+      !mountedBackend.isDisposed() &&
+      activeLease?.backend === mountedBackend &&
       activeLease.projectId === activeProject.id &&
-      !backend.getFatalNetworkFailure?.()
+      !mountedBackend.getFatalNetworkFailure?.() &&
+      bootedTailscaleKeyRef.current === currentTailscaleKey
     ) {
       // Same superseded guard as the fresh-boot path: an aborted or
       // project-switched build must not sail through here and keep running
@@ -4775,16 +4779,32 @@ export default function App() {
         label: 'VM ready',
         text: 'Reusing the running VM and workspace.',
       });
-      return backend;
+      if (!backend) setBackend(mountedBackend);
+      return mountedBackend;
     }
-    if (backend) {
-      if (!backend.isDisposed()) {
+    const throwIfBootSuperseded = () => {
+      if (
+        signal?.aborted ||
+        !componentActiveRef.current ||
+        activeProjectIdRef.current !== activeProject.id
+      ) {
+        const abortError = new Error('VM boot was superseded.');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
+    };
+    throwIfBootSuperseded();
+    if (mountedBackend) {
+      if (!mountedBackend.isDisposed()) {
         appendEvent({
           kind: 'status',
           label: 'Restarting VM',
-          text: 'Checkpointing the workspace before restarting the VM.',
+          text:
+            bootedTailscaleKeyRef.current !== currentTailscaleKey
+              ? 'The Tailscale key changed; checkpointing the workspace and restarting the VM with it.'
+              : 'Checkpointing the workspace before restarting the VM.',
         });
-        await saveVaultCheckpoint(backend, 'before-reset');
+        await saveVaultCheckpoint(mountedBackend, 'before-reset');
       } else {
         appendEvent({
           kind: 'status',
@@ -4792,7 +4812,7 @@ export default function App() {
           text: 'The previous VM stopped after a failed command proof; starting a fresh VM from the durable workspace.',
         });
       }
-      await disposeWorkspaceRuntime(backend);
+      await disposeWorkspaceRuntime(mountedBackend);
       setBackend(null);
     }
     setVmStatus({
@@ -4822,10 +4842,12 @@ export default function App() {
         });
       }
       const projectIdAtBoot = vaultProject.id;
+      throwIfBootSuperseded();
       const acquiredLease = await acquireWorkspaceLease(projectIdAtBoot);
       leaseDuringBoot = acquiredLease;
+      bootedTailscaleKeyRef.current = currentTailscaleKey;
       const vm = await WebVmBackend.create({
-        tailscaleAuthKey: tailscaleAuthKey.trim() || undefined,
+        tailscaleAuthKey: currentTailscaleKey || undefined,
         workspaceDbName: vaultProject.workspaceDbName,
         rootCacheDbName: rootCacheDatabaseName(vaultProject.environmentId),
         diskProfile: DEFAULT_WEBVM_DISK_PROFILE,
@@ -4969,7 +4991,8 @@ export default function App() {
     setHasStarted(true);
     setBuilding(true);
     setReady(false);
-    setDebugLog('');
+    // Keep VM diagnostics across builds: the VM now boots before the first
+    // prompt, and its boot log is part of what a failed run needs to show.
     tailnetReadyLoggedRef.current = null;
     buildAbortControllerRef.current?.abort();
     const abortController = new AbortController();
@@ -5577,11 +5600,34 @@ export default function App() {
     }
   };
 
+  /**
+   * Boot the VM outside a coding run (workbench entry, Start VM in the
+   * terminal). No-op while a run or network operation owns the VM, or when a
+   * healthy VM already exists.
+   */
+  const startVmNow = async () => {
+    if (building || networkRetrying || stopping) return;
+    if (backend && !backend.isDisposed()) return;
+    try {
+      await bootVm();
+    } catch (error) {
+      if (isAbortError(error)) return;
+      appendEvent({
+        kind: 'error',
+        label: 'VM start failed',
+        text: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   const openTerminal = () => {
     setShowFiles(false);
     setShowLogs(false);
     setShowTerminal(true);
-    prepareTerminal();
+    // The shell attaches from the dock effect below once a healthy VM exists.
+    if (!backend || backend.isDisposed()) {
+      void startVmNow();
+    }
   };
 
   const openFiles = () => {
@@ -5595,6 +5641,46 @@ export default function App() {
     setShowTerminal(false);
     setShowLogs(true);
   };
+
+  // The dock can be open before the VM exists (Start VM, auto-boot). Attach
+  // the interactive shell as soon as a healthy VM appears; the call is
+  // idempotent on an already-running shell.
+  const backendForShell = backend && !backend.isDisposed() ? backend : null;
+  useEffect(() => {
+    if (!showTerminal || !backendForShell || building || networkRetrying) return;
+    prepareTerminal();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showTerminal, backendForShell, building, networkRetrying]);
+
+  // Boot the VM as soon as a project opens in the workbench so the terminal
+  // and the first build do not wait for a cold start. Once per project; a
+  // failed boot is reported and not retried automatically.
+  const autoBootProjectIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (screen !== 'chat') return;
+    if (backend || building || networkRetrying || stopping) return;
+    // A lease means a VM is booted or booting for this tab already (React
+    // state can lag the boot); never start a second one.
+    if (workspaceLeaseRef.current || vmBootInFlightRef.current) return;
+    if (autoBootProjectIdRef.current === activeProject.id) return;
+    autoBootProjectIdRef.current = activeProject.id;
+    void startVmNow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen, backend, building, networkRetrying, stopping, activeProject.id]);
+
+  // Ctrl/Cmd + ` toggles the docked terminal, as in most editors.
+  useEffect(() => {
+    if (screen !== 'chat') return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== '`' || !(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      if (showTerminal) setShowTerminal(false);
+      else openTerminal();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen, showTerminal, backend, building, networkRetrying, stopping]);
 
   const runTerminalCommand = (
     commandOverride?: string,
@@ -5826,7 +5912,7 @@ export default function App() {
 
   return (
     <>
-      <div inert={showFiles || showLogs || showTerminal ? true : undefined}>
+      <div inert={showFiles || showLogs ? true : undefined}>
         <AppBar
         inert={railModalOpen}
         title={title}
@@ -5937,7 +6023,11 @@ export default function App() {
             onFiles={openFiles}
             onLogs={openLogs}
             onTerminal={openTerminal}
-            onPrepareTerminal={prepareTerminal}
+            onCloseTerminal={() => setShowTerminal(false)}
+            onStartVm={() => void startVmNow()}
+            terminalOpen={showTerminal}
+            terminalDockHeight={terminalDockHeight}
+            onTerminalDockHeight={updateTerminalDockHeight}
             terminalText={terminal}
             terminalInput={terminalCommand}
             terminalAvailable={Boolean(backend)}
@@ -5962,18 +6052,6 @@ export default function App() {
         open={showLogs}
         onClose={() => setShowLogs(false)}
         text={debugLog}
-      />
-      <TerminalDrawer
-        open={showTerminal}
-        onClose={() => setShowTerminal(false)}
-        text={terminal}
-        input={terminalCommand}
-        available={Boolean(backend)}
-        disabled={!backend || building || networkRetrying}
-        pauseReason={networkRetrying ? 'tailnet' : building ? 'coding' : null}
-        onInput={setTerminalCommand}
-        onSendInput={sendTerminalInput}
-        onRawInput={sendRawTerminalInput}
       />
     </>
   );
