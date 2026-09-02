@@ -9,17 +9,20 @@ import type {
   CodingRuntimePreviewResult,
 } from './codingHarness';
 import {
+  CODING_APPEND_FILE_TOOL,
   CODING_READ_FILE_TOOL,
   CODING_REPLACE_TOOL,
   CODING_RUN_COMMAND_TOOL,
   CODING_START_PREVIEW_TOOL,
   CODING_WRITE_FILE_TOOL,
+  CODING_LIST_DIRECTORY_TOOL,
   executeCodingToolCall,
   normalizeCodingWorkspacePath,
   redactCodingSecrets,
 } from './codingHarnessTools';
 import {
   GEMINI_API_MAX_RETRIES,
+  GEMINI_EXECUTION_RETRIES,
   GEMINI_INTERACTIONS_PROVIDER,
   GeminiInteractionsCodingHarness,
   type GeminiInteractionsClient,
@@ -485,7 +488,7 @@ describe('GeminiInteractionsCodingHarness', () => {
     });
   });
 
-  it('does not replay a confirmed background execution failure', async () => {
+  it('resubmits a confirmed background execution failure up to the execution allowance', async () => {
     const create = vi.fn().mockResolvedValueOnce(
       response({ id: 'capacity-failed', status: 'in_progress' }),
     );
@@ -505,8 +508,9 @@ describe('GeminiInteractionsCodingHarness', () => {
       new GeminiInteractionsCodingHarness({
         client: client(create, { get }),
         backgroundPollIntervalMs: 0,
+        executionRetries: 0,
       }).run({
-        prompt: 'Do not replay confirmed execution failures.',
+        prompt: 'A single execution attempt fails closed.',
         runtime: new MemoryCodingRuntime(),
         retryBaseDelayMs: 0,
       }),
@@ -516,7 +520,7 @@ describe('GeminiInteractionsCodingHarness', () => {
     expect(create).toHaveBeenCalledTimes(1);
   });
 
-  it('retries a thrown high-demand GET for the exact transport allowance', async () => {
+  it('treats a thrown high-demand GET as the execution death notice without transport retries', async () => {
     const create = vi.fn().mockResolvedValueOnce(
       response({ id: 'capacity-transport', status: 'in_progress' }),
     );
@@ -531,14 +535,15 @@ describe('GeminiInteractionsCodingHarness', () => {
       new GeminiInteractionsCodingHarness({
         client: client(create, { get }),
         backgroundPollIntervalMs: 0,
+        executionRetries: 0,
       }).run({
-        prompt: 'Retry transport failures without replaying execution.',
+        prompt: 'A dead execution is not polled again.',
         runtime: new MemoryCodingRuntime(),
         retryBaseDelayMs: 0,
       }),
     ).rejects.toThrow('high demand');
 
-    expect(get).toHaveBeenCalledTimes(GEMINI_API_MAX_RETRIES + 1);
+    expect(get).toHaveBeenCalledTimes(1);
     expect(create).toHaveBeenCalledTimes(1);
   });
 
@@ -560,6 +565,7 @@ describe('GeminiInteractionsCodingHarness', () => {
       new GeminiInteractionsCodingHarness({
         client: client(create, { get }),
         backgroundPollIntervalMs: 0,
+        executionRetries: 0,
       }).run({
         prompt: 'Bound combined recovery.',
         runtime: new MemoryCodingRuntime(),
@@ -585,7 +591,10 @@ describe('GeminiInteractionsCodingHarness', () => {
     );
 
     await expect(
-      new GeminiInteractionsCodingHarness({ client: client(create) }).run({
+      new GeminiInteractionsCodingHarness({
+        client: client(create),
+        executionRetries: 0,
+      }).run({
         prompt: 'Do not replay a completed failed execution.',
         runtime: new MemoryCodingRuntime(),
         retryBaseDelayMs: 0,
@@ -1050,6 +1059,9 @@ describe('GeminiInteractionsCodingHarness', () => {
     );
     expect(create.mock.calls[0][0].system_instruction).toContain(
       'Do not restart a healthy preview for a narrow file-only repair',
+    );
+    expect(create.mock.calls[0][0].system_instruction).not.toContain(
+      'Execution environment',
     );
     expect(create.mock.calls[0][1]).toMatchObject({ maxRetries: 0 });
     expect(create.mock.calls[1][0].previous_interaction_id).toBe(
@@ -2641,5 +2653,332 @@ describe('coding harness VM tools', () => {
     expect(destructivePreview.isError).toBe(true);
     expect(destructivePreview.content).toContain('blocked');
     expect(runtime.previews).toHaveLength(0);
+  });
+});
+
+describe('environment instruction', () => {
+  it('renders the guest toolchain facts into the system instruction', async () => {
+    const create = vi.fn().mockResolvedValueOnce(
+      response({
+        id: 'interaction-env-1',
+        status: 'completed',
+        output_text: 'Done.',
+      }),
+    );
+    const harness = new GeminiInteractionsCodingHarness({
+      client: client(create),
+      environmentInstruction:
+        'Guest OS: Debian 10.\nNOT installed: Node.js, npm.\nNo public internet from the guest.',
+      additionalSystemInstruction: 'Keep the palette monochrome.',
+    });
+    await harness.run({
+      prompt: 'Say done.',
+      runtime: new MemoryCodingRuntime(),
+    });
+    const instruction = create.mock.calls[0][0].system_instruction as string;
+    expect(instruction).toContain('Execution environment (authoritative');
+    expect(instruction).toContain('NOT installed: Node.js, npm.');
+    expect(instruction).toContain('No public internet from the guest.');
+    expect(instruction).toContain('Project-specific instructions:');
+    expect(instruction.indexOf('Execution environment')).toBeLessThan(
+      instruction.indexOf('Project-specific instructions:'),
+    );
+  });
+});
+
+describe('provider execution resubmission', () => {
+  const highDemand = () =>
+    Object.assign(
+      new Error(
+        '500 The model is currently experiencing high demand, spikes in demand are usually temporary. Please try again later.',
+      ),
+      { status: 500 },
+    );
+
+  it('resubmits the same turn to the same model as soon as the accepted interaction dies', async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(response({ id: 'dead-1', status: 'in_progress' }))
+      .mockResolvedValueOnce(
+        response({ id: 'alive-2', output_text: 'Finished after resubmission.' }),
+      );
+    // Measured: the first "high demand" 5xx from GET is the death notice.
+    const get = vi.fn().mockRejectedValueOnce(highDemand());
+    const cancel = vi.fn();
+    const events: string[] = [];
+    const snapshots: CodingHarnessSession[] = [];
+
+    const result = await new GeminiInteractionsCodingHarness({
+      client: client(create, { get, cancel }),
+      backgroundPollIntervalMs: 0,
+    }).run({
+      prompt: 'Build the page.',
+      runtime: new MemoryCodingRuntime(),
+      retryBaseDelayMs: 0,
+      onEvent: (event) => events.push(event.message),
+      onSession: (session) => {
+        snapshots.push(session);
+      },
+    });
+
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[0][0].model).toBe(MODEL_ID);
+    expect(create.mock.calls[1][0].model).toBe(MODEL_ID);
+    expect(create.mock.calls[1][0].input).toBe('Build the page.');
+    // A dead interaction answers cancel with 500 forever; never demand it.
+    expect(cancel).not.toHaveBeenCalled();
+    expect(result.finalText).toBe('Finished after resubmission.');
+    expect(result.session.model).toBe(MODEL_ID);
+    expect(result.session.previousInteractionId).toBe('alive-2');
+    expect(result.session.providerState.pendingInteractionId).toBeUndefined();
+    expect(result.session.providerState.unconfirmedCancellationIds).toBeUndefined();
+    expect(events).toContainEqual(
+      expect.stringContaining('Resubmitting the same request to gemini-3.7-flash'),
+    );
+    expect(events).toContainEqual(
+      expect.stringContaining('execution attempt 2/9'),
+    );
+    expect(
+      snapshots.some(
+        (snapshot) => snapshot.providerState.pendingInteractionId === 'dead-1',
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps previous_interaction_id when resubmitting a tool turn whose execution died', async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({
+          id: 'turn-1',
+          status: 'requires_action',
+          steps: [
+            {
+              type: 'function_call',
+              id: 'call-1',
+              name: CODING_LIST_DIRECTORY_TOOL,
+              arguments: { dir_path: '' },
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(response({ id: 'turn-2-dead', status: 'in_progress' }))
+      .mockResolvedValueOnce(
+        response({ id: 'turn-2-resubmitted', output_text: 'Done.' }),
+      );
+    const get = vi.fn().mockRejectedValueOnce(highDemand());
+
+    const result = await new GeminiInteractionsCodingHarness({
+      client: client(create, { get }),
+      backgroundPollIntervalMs: 0,
+    }).run({
+      prompt: 'List then finish.',
+      runtime: new MemoryCodingRuntime({ 'index.html': '<h1>hi</h1>' }),
+      retryBaseDelayMs: 0,
+    });
+
+    expect(create).toHaveBeenCalledTimes(3);
+    const resubmitted = create.mock.calls.at(-1)?.[0];
+    expect(resubmitted.model).toBe(MODEL_ID);
+    expect(resubmitted.previous_interaction_id).toBe('turn-1');
+    expect(resubmitted.input).toEqual([
+      expect.objectContaining({ type: 'function_result', call_id: 'call-1' }),
+    ]);
+    expect(result.finalText).toBe('Done.');
+  });
+
+  it('resubmits after a terminal failed status caused by capacity', async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(response({ id: 'failed-status', status: 'in_progress' }))
+      .mockResolvedValueOnce(response({ id: 'ok-2', output_text: 'Recovered.' }));
+    const get = vi.fn().mockResolvedValueOnce(
+      response({
+        id: 'failed-status',
+        status: 'failed',
+        errors: [{ code: 500, message: 'The model is currently experiencing high demand.' }],
+      }),
+    );
+
+    const result = await new GeminiInteractionsCodingHarness({
+      client: client(create, { get }),
+      backgroundPollIntervalMs: 0,
+    }).run({
+      prompt: 'Recover from failed status.',
+      runtime: new MemoryCodingRuntime(),
+      retryBaseDelayMs: 0,
+    });
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(result.finalText).toBe('Recovered.');
+  });
+
+  it('grants the execution allowance to every turn, not once per run', async () => {
+    const create = vi.fn();
+    const get = vi.fn();
+    // Turn 1: eight deaths, then a tool call.
+    for (let death = 0; death < GEMINI_EXECUTION_RETRIES; death += 1) {
+      create.mockResolvedValueOnce(response({ id: `t1-dead-${death}`, status: 'in_progress' }));
+      get.mockRejectedValueOnce(highDemand());
+    }
+    create.mockResolvedValueOnce(
+      response({
+        id: 't1-ok',
+        status: 'requires_action',
+        steps: [
+          {
+            type: 'function_call',
+            id: 'call-1',
+            name: CODING_LIST_DIRECTORY_TOOL,
+            arguments: { dir_path: '' },
+          },
+        ],
+      }),
+    );
+    // Turn 2: one more death must still be absorbed.
+    create.mockResolvedValueOnce(response({ id: 't2-dead', status: 'in_progress' }));
+    get.mockRejectedValueOnce(highDemand());
+    create.mockResolvedValueOnce(response({ id: 't2-ok', output_text: 'Done.' }));
+
+    const result = await new GeminiInteractionsCodingHarness({
+      client: client(create, { get }),
+      backgroundPollIntervalMs: 0,
+    }).run({
+      prompt: 'Survive deaths across turns.',
+      runtime: new MemoryCodingRuntime(),
+      retryBaseDelayMs: 0,
+    });
+    expect(result.finalText).toBe('Done.');
+    expect(create).toHaveBeenCalledTimes(GEMINI_EXECUTION_RETRIES + 1 + 2);
+    expect(create.mock.calls.at(-1)?.[0].previous_interaction_id).toBe('t1-ok');
+  });
+
+  it('does not resubmit when create itself exhausted its transport allowance', async () => {
+    const create = vi.fn().mockRejectedValue(highDemand());
+    await expect(
+      new GeminiInteractionsCodingHarness({ client: client(create) }).run({
+        prompt: 'Create exhaustion keeps the exact D-007 count.',
+        runtime: new MemoryCodingRuntime(),
+        retryBaseDelayMs: 0,
+      }),
+    ).rejects.toThrow('high demand');
+    expect(create).toHaveBeenCalledTimes(GEMINI_API_MAX_RETRIES + 1);
+  });
+
+  it('gives up after the execution allowance and never resubmits a permanent client error', async () => {
+    const create = vi.fn().mockResolvedValue(
+      response({ id: 'always-dies', status: 'in_progress' }),
+    );
+    const get = vi.fn().mockRejectedValue(highDemand());
+    const events: string[] = [];
+    await expect(
+      new GeminiInteractionsCodingHarness({
+        client: client(create, { get }),
+        backgroundPollIntervalMs: 0,
+      }).run({
+        prompt: 'Exhaust the execution allowance.',
+        runtime: new MemoryCodingRuntime(),
+        retryBaseDelayMs: 0,
+        onEvent: (event) => events.push(event.message),
+      }),
+    ).rejects.toThrow('high demand');
+    expect(GEMINI_EXECUTION_RETRIES).toBe(8);
+    expect(create).toHaveBeenCalledTimes(GEMINI_EXECUTION_RETRIES + 1);
+    expect(get).toHaveBeenCalledTimes(GEMINI_EXECUTION_RETRIES + 1);
+    expect(events.filter((event) => event.includes('Resubmitting'))).toHaveLength(
+      GEMINI_EXECUTION_RETRIES,
+    );
+
+    const badRequest = Object.assign(new Error('400 tools[0] is invalid'), {
+      status: 400,
+    });
+    const rejecting = vi.fn().mockRejectedValueOnce(badRequest);
+    await expect(
+      new GeminiInteractionsCodingHarness({ client: client(rejecting) }).run({
+        prompt: 'Bad request stays fatal.',
+        runtime: new MemoryCodingRuntime(),
+        retryBaseDelayMs: 0,
+      }),
+    ).rejects.toThrow('tools[0] is invalid');
+    expect(rejecting).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a 400 "Invalid interaction name" cancellation as already terminal', async () => {
+    const create = vi.fn().mockResolvedValueOnce(
+      response({ id: 'fresh', output_text: 'Done.' }),
+    );
+    const cancel = vi.fn().mockRejectedValue(
+      Object.assign(
+        new Error('400 Invalid interaction name: interactions/v1_gone'),
+        { status: 400 },
+      ),
+    );
+    const prior = {
+      version: 1 as const,
+      id: 'session-gone',
+      provider: GEMINI_INTERACTIONS_PROVIDER,
+      model: MODEL_ID,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      previousInteractionId: null,
+      transcript: [],
+      providerState: { pendingInteractionId: 'v1_gone' },
+    };
+    const result = await new GeminiInteractionsCodingHarness({
+      client: client(create, { cancel }),
+    }).run({
+      prompt: 'Continue after a forgotten interaction.',
+      runtime: new MemoryCodingRuntime(),
+      session: prior,
+      retryBaseDelayMs: 0,
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(result.finalText).toBe('Done.');
+    expect(result.session.providerState.unconfirmedCancellationIds).toBeUndefined();
+  });
+
+  it('appends file parts in order and invalidates prior inspections', async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({
+          id: 'append-1',
+          status: 'requires_action',
+          steps: [
+            {
+              type: 'function_call',
+              id: 'w',
+              name: CODING_WRITE_FILE_TOOL,
+              arguments: { file_path: 'index.html', content: '<html>\n' },
+            },
+            {
+              type: 'function_call',
+              id: 'a',
+              name: CODING_APPEND_FILE_TOOL,
+              arguments: { file_path: 'index.html', content: '<body></body>\n' },
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(response({ id: 'append-2', output_text: 'Done.' }));
+    const runtime = new MemoryCodingRuntime();
+    await new GeminiInteractionsCodingHarness({ client: client(create) }).run({
+      prompt: 'Write in parts.',
+      runtime,
+      retryBaseDelayMs: 0,
+    });
+    expect(runtime.files.get('index.html')).toBe('<html>\n<body></body>\n');
+    expect(create.mock.calls[1][0].input).toEqual([
+      expect.objectContaining({ call_id: 'w' }),
+      expect.objectContaining({
+        call_id: 'a',
+        result: [
+          expect.objectContaining({
+            text: expect.stringContaining('Appended 14 characters'),
+          }),
+        ],
+      }),
+    ]);
   });
 });

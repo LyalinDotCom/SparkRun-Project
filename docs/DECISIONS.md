@@ -394,3 +394,43 @@ release evidence attributable.
 experimental selection without becoming a fallback. Promotion replaces the
 canonical runtime only after its full gate passes and checkpoint restore is
 validated. Browser Vault is recovery authority, not an off-device backup.
+
+## D-016 — Resubmit a dead background Interaction to the same model; never fall back to a lower model
+
+**Status:** Accepted; implemented and covered by conformance tests
+
+**Decision:** Gemini 3.7 Flash is the only model SparkRun drives, and
+resilience is achieved on that model. When an accepted background Interaction
+stops answering its own `get` with a `5xx` "high demand" response, or with a
+`4xx` once the server has forgotten the id, SparkRun treats that provider
+execution as dead immediately: it is not polled again, its id is cleared
+without demanding a confirmed cancellation, and the identical turn (same
+input, same `previous_interaction_id`) is resubmitted to the same model with
+abortable exponential backoff, up to `GEMINI_EXECUTION_RETRIES` (eight)
+resubmissions inside the existing turn deadline. The same resubmission applies
+when `create` exhausts its D-007 allowance with capacity errors or the
+provider returns a terminal `failed` status for capacity. A `400 Invalid
+interaction name` from `cancel` counts as already terminal. Resubmission never
+triggers on user Stop, the local turn deadline, or permanent request errors.
+
+Because a dead execution is tied to elapsed generation time, the agent is also
+instructed to keep every response short and to build long files in parts with
+`write_file` followed by `append_file`, so one killed response costs one small
+part rather than the whole file.
+
+**Why:** Measured on September 2, 2026 against `gemini-3.7-flash`: an accepted
+Interaction died with `500 high demand` at a roughly constant hazard rate
+(about half survived 20 s; none of six 350-line generations survived, and
+streaming and synchronous requests died the same way), and a dead id answered
+`500`/`400` to both `get` and `cancel` indefinitely. Under the previous rules
+the run failed with an unexplained 400 (the August 28 checkpoint) and the
+unfinished id could then block the conversation forever. The product owner
+requires the newest model; a lower-model fallback was prototyped and rejected.
+
+**Consequences:** D-007's transport allowance is unchanged for transient
+errors, but a "high demand" `5xx` from `get` is classified as an execution
+outcome rather than a transport fault and consumes no transport retries. Tool
+results are never replayed locally; resubmission only re-sends already durable
+input. Each resubmission is a visible status line with its attempt count. The
+dead id is not retained for reconciliation because the provider itself reports
+it as unrecoverable.

@@ -5,7 +5,7 @@ import type {
   CodingHarnessRunOptions,
   CodingHarnessSession,
 } from './lib/codingHarness';
-import { MODEL_ID } from './lib/constants';
+import { DEFAULT_WEBVM_DISK_PROFILE, MODEL_ID } from './lib/constants';
 
 const appMocks = vi.hoisted(() => ({
   acquireWorkspaceLease: vi.fn(),
@@ -1803,7 +1803,11 @@ describe('SparkRun chat screen', () => {
     expect(appMocks.createHarness).toHaveBeenCalledWith({
       apiKey: 'test-api-key',
       model: MODEL_ID,
+      environmentInstruction: DEFAULT_WEBVM_DISK_PROFILE.agentEnvironmentNotes,
     });
+    expect(DEFAULT_WEBVM_DISK_PROFILE.agentEnvironmentNotes).toMatch(
+      /No public internet from the guest/,
+    );
     expect(appMocks.runHarness).toHaveBeenCalledWith(
       expect.objectContaining({
         prompt: expect.stringContaining('hello world website'),

@@ -93,7 +93,19 @@ termination and may end an operation earlier; it is never mislabeled as an
 API-retry exhaustion. SDK-level retries are disabled so the real maximum is
 nine attempts, not nine multiplied by a hidden second retry loop. A failed
 remote cancellation keeps its Interaction ID in Browser Vault and blocks a new
-provider execution until cancellation is reconciled. Redacted per-interaction telemetry records create/poll time,
+provider execution until cancellation is reconciled. **Provider execution resubmission.** On September 2, 2026 the live probes
+showed that an accepted `gemini-3.7-flash` background Interaction dies with
+`500 high demand` at a roughly constant rate (about half survive 20 s; long
+generations never finished, synchronous and streaming requests died the same
+way), after which that id answers `500` or `400 Request contains an invalid
+argument` forever, including to `cancel`. The harness therefore treats the
+first "high demand" `5xx` from a poll as the execution's death notice, clears
+the id without demanding a cancellation, and resubmits the identical turn to
+the same model with backoff, up to eight times inside the turn deadline. The
+agent is instructed to keep each response short and to build long files with
+`write_file` plus `append_file` parts so one killed response costs one part.
+The transport retry contract below is unchanged for transient errors.
+Redacted per-interaction telemetry records create/poll time,
 actual request counts, provider timestamps, and reported input/output/thought
 tokens without storing prompt or tool bodies in diagnostics.
 
@@ -386,6 +398,26 @@ isolation.
   human-readable run identity helps evidence capture.
 - Setup → Diagnostics shows build SHA/time and compares build-time versus
   runtime CheerpX versions.
+- `GEMINI_API_KEY=… npx vitest run src/lib/geminiLive.probe.test.ts` runs the
+  real harness, system instruction, tools, and Debian environment notes
+  against an in-memory guest-like runtime, building a Three.js solar system and
+  then editing it in a second episode. It is skipped without the key.
+- `node scripts/probe-gemini-poll.mjs` and `node scripts/probe-gemini-long.mjs
+  --mode sync|bg --thinking high --model …` characterize background-interaction
+  deaths and long generations per model.
+- `node scripts/probe-gemini.mjs` (maintainer-only; reads `GEMINI_API_KEY`
+  from the environment or the untracked `.env`) replays the app's exact
+  Interactions request shape from Node—system instruction, bounded function
+  tools, `thinking_level`, background execution, and a `function_result`
+  continuation—and prints the full provider error body. Run it first when the
+  in-app coding turn ends in an unexplained 4xx.
+
+The coding agent's system instruction includes the selected disk profile's
+`agentEnvironmentNotes` (see [`src/lib/constants.ts`](src/lib/constants.ts)):
+what is installed, what is missing, and that the guest has no public internet.
+On the Debian baseline this steers the model toward static HTML/ES-module
+projects that load libraries such as Three.js from a CDN import map instead of
+burning turns on `npm`/Vite commands that cannot succeed there.
 
 When a failure is machine-specific, run `/diag.html` before changing app code.
 If diagnostics fail too, investigate the image, CheerpX, browser, or machine. If

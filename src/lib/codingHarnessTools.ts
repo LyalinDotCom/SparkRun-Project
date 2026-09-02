@@ -9,6 +9,7 @@ export const CODING_REPLACE_TOOL = 'replace';
 export const CODING_LIST_DIRECTORY_TOOL = 'list_directory';
 export const CODING_RUN_COMMAND_TOOL = 'run_command';
 export const CODING_START_PREVIEW_TOOL = 'start_preview';
+export const CODING_APPEND_FILE_TOOL = 'append_file';
 
 export interface CodingToolDeclaration {
   name: string;
@@ -56,6 +57,23 @@ export const CODING_TOOL_DECLARATIONS: CodingToolDeclaration[] = [
     name: CODING_WRITE_FILE_TOOL,
     description:
       'Write the complete UTF-8 contents of a file in the durable workspace, creating parent directories when the runtime supports it.',
+    parametersJsonSchema: {
+      type: 'object',
+      properties: {
+        file_path: {
+          type: 'string',
+          description:
+            'Path relative to the workspace root, or an absolute path inside it.',
+        },
+        content: { type: 'string' },
+      },
+      required: ['file_path', 'content'],
+    },
+  },
+  {
+    name: CODING_APPEND_FILE_TOOL,
+    description:
+      'Append UTF-8 text to the end of a file in the durable workspace, creating it if missing. Use it to build a long file in short parts after write_file wrote the first part; content is appended exactly as given, so include any needed leading newline.',
     parametersJsonSchema: {
       type: 'object',
       properties: {
@@ -1120,6 +1138,41 @@ export async function executeCodingToolCall(
             `Wrote ${content.length.toLocaleString()} characters to ${absolute}.`,
           ),
           display: redactCodingSecrets(`Wrote ${absolute}`),
+          isError: false,
+          changedFiles: [path],
+        };
+      }
+
+      case CODING_APPEND_FILE_TOOL: {
+        const path = normalizeCodingWorkspacePath(
+          expectString(call.arguments.file_path, 'file_path'),
+          runtime.workspaceRoot,
+        );
+        if (!path) throw new Error('append_file requires a file path.');
+        if (isSensitiveFile(path)) {
+          throw new Error(
+            'Writing secret-bearing files through the model is blocked. Use the host credential settings instead.',
+          );
+        }
+        const content = expectString(call.arguments.content, 'content');
+        if (!content) throw new Error('"content" cannot be empty.');
+        let existing = '';
+        try {
+          existing = await runtime.readText(path);
+        } catch {
+          // A missing file is created.
+        }
+        throwIfToolAborted(abortSignal);
+        await runtime.writeText(path, existing + content);
+        completedMutation = true;
+        const absolute = absoluteWorkspacePath(runtime, path);
+        return {
+          content: redactCodingSecrets(
+            `Appended ${content.length.toLocaleString()} characters to ${absolute}; it is now ${(
+              existing.length + content.length
+            ).toLocaleString()} characters.`,
+          ),
+          display: redactCodingSecrets(`Appended to ${absolute}`),
           isError: false,
           changedFiles: [path],
         };

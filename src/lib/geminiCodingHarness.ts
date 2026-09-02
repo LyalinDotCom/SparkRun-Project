@@ -12,6 +12,7 @@ import {
   type CodingTranscriptEntry,
 } from './codingHarness';
 import {
+  CODING_APPEND_FILE_TOOL,
   CODING_LIST_DIRECTORY_TOOL,
   CODING_READ_FILE_TOOL,
   CODING_REPLACE_TOOL,
@@ -29,6 +30,15 @@ import {
 export const GEMINI_INTERACTIONS_PROVIDER = 'google-interactions';
 export const GEMINI_API_MAX_RETRIES = 8;
 export const DEFAULT_CODING_HARNESS_MAX_TURNS = 60;
+/**
+ * How many times one turn's dead provider execution is resubmitted to the same
+ * model before the run fails. Measured 2026-09-02 on gemini-3.7-flash: an
+ * accepted background interaction dies with "500 high demand" at a roughly
+ * constant hazard rate (about half survive 20 s; none survived 60 s), and a
+ * dead id answers 500/400 forever. Resubmitting the identical request is the
+ * only recovery, and it is idempotent because tool results are already durable.
+ */
+export const GEMINI_EXECUTION_RETRIES = 8;
 
 const DEFAULT_API_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_BACKGROUND_TURN_TIMEOUT_MS = 12 * 60_000;
@@ -118,8 +128,20 @@ export interface GeminiCodingHarnessOptions {
   apiKey?: string;
   client?: GeminiInteractionsClient;
   model?: string;
+  /**
+   * Resubmissions of one turn to the same model after its provider execution
+   * died of a capacity failure. Defaults to GEMINI_EXECUTION_RETRIES.
+   */
+  executionRetries?: number;
   /** Appended to the built-in safety and operating instructions. */
   additionalSystemInstruction?: string;
+  /**
+   * Facts about the execution environment (installed toolchain, missing
+   * tools, network egress). Without them the model reaches for npm/Vite in a
+   * guest that has neither Node nor internet and burns its turn budget on
+   * commands that can never succeed.
+   */
+  environmentInstruction?: string;
   thinkingLevel?: 'minimal' | 'low' | 'medium' | 'high';
   /** Overall server-side background execution budget for one model turn. */
   backgroundTurnTimeoutMs?: number;
@@ -229,6 +251,25 @@ function isRetryableApiError(error: unknown): boolean {
   );
 }
 
+function describeApiError(error: unknown): string {
+  const record =
+    error && typeof error === 'object'
+      ? (error as { status?: unknown; code?: unknown; message?: unknown; name?: unknown })
+      : {};
+  const status = record.status ?? record.code;
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof record.message === 'string'
+        ? record.message
+        : String(error);
+  const name = error instanceof Error ? error.name : String(record.name ?? '');
+  return [name, status !== undefined ? `status ${String(status)}` : '', message]
+    .filter(Boolean)
+    .join(' · ')
+    .slice(0, 300);
+}
+
 function sanitizedApiError(error: unknown): Error {
   const record =
     error && typeof error === 'object'
@@ -249,6 +290,87 @@ function sanitizedApiError(error: unknown): Error {
   return sanitized;
 }
 
+const INTERACTION_DIED = Symbol('sparkrun.interactionDied');
+
+type InteractionDeathError = Error & {
+  [INTERACTION_DIED]?: string;
+  status?: unknown;
+  code?: unknown;
+};
+
+/**
+ * A background interaction that was accepted and then stopped answering its
+ * own GET with 5xx (or a 400 once the server forgot it) is dead: measured on
+ * 2026-09-02, such an id keeps returning 500/400 to get and cancel forever.
+ * Tag the transport error so the run loop can resubmit the turn instead of
+ * demanding a cancellation that can never be confirmed.
+ */
+function markInteractionDied(error: unknown, interactionId: string): Error {
+  const sanitized = sanitizedApiError(error) as InteractionDeathError;
+  sanitized[INTERACTION_DIED] = interactionId;
+  return sanitized;
+}
+
+export function isInteractionDeathError(error: unknown): boolean {
+  return Boolean(
+    error &&
+      typeof error === 'object' &&
+      (error as InteractionDeathError)[INTERACTION_DIED],
+  );
+}
+
+/**
+ * The 500 the provider returns when a background execution has died mid-run.
+ * It arrives through GET of the accepted interaction, and once seen that id
+ * never recovers, so polling it further is pure waste.
+ */
+function isExecutionDeathSignal(error: unknown): boolean {
+  const record =
+    error && typeof error === 'object'
+      ? (error as { status?: unknown; code?: unknown; message?: unknown })
+      : {};
+  const status = String(record.status ?? record.code ?? '');
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof record.message === 'string'
+        ? record.message
+        : String(error);
+  return /^5\d\d$/.test(status) && /high demand/i.test(message);
+}
+
+/**
+ * Provider-side capacity failure: the model's execution, not the request, is
+ * the problem, so resubmitting the identical turn can complete it. User Stop
+ * and the local turn deadline are control-plane terminations and never
+ * qualify; permanent request errors (a 4xx on create) never qualify.
+ */
+export function isProviderCapacityFailure(error: unknown): boolean {
+  if (isAbortError(error)) return false;
+  if (error instanceof Error && error.name === 'TimeoutError') return false;
+  if (isInteractionDeathError(error)) return true;
+  const record =
+    error && typeof error === 'object'
+      ? (error as { status?: unknown; code?: unknown; message?: unknown })
+      : {};
+  const status = String(record.status ?? record.code ?? '').toUpperCase();
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof record.message === 'string'
+        ? record.message
+        : String(error);
+  return (
+    /^5\d\d$/.test(status) ||
+    status === '429' ||
+    status === 'UNAVAILABLE' ||
+    status === 'RESOURCE_EXHAUSTED' ||
+    /high demand|overloaded|temporarily unavailable|\bUNAVAILABLE\b|\bRESOURCE_EXHAUSTED\b/i.test(
+      message,
+    )
+  );
+}
+
 function isAlreadyTerminalCancellationError(error: unknown): boolean {
   const record =
     error && typeof error === 'object'
@@ -263,6 +385,9 @@ function isAlreadyTerminalCancellationError(error: unknown): boolean {
         : String(error);
   return (
     status === 404 ||
+    // The API answers 400 "Invalid interaction name" for an id it no longer
+    // knows; there is nothing left to cancel.
+    (status === 400 && /invalid interaction name/i.test(message)) ||
     /interaction.*(?:not found|already (?:completed|cancelled|failed|terminal))|already (?:completed|cancelled|failed|terminal).*interaction/i.test(
       message,
     )
@@ -533,6 +658,7 @@ function buildSystemInstruction(
   model: string,
   workspaceRoot: string,
   additionalInstruction: string | undefined,
+  environmentInstruction: string | undefined,
 ): string {
   return `
 You are SparkRun's coding agent operating an isolated Linux VM through tools.
@@ -553,10 +679,14 @@ Operating rules:
 - Do not expose localhost as a user-facing URL. The host application manages reachable preview URLs.
 - When the active objective needs a browser preview and no healthy managed preview already exists, use start_preview as the final runtime step. Configure the server to bind 0.0.0.0 on the exact port you pass. Do not restart a healthy preview for a narrow file-only repair, and do not use a detached run_command for a preview server.
 - Prefer targeted file tools for ordinary edits. Use run_command for builds, tests, package managers, version control, and system work.
+- Provider execution is bounded per response: a single model response that takes more than roughly 20 seconds to generate is likely to be killed and resubmitted from scratch, so long responses waste the whole turn. Keep every response small: at most about 80 lines of file content per tool call and at most a few tool calls per response. Create a long file with write_file for its first part and append_file for each following part, in order; after a resubmission, check the file's current tail before appending so no part is written twice.
+- read_file returns the whole file when no line range is given, and tool output is capped at about 60,000 characters. Read a file once in full unless it is larger than that; do not page through a normal-sized file in small line ranges or re-read it with grep/head/ls before editing.
+- For a small change to an existing file, use replace with a unique old_string from the single read you already made. Do not rewrite the whole file for a one-line change.
 - When multiple tool operations are independent and safe from the same known workspace state, emit all of their function calls in one response. SparkRun executes every returned call in order and sends all results together in the next interaction.
 - Preserve dependency order. Do not batch a call that requires another call's result or side effect from the same response; wait for that result before issuing a dependent edit, check, build, or preview start.
 - A command runs as root inside the disposable VM, not on the host. Treat the durable work folder as valuable even though the VM itself is replaceable.
 - When finished, give a concise outcome, tests run, and any remaining limitation. Do not invent success.
+${environmentInstruction?.trim() ? `\nExecution environment (authoritative; do not probe for tools listed as missing):\n${environmentInstruction.trim()}` : ''}
 ${additionalInstruction?.trim() ? `\nProject-specific instructions:\n${additionalInstruction.trim()}` : ''}
 `.trim();
 }
@@ -658,6 +788,7 @@ function inspectionFingerprint(
 function canInvalidateInspectionEvidence(toolName: string): boolean {
   return (
     toolName === CODING_WRITE_FILE_TOOL ||
+    toolName === CODING_APPEND_FILE_TOOL ||
     toolName === CODING_REPLACE_TOOL ||
     toolName === CODING_RUN_COMMAND_TOOL ||
     toolName === CODING_START_PREVIEW_TOOL
@@ -840,6 +971,8 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
   readonly model: string;
   private readonly client: GeminiInteractionsClient;
   private readonly additionalSystemInstruction?: string;
+  private readonly environmentInstruction?: string;
+  private readonly executionRetries: number;
   private readonly thinkingLevel: 'minimal' | 'low' | 'medium' | 'high';
   private readonly backgroundTurnTimeoutMs: number;
   private readonly backgroundPollIntervalMs: number;
@@ -851,6 +984,11 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
       options.client ??
       (new GoogleGenAI({ apiKey: options.apiKey }) as GeminiInteractionsClient);
     this.additionalSystemInstruction = options.additionalSystemInstruction;
+    this.environmentInstruction = options.environmentInstruction;
+    this.executionRetries = Math.max(
+      0,
+      Math.floor(options.executionRetries ?? GEMINI_EXECUTION_RETRIES),
+    );
     this.thinkingLevel = options.thinkingLevel ?? 'high';
     this.backgroundTurnTimeoutMs =
       options.backgroundTurnTimeoutMs ?? DEFAULT_BACKGROUND_TURN_TIMEOUT_MS;
@@ -904,11 +1042,11 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
         }
         emit(options, {
           type: 'status',
-          message: `Gemini API call failed temporarily. Retrying in ${(
-            delay / 1_000
-          ).toLocaleString()}s (attempt ${retry + 2}/${
-            GEMINI_API_MAX_RETRIES + 1
-          }).`,
+          message: `Gemini API call failed temporarily (${redactCodingSecrets(
+            describeApiError(error),
+          )}). Retrying in ${(delay / 1_000).toLocaleString()}s (attempt ${
+            retry + 2
+          }/${GEMINI_API_MAX_RETRIES + 1}).`,
         });
         await waitForRetry(delay, options.abortSignal);
       }
@@ -1100,7 +1238,9 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
           },
           options,
           this.apiRequestTimeoutMs,
-          () => true,
+          // A "high demand" 5xx from GET is the execution's death notice, not
+          // a transport blip; other transient errors keep the full allowance.
+          (error) => !isExecutionDeathSignal(error),
           deadlineAt,
           turnTimeoutMs,
         );
@@ -1126,8 +1266,22 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
           delete session.providerState.pendingInteractionId;
           await persistSession(session, options);
         }
+        throw error;
       }
-      throw error;
+      // The accepted interaction stopped answering its own GET after the full
+      // transport allowance (5xx), or the server already forgot it (4xx).
+      // Its execution is dead and its id answers cancel with 500 forever, so
+      // requiring a confirmed cancellation here would lock the conversation.
+      delete session.providerState.pendingInteractionId;
+      await persistSession(session, options);
+      emit(options, {
+        type: 'status',
+        message: `The Gemini background interaction stopped responding (${redactCodingSecrets(
+          describeApiError(error),
+        )}); its provider execution is treated as failed.`,
+        interactionId: response.id,
+      });
+      throw markInteractionDied(error, response.id);
     }
 
     const terminalTelemetry = interactionTelemetry(response, 'terminal', {
@@ -1236,6 +1390,7 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
       this.model,
       options.runtime.workspaceRoot,
       this.additionalSystemInstruction,
+      this.environmentInstruction,
     );
 
     for (let turn = 1; turn <= maxTurns; turn++) {
@@ -1275,45 +1430,97 @@ export class GeminiInteractionsCodingHarness implements CodingHarness {
       await persistSession(session, options);
 
       let response: GeminiInteractionResponse;
-      try {
-        response = await this.createInteraction(
-          params(),
-          session,
-          options,
-          turnBudget,
-        );
-      } catch (error) {
-        if (!previousInteractionId || !isUnavailablePreviousInteraction(error)) {
-          throw error;
+      let expiredChainRecovered = false;
+      // The allowance is per turn: a long run legitimately survives many
+      // deaths spread over many turns, and each turn's budget is already
+      // bounded by its own deadline.
+      let executionResubmissions = 0;
+      for (;;) {
+        try {
+          response = await this.createInteraction(
+            params(),
+            session,
+            options,
+            turnBudget,
+          );
+          if (!response.id || typeof response.id !== 'string') {
+            throw new Error(
+              'Gemini Interactions returned a response without an id.',
+            );
+          }
+          if (response.status === 'failed') {
+            const failure = interactionFailureError(response);
+            // A terminal capacity failure is an execution death like a dead
+            // poll; anything else (safety, malformed input) is permanent.
+            throw isProviderCapacityFailure(failure)
+              ? markInteractionDied(failure, response.id)
+              : failure;
+          }
+          break;
+        } catch (error) {
+          if (
+            previousInteractionId &&
+            !expiredChainRecovered &&
+            isUnavailablePreviousInteraction(error)
+          ) {
+            expiredChainRecovered = true;
+            emit(options, {
+              type: 'status',
+              message:
+                'The saved Gemini interaction expired. Reconstructing the conversation from the durable transcript and workspace.',
+            });
+            previousInteractionId = undefined;
+            session.previousInteractionId = null;
+            appendTranscript(session, {
+              role: 'system',
+              kind: 'recovery',
+              content:
+                'The Gemini previous_interaction_id was unavailable; the next request reconstructed context from the saved transcript.',
+            });
+            nextInput = renderRecoveryContext(session, prompt);
+            await persistSession(session, options);
+            continue;
+          }
+          // Only an accepted execution that died qualifies. A create that
+          // exhausted its own transport allowance already had its exact
+          // initial-plus-eight attempts (D-007) and is reported as such.
+          if (
+            !isInteractionDeathError(error) ||
+            executionResubmissions >= this.executionRetries
+          ) {
+            throw error;
+          }
+          // The provider's execution of this turn died, not the request:
+          // resubmit the identical turn (same input, same
+          // previous_interaction_id) to the same model. Tool results are
+          // already durable, so nothing local is replayed, and the dead id
+          // never becomes previous_interaction_id.
+          executionResubmissions += 1;
+          const delay = Math.min(
+            (options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS) *
+              2 ** (executionResubmissions - 1),
+            MAX_RETRY_DELAY_MS,
+          );
+          const remaining = remainingTurnTime(
+            turnBudget.deadlineAt,
+            turnBudget.turnTimeoutMs,
+          );
+          if (remaining !== undefined && delay >= remaining) {
+            throw backgroundTurnTimeoutError(turnBudget.turnTimeoutMs);
+          }
+          emit(options, {
+            type: 'status',
+            message: `Gemini's execution of this turn died (${redactCodingSecrets(
+              describeApiError(error),
+            )}). Resubmitting the same request to ${this.model} in ${(
+              delay / 1_000
+            ).toLocaleString()}s (execution attempt ${
+              executionResubmissions + 1
+            }/${this.executionRetries + 1}).`,
+          });
+          await waitForRetry(delay, options.abortSignal);
+          throwIfRuntimeDisposed(options.runtime);
         }
-        emit(options, {
-          type: 'status',
-          message:
-            'The saved Gemini interaction expired. Reconstructing the conversation from the durable transcript and workspace.',
-        });
-        previousInteractionId = undefined;
-        session.previousInteractionId = null;
-        appendTranscript(session, {
-          role: 'system',
-          kind: 'recovery',
-          content:
-            'The Gemini previous_interaction_id was unavailable; the next request reconstructed context from the saved transcript.',
-        });
-        nextInput = renderRecoveryContext(session, prompt);
-        await persistSession(session, options);
-        response = await this.createInteraction(
-          params(),
-          session,
-          options,
-          turnBudget,
-        );
-      }
-
-      if (!response.id || typeof response.id !== 'string') {
-        throw new Error('Gemini Interactions returned a response without an id.');
-      }
-      if (response.status === 'failed') {
-        throw interactionFailureError(response);
       }
       if (
         response.status !== 'completed' &&

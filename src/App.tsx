@@ -65,6 +65,7 @@ import {
 } from './lib/browserVault';
 import {
   DEFAULT_WEBVM_DISK_PROFILE,
+  ENABLED_MODELS,
   MODEL_ID,
   SITE_ROOT,
 } from './lib/constants';
@@ -219,9 +220,7 @@ const INITIAL_STATUS: WebVmStatus = {
   serverPort: null,
 };
 
-const MODELS = [
-  { id: MODEL_ID, label: '3.7 Flash', sub: 'Only model enabled' },
-];
+const MODELS = ENABLED_MODELS;
 
 function formatBuildTimeLocal(iso: string): string {
   if (!iso || iso === 'dev' || iso === 'unknown') return iso;
@@ -5046,6 +5045,7 @@ export default function App() {
       const harness = new GeminiInteractionsCodingHarness({
         apiKey: trimmedApiKey,
         model,
+        environmentInstruction: DEFAULT_WEBVM_DISK_PROFILE.agentEnvironmentNotes,
       });
       const result = await harness.run({
         prompt: buildPrompt,
