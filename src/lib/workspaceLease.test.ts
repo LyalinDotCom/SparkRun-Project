@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  type WorkspaceLockRequestOptions,
   acquireWorkspaceLease,
   workspaceLeaseLockName,
   type WorkspaceLockManager,
@@ -17,7 +18,7 @@ class FakeLockManager implements WorkspaceLockManager {
   readonly held = new Set<string>();
   readonly calls: Array<{
     name: string;
-    options: { mode: 'exclusive'; ifAvailable: true };
+    options: WorkspaceLockRequestOptions;
   }> = [];
   completedRequests = 0;
   requestError: unknown = null;
@@ -27,13 +28,15 @@ class FakeLockManager implements WorkspaceLockManager {
 
   request(
     name: string,
-    options: { mode: 'exclusive'; ifAvailable: true },
+    options: WorkspaceLockRequestOptions,
     callback: (lock: Lock | null) => void | Promise<void>,
   ): Promise<unknown> {
     this.calls.push({ name, options });
     if (this.throwSynchronously) throw this.throwSynchronously;
     if (this.requestError) return Promise.reject(this.requestError);
-    if (this.held.has(name)) return Promise.resolve(callback(null));
+    if (this.held.has(name) && !('steal' in options)) {
+      return Promise.resolve(callback(null));
+    }
 
     this.held.add(name);
     return Promise.resolve(
@@ -83,7 +86,7 @@ describe('workspace lease', () => {
     await expect(
       acquireWorkspaceLease('shared-project', { lockManager: manager }),
     ).rejects.toMatchObject({ code: 'unavailable' });
-    expect(manager.calls[1]?.options.ifAvailable).toBe(true);
+    expect(manager.calls[1]?.options).toMatchObject({ ifAvailable: true });
 
     await first.release();
     const afterRelease = await acquireWorkspaceLease('shared-project', {
@@ -220,5 +223,33 @@ describe('workspace lease', () => {
     await Promise.resolve();
     window.removeEventListener('unhandledrejection', unhandled);
     expect(unhandled).not.toHaveBeenCalled();
+  });
+});
+
+describe('workspace lease take-over', () => {
+  it('steals the lock from another tab only when explicitly asked', async () => {
+    const manager = new FakeLockManager();
+    manager.held.add('sparkrun:workspace:v1:shared-project');
+
+    await expect(
+      acquireWorkspaceLease('shared-project', { lockManager: manager }),
+    ).rejects.toMatchObject({ code: 'unavailable' });
+    expect(manager.calls.at(-1)?.options).toEqual({
+      mode: 'exclusive',
+      ifAvailable: true,
+    });
+
+    const lease = await acquireWorkspaceLease('shared-project', {
+      lockManager: manager,
+      takeOver: true,
+    });
+    expect(manager.calls.at(-1)?.options).toEqual({
+      mode: 'exclusive',
+      steal: true,
+    });
+    expect(lease.projectId).toBe('shared-project');
+    expect(lease.released).toBe(false);
+    await lease.release();
+    expect(lease.released).toBe(true);
   });
 });

@@ -95,6 +95,7 @@ import type { DirectoryEntry, VmFileBackend } from './lib/vmFileContract';
 import type { WorkspaceRuntime } from './lib/workspaceRuntime';
 import {
   acquireWorkspaceLease,
+  WorkspaceLeaseError,
   type WorkspaceLease,
 } from './lib/workspaceLease';
 import '@xterm/xterm/css/xterm.css';
@@ -1250,6 +1251,9 @@ interface ChatScreenProps {
   onTerminal: () => void;
   onCloseTerminal: () => void;
   onStartVm: () => void;
+  /** Another tab holds this project's workspace; offer to take it over here. */
+  workspaceHeldElsewhere: boolean;
+  onTakeOverWorkspace: () => void;
   terminalOpen: boolean;
   terminalDockHeight: number;
   onTerminalDockHeight: (height: number) => void;
@@ -1951,6 +1955,8 @@ function ChatScreen({
   onTerminal,
   onCloseTerminal,
   onStartVm,
+  workspaceHeldElsewhere,
+  onTakeOverWorkspace,
   terminalOpen,
   terminalDockHeight,
   onTerminalDockHeight,
@@ -2224,6 +2230,24 @@ function ChatScreen({
             </button>
           ) : null}
 
+          {workspaceHeldElsewhere ? (
+            <div className="error-strip lease-strip" role="alert">
+              <TriangleAlert size={15} aria-hidden="true" />
+              <div>
+                This project is open in another tab or window, which holds its
+                workspace. Close it, or take the workspace over here; the other
+                tab loses its VM lease.
+              </div>
+              <button
+                className="lease-takeover"
+                disabled={building || networkRetrying || stopping}
+                onClick={onTakeOverWorkspace}
+                type="button"
+              >
+                Take over in this tab
+              </button>
+            </div>
+          ) : null}
           {errorMessage ? (
             <div className="error-strip" role="alert">
               <TriangleAlert size={15} aria-hidden="true" />
@@ -3211,6 +3235,12 @@ export default function App() {
   const bootedTailscaleKeyRef = useRef<string>('');
   /** Boots currently queued or running; the auto-boot effect must not add one. */
   const vmBootInFlightRef = useRef(0);
+  /** Project whose workspace lock is held by another tab, if the last boot said so. */
+  const [workspaceHeldElsewhereFor, setWorkspaceHeldElsewhereFor] = useState<
+    string | null
+  >(null);
+  /** One-shot: the next boot takes the workspace lock over from the other tab. */
+  const takeOverWorkspaceRef = useRef(false);
   const [terminalDockHeight, setTerminalDockHeight] = useState(
     readTerminalDockHeight,
   );
@@ -4843,7 +4873,32 @@ export default function App() {
       }
       const projectIdAtBoot = vaultProject.id;
       throwIfBootSuperseded();
-      const acquiredLease = await acquireWorkspaceLease(projectIdAtBoot);
+      const takeOver = takeOverWorkspaceRef.current;
+      takeOverWorkspaceRef.current = false;
+      let acquiredLease: WorkspaceLease;
+      try {
+        acquiredLease = await acquireWorkspaceLease(projectIdAtBoot, {
+          ...(takeOver ? { takeOver: true } : {}),
+        });
+      } catch (error) {
+        if (
+          error instanceof WorkspaceLeaseError &&
+          error.code === 'unavailable'
+        ) {
+          setWorkspaceHeldElsewhereFor(projectIdAtBoot);
+        }
+        throw error;
+      }
+      setWorkspaceHeldElsewhereFor((current) =>
+        current === projectIdAtBoot ? null : current,
+      );
+      if (takeOver) {
+        appendEvent({
+          kind: 'status',
+          label: 'Workspace taken over',
+          text: 'This tab now owns the project workspace; the other tab lost its VM lease.',
+        });
+      }
       leaseDuringBoot = acquiredLease;
       bootedTailscaleKeyRef.current = currentTailscaleKey;
       const vm = await WebVmBackend.create({
@@ -5620,6 +5675,14 @@ export default function App() {
     }
   };
 
+  const takeOverWorkspace = () => {
+    if (building || networkRetrying || stopping) return;
+    takeOverWorkspaceRef.current = true;
+    setWorkspaceHeldElsewhereFor(null);
+    autoBootProjectIdRef.current = activeProject.id;
+    void startVmNow();
+  };
+
   const openTerminal = () => {
     setShowFiles(false);
     setShowLogs(false);
@@ -6025,6 +6088,8 @@ export default function App() {
             onTerminal={openTerminal}
             onCloseTerminal={() => setShowTerminal(false)}
             onStartVm={() => void startVmNow()}
+            workspaceHeldElsewhere={workspaceHeldElsewhereFor === activeProject.id}
+            onTakeOverWorkspace={takeOverWorkspace}
             terminalOpen={showTerminal}
             terminalDockHeight={terminalDockHeight}
             onTerminalDockHeight={updateTerminalDockHeight}

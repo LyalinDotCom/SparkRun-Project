@@ -1030,8 +1030,12 @@ describe('SparkRun chat screen', () => {
         '2 lines',
       ),
     );
-    const checkpointTimerIndex = timeoutSpy.mock.calls.findIndex(
-      ([, delay]) => delay === 2_500,
+    // The VM now boots on workbench entry, so earlier 2.5 s checkpoint timers
+    // (boot output) may already exist; the one the transition must cancel is
+    // the latest, scheduled by the command just run.
+    const checkpointTimerIndex = timeoutSpy.mock.calls.reduce(
+      (found, [, delay], index) => (delay === 2_500 ? index : found),
+      -1,
     );
     expect(checkpointTimerIndex).toBeGreaterThanOrEqual(0);
     const checkpointTimerId = timeoutSpy.mock.results[checkpointTimerIndex]
@@ -2418,6 +2422,55 @@ describe('SparkRun chat screen', () => {
     expect(screen.getByRole('region', { name: /^Terminal$/i })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Close terminal/i }));
     expect(screen.queryByRole('region', { name: /^Terminal$/i })).not.toBeInTheDocument();
+  });
+
+  it('offers to take over a workspace held by another tab and boots with the stolen lock', async () => {
+    const backend = fakeBackend();
+    appMocks.createBackend.mockResolvedValue(backend);
+    const { WorkspaceLeaseError } = await import('./lib/workspaceLease');
+    appMocks.acquireWorkspaceLease.mockImplementation(
+      async (projectId: string, options?: { takeOver?: boolean }) => {
+        if (!options?.takeOver) {
+          throw new WorkspaceLeaseError(
+            'unavailable',
+            'This project is already open in another tab. Close that workspace before trying again.',
+          );
+        }
+        let released = false;
+        return {
+          projectId,
+          lockName: `test-workspace-lock:${projectId}`,
+          get released() {
+            return released;
+          },
+          release: vi.fn(async () => {
+            released = true;
+          }),
+        };
+      },
+    );
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/Google AI key/i), {
+      target: { value: 'test-api-key' },
+    });
+    gotoChat();
+
+    const takeOver = await screen.findByRole('button', {
+      name: /Take over in this tab/i,
+    });
+    expect(appMocks.createBackend).not.toHaveBeenCalled();
+    fireEvent.click(takeOver);
+
+    await waitFor(() => expect(appMocks.createBackend).toHaveBeenCalledTimes(1));
+    expect(appMocks.acquireWorkspaceLease).toHaveBeenLastCalledWith(
+      expect.any(String),
+      { takeOver: true },
+    );
+    expect(await screen.findByText(/Workspace taken over/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /Take over in this tab/i }),
+    ).not.toBeInTheDocument();
   });
 
   it('keeps a writable matching-head cache with newer uncheckpointed files', async () => {

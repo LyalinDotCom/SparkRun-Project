@@ -4081,3 +4081,32 @@ summary:focus-visible,
     max-height: 60vh;
   }
 }
+
+/* ----- Workspace held by another tab ----- */
+.error-strip.lease-strip {
+  align-items: center;
+  gap: 10px;
+}
+.error-strip.lease-strip > div {
+  flex: 1;
+  min-width: 0;
+}
+.lease-takeover {
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 138, 110, 0.5);
+  background: rgba(255, 138, 110, 0.16);
+  color: #ffb39f;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.lease-takeover:hover {
+  background: rgba(255, 138, 110, 0.28);
+}
+.lease-takeover:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

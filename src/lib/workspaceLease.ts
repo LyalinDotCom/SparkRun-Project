@@ -26,10 +26,14 @@ export class WorkspaceLeaseError extends Error {
  * The subset of LockManager used here. Keeping this surface small makes the
  * lease independently testable without pretending a fake implements query().
  */
+export type WorkspaceLockRequestOptions =
+  | { mode: 'exclusive'; ifAvailable: true }
+  | { mode: 'exclusive'; steal: true };
+
 export interface WorkspaceLockManager {
   request(
     name: string,
-    options: { mode: 'exclusive'; ifAvailable: true },
+    options: WorkspaceLockRequestOptions,
     callback: (lock: Lock | null) => void | Promise<void>,
   ): Promise<unknown>;
 }
@@ -49,6 +53,13 @@ export interface WorkspaceLease {
 export interface AcquireWorkspaceLeaseOptions {
   /** Dependency injection for tests. Passing null explicitly fails closed. */
   lockManager?: WorkspaceLockManager | null;
+  /**
+   * Take the workspace over from whichever tab holds it. The other tab's lock
+   * request is aborted by the browser, so its lease reports released and it
+   * cannot run further VM work; this tab becomes the single owner. Only for an
+   * explicit user action ("Take over in this tab"), never for automatic boots.
+   */
+  takeOver?: boolean;
 }
 
 interface Deferred<T> {
@@ -188,7 +199,9 @@ export async function acquireWorkspaceLease(
     requestCompletion = Promise.resolve(
       lockManager.request(
         lockName,
-        { mode: 'exclusive', ifAvailable: true },
+        options.takeOver
+          ? { mode: 'exclusive', steal: true }
+          : { mode: 'exclusive', ifAvailable: true },
         async (lock) => {
           if (callbackInvoked) {
             throw new WorkspaceLeaseError(
