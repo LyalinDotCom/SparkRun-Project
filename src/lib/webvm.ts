@@ -425,6 +425,13 @@ const COMMAND_COMPLETION_DRAIN_HARD_LIMIT_MS = 30_000;
 const COMMAND_CONSOLE_DRAIN_POLL_MS = 5;
 const COMMAND_TRAILING_OUTPUT_DRAIN_MS = 20;
 const HOST_COMMAND_WATCHDOG_GRACE_MS = 15_000;
+// Readiness bookkeeping commands (cat server.port, wc -c server.log, tail of
+// the server log, the readiness certificate write) are trivial, but a missed
+// completion proof disposes the whole VM by policy. Under load (Python
+// starting, Tailnet just activated, another VM in a sibling tab) a 2-3 s
+// watchdog produced false disposals on the live site (2026-09-02, 04:05 PM).
+// Give these polls the same headroom as other guest commands.
+const READINESS_COMMAND_TIMEOUT_MS = 15_000;
 const COMMAND_COMPLETION_PREFIX = '__SPARKRUN_COMMAND_COMPLETED_';
 const SERVER_STATE_DIR = '/tmp/sparkrun';
 const SERVER_LOG_PATH = `${SERVER_STATE_DIR}/server.log`;
@@ -1542,7 +1549,7 @@ export class WebVmBackend
       '/',
       false,
       false,
-      5_000,
+      READINESS_COMMAND_TIMEOUT_MS,
       false,
     ).catch(() => undefined);
   }
@@ -1833,7 +1840,7 @@ export class WebVmBackend
       '/',
       false,
       false,
-      5_000,
+      READINESS_COMMAND_TIMEOUT_MS,
     );
     if (readiness.status !== 0) {
       const log = await this.readServerLog(60);
@@ -2432,7 +2439,7 @@ export class WebVmBackend
         SITE_ROOT,
         false,
         false,
-        2_000,
+        READINESS_COMMAND_TIMEOUT_MS,
         false,
       );
       if (
@@ -2465,7 +2472,7 @@ export class WebVmBackend
         SITE_ROOT,
         false,
         false,
-        2_000,
+        READINESS_COMMAND_TIMEOUT_MS,
         false,
       );
       if (this.disposed || this.getFatalNetworkFailure()) return null;
@@ -2476,7 +2483,7 @@ export class WebVmBackend
           SITE_ROOT,
           false,
           false,
-          2_000,
+          READINESS_COMMAND_TIMEOUT_MS,
           false,
         );
         if (this.disposed || this.getFatalNetworkFailure()) return null;
@@ -2586,7 +2593,7 @@ export class WebVmBackend
       SITE_ROOT,
       false,
       false,
-      3_000,
+      READINESS_COMMAND_TIMEOUT_MS,
     );
     return result.output;
   }
@@ -2700,7 +2707,7 @@ export class WebVmBackend
       SITE_ROOT,
       false,
       false,
-      3_000,
+      READINESS_COMMAND_TIMEOUT_MS,
     );
     this.throwIfFatalNetworkFailure();
     if (this.disposed) {
