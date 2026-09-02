@@ -1546,13 +1546,37 @@ describe('WebVM backend setup', () => {
     expect(statuses.at(-1)).toMatchObject({ lifecycle: 'error', previewUrl: null });
   });
 
+  it('routes a generic static-server preview through the supervised static server', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+
+    const result = await backend.startPreview({
+      command: 'python3 -m http.server 8000 --bind 0.0.0.0',
+      port: 8000,
+      cwd: SITE_ROOT,
+    });
+
+    expect(result.status).toBe(0);
+    // The fake guest reports the static server bound one above SERVER_PORT.
+    expect(result.port).toBe(SERVER_PORT + 1);
+    expect(result.url).toBe(`http://100.64.0.10:${SERVER_PORT + 1}/`);
+    expect(result.output).toContain('supervised static server instead of');
+    expect(result.output).toContain(`It listens on port ${SERVER_PORT + 1}, not 8000`);
+    const launch = mockState.runCalls.find(
+      (call) => call.fileName === '/usr/bin/setsid',
+    );
+    expect(launch?.args.at(-1)).toContain('.sparkrun_static_server.py');
+    expect(launch?.args.at(-1)).not.toContain('http.server');
+    expect(mockState.browserProbeCalls).toEqual([]);
+  });
+
   it('proves a managed preview from the outer browser without a guest loopback command', async () => {
     mockState.emitEarlyIp = true;
     const backend = await WebVmBackend.create({});
     const launchCount = mockState.runCalls.length;
 
     const result = await backend.startPreview({
-      command: 'python3 -m http.server 8000 --bind 0.0.0.0',
+      command: 'node server.js',
       port: 8000,
       cwd: SITE_ROOT,
     });

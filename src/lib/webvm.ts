@@ -292,6 +292,21 @@ function resolveRuntimeCwd(rawCwd: string | undefined): string {
   return trimmed.startsWith('/') ? trimmed : `${SITE_ROOT}/${trimmed}`;
 }
 
+/**
+ * Generic static file servers that only serve the workspace: SparkRun's own
+ * supervised server replaces them (see startPreview).
+ */
+export function isGenericStaticServerCommand(command: string): boolean {
+  const normalized = command.trim().replace(/\s+/g, ' ');
+  return (
+    /^(?:python3?|python\d(?:\.\d+)?)(?:\s+-u)?\s+-m\s+(?:http\.server|SimpleHTTPServer)\b/.test(
+      normalized,
+    ) ||
+    /^(?:npx\s+)?(?:serve|http-server|sirv)\b/.test(normalized) ||
+    /^php\s+-S\b/.test(normalized)
+  );
+}
+
 function commandAbortError(): Error {
   const error = new Error('VM command was stopped.');
   error.name = 'AbortError';
@@ -1643,6 +1658,31 @@ export class WebVmBackend
     const command = options.command.trim();
     const port = options.port;
     const cwd = resolveRuntimeCwd(options.cwd);
+    if (isGenericStaticServerCommand(command)) {
+      // Observed on the live site (2026-09-02): a bare `python3 -m
+      // http.server` reached through the Tailnet crashed CheerpX 1.3.9's
+      // Tailscale TCP wrapper ("Cannot cancel a locked stream"), which took
+      // the network worker down and then the command runner with it. The
+      // supervised static server has never triggered that path, serves the
+      // same files, and proves its bind with a certificate, so static
+      // previews always use it.
+      const started = await this.awaitAbortable(this.startServer(), options.signal);
+      const servedPort = this.serverPort ?? port;
+      return {
+        ...started,
+        output: [
+          `SparkRun served the site with its supervised static server instead of \`${command}\` (generic static servers are not stable over the private network in this VM).`,
+          servedPort !== port
+            ? `It listens on port ${servedPort}, not ${port}; use the reported URL.`
+            : '',
+          started.output,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        port: servedPort,
+        url: this.getPreviewUrl(),
+      };
+    }
     if (!command) {
       return {
         status: 1,

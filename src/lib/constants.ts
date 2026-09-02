@@ -43,7 +43,7 @@ export const WEBVM_OFFICIAL_DISK_PROFILE: WebVmDiskProfile = {
     'NOT installed and NOT installable: Node.js, npm, npx, pnpm, Yarn, Go, Docker, and modern package repositories. Never run npm/npx/node/vite commands here and never try to install them.',
     'No public internet from the guest: apt-get, pip install, npm install, curl/wget to public hosts, and internet git clones all fail. Only the user\'s browser fetches remote assets.',
     'Build browser projects as static HTML/CSS/JavaScript ES modules with no build step. Load libraries through a <script type="importmap"> that points at a CDN, for example Three.js: "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" and "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/". Do not use bundlers, TypeScript compilation, or frameworks that require npm.',
-    'Serve the site with start_preview using `python3 -m http.server <port> --bind 0.0.0.0` from the site directory, or leave index.html at the workspace root and SparkRun starts its own static server after the run. Verify a started server inside the guest with python3 urllib against http://127.0.0.1:<port>.',
+    'Do NOT start a server for a static site. When index.html is at the workspace root, SparkRun starts its own supervised static server after your run and reports the private URL; a bare `python3 -m http.server` is not stable over this VM\'s private network and is replaced by that server anyway. Use start_preview only for a real application server (an API or framework dev server), and never probe 127.0.0.1 with curl or urllib inside the guest.',
   ].join('\n'),
   url: 'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
 };
@@ -58,7 +58,7 @@ export const WEBVM_CODING_CANDIDATE_PROFILE: WebVmDiskProfile = {
     'Guest OS: Alpine Linux 3.24 (musl, 32-bit x86), running as root inside a CheerpX WebAssembly VM in the user\'s browser tab. It is slow compared with a native machine; keep commands small.',
     'Installed: bash, Node.js 24 with npm/pnpm/Yarn, Python 3.14 with pip, Go 1.26, gcc/g++, SQLite, git, curl, and common CLI tools.',
     'No public internet from the guest: npm install, pip install, go get, apk add, and internet git clones all fail. Use only preinstalled tools and load browser libraries from a CDN through an import map, because only the user\'s browser fetches remote assets.',
-    'Serve web projects with start_preview binding 0.0.0.0 on the exact port you pass.',
+    'Do NOT start a server for a static site: leave index.html at the workspace root and SparkRun starts its own supervised static server after your run. Use start_preview only for a real application server binding 0.0.0.0 on the exact port you pass, and never probe 127.0.0.1 inside the guest.',
   ].join('\n'),
   nodeCompatibility: {
     preloadPath: '/usr/local/lib/sparkrun/node-exit-preload.cjs',
