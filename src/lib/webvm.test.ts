@@ -34,6 +34,7 @@ const mockState = vi.hoisted(() => ({
   bytesUrls: [] as string[],
   httpHealthy: true,
   httpProbeDelayMs: 0,
+  browserProbeCalls: [] as Array<{ url: string; mode: RequestMode | null }>,
   idbNames: [] as string[],
   linuxCreateCalls: 0,
   serverAlive: true,
@@ -620,6 +621,20 @@ describe('WebVM backend setup', () => {
     mockState.bytesUrls = [];
     mockState.httpHealthy = true;
     mockState.httpProbeDelayMs = 0;
+    // Managed previews are proven from the outer browser with a no-cors
+    // fetch of the tailnet URL; a guest loopback probe can wedge CheerpX.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        mockState.browserProbeCalls.push({
+          url: String(input),
+          mode: init?.mode ?? null,
+        });
+        if (mockState.httpHealthy) return new Response('');
+        throw new TypeError('Failed to fetch');
+      }),
+    );
+    mockState.browserProbeCalls = [];
     mockState.idbNames = [];
     mockState.linuxCreateCalls = 0;
     mockState.serverAlive = true;
@@ -1531,6 +1546,31 @@ describe('WebVM backend setup', () => {
     expect(statuses.at(-1)).toMatchObject({ lifecycle: 'error', previewUrl: null });
   });
 
+  it('proves a managed preview from the outer browser without a guest loopback command', async () => {
+    mockState.emitEarlyIp = true;
+    const backend = await WebVmBackend.create({});
+    const launchCount = mockState.runCalls.length;
+
+    const result = await backend.startPreview({
+      command: 'python3 -m http.server 8000 --bind 0.0.0.0',
+      port: 8000,
+      cwd: SITE_ROOT,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.url).toBe('http://100.64.0.10:8000/');
+    expect(result.output).toContain('browser received an HTTP response');
+    expect(mockState.browserProbeCalls).toEqual([
+      { url: 'http://100.64.0.10:8000/', mode: 'no-cors' },
+    ]);
+    const guestCommands = mockState.runCalls
+      .slice(launchCount)
+      .map((call) => call.args.at(-1) ?? '');
+    expect(guestCommands.some((command) => /curl|127\.0\.0\.1/.test(command))).toBe(
+      false,
+    );
+  });
+
   it('rejects a managed preview process that never accepts HTTP', async () => {
     mockState.emitEarlyIp = true;
     const backend = await WebVmBackend.create({});
@@ -1546,7 +1586,8 @@ describe('WebVM backend setup', () => {
       const result = await pending;
 
       expect(result.status).toBe(1);
-      expect(result.output).toContain('did not accept HTTP connections');
+      expect(result.output).toContain('did not answer HTTP on port 4173 from the browser');
+      expect(result.output).toContain('No HTTP response from http://100.64.0.10:4173/');
       expect(backend.getServerPort()).toBeNull();
     } finally {
       vi.useRealTimers();

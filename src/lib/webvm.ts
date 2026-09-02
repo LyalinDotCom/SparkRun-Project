@@ -161,7 +161,37 @@ export interface CreateWebVmBackendOptions {
   onConsole?: ConsoleCallback;
   onStatus?: StatusCallback;
   onDebug?: DebugCallback;
+  /**
+   * Outer-browser readiness probe for a managed preview URL. Resolves true
+   * when the browser received any HTTP response from the URL. Defaults to a
+   * no-cors fetch; tests inject a fake.
+   */
+  probePreviewUrl?: PreviewUrlProbe;
 }
+
+export type PreviewUrlProbe = (
+  url: string,
+  signal: AbortSignal,
+) => Promise<boolean>;
+
+/**
+ * Managed previews are proven from the outer browser, never from inside the
+ * guest. A loopback `curl`/`python` GET against 127.0.0.1 can wedge inside
+ * CheerpX 1.3.9's userspace network stack, outlive the command watchdog, and
+ * dispose an otherwise healthy VM (observed on the live site, 2026-09-02).
+ * A no-cors fetch resolves for any HTTP response, including an opaque one
+ * from a server that sets no CORS headers, and rejects on connection failure.
+ */
+export const defaultPreviewUrlProbe: PreviewUrlProbe = async (url, signal) => {
+  try {
+    await fetch(url, { mode: 'no-cors', cache: 'no-store', signal });
+    return true;
+  } catch {
+    return false;
+  }
+};
+const MANAGED_PREVIEW_PROBE_TIMEOUT_MS = 4_000;
+const MANAGED_PREVIEW_PROBE_INTERVAL_MS = 1_000;
 
 export interface ConnectTailnetOptions {
   timeoutMs?: number;
@@ -242,23 +272,6 @@ function containsUnsupportedDetachment(command: string): boolean {
   return false;
 }
 
-function buildInternalHttpProbeCommand(port: number): string {
-  // Never launch a second CPython interpreter beside a live preview. In the
-  // real CheerpX VM a cold interpreter can take longer than the command
-  // watchdog while the first Python process is serving, which turns a healthy
-  // preview into a catastrophic false timeout. curl is part of every supported
-  // SparkRun image and exits under its own bounded network timers.
-  return [
-    'curl',
-    '--silent',
-    '--show-error',
-    '--output /dev/null',
-    `--write-out ${shellQuote('SPARKRUN_HTTP_%{http_code}\\n')}`,
-    '--connect-timeout 2',
-    '--max-time 4',
-    shellQuote(`http://127.0.0.1:${port}/`),
-  ].join(' ');
-}
 
 function toWorkspaceDevicePath(relativePath: string): string {
   return `/site/${normalizeSitePath(relativePath)}`;
@@ -397,11 +410,6 @@ const COMMAND_COMPLETION_DRAIN_HARD_LIMIT_MS = 30_000;
 const COMMAND_CONSOLE_DRAIN_POLL_MS = 5;
 const COMMAND_TRAILING_OUTPUT_DRAIN_MS = 20;
 const HOST_COMMAND_WATCHDOG_GRACE_MS = 15_000;
-// Managed previews use curl with their own four-second socket deadline. Leave
-// enough scheduling headroom for a busy WebVM while keeping the command proof
-// watchdog bounded. The built-in Python server performs its readiness request
-// in-process and does not use this second command at all.
-const HTTP_PROBE_COMMAND_TIMEOUT_MS = 15_000;
 const COMMAND_COMPLETION_PREFIX = '__SPARKRUN_COMMAND_COMPLETED_';
 const SERVER_STATE_DIR = '/tmp/sparkrun';
 const SERVER_LOG_PATH = `${SERVER_STATE_DIR}/server.log`;
@@ -696,6 +704,7 @@ export class WebVmBackend
   private interactiveShellRunning = false;
   private interactiveShellPromise: Promise<{ status: number }> | null = null;
   private tailnetLoginStarted = false;
+  private probePreviewUrl: PreviewUrlProbe = defaultPreviewUrlProbe;
   private tailnetConnectPromise: Promise<string | null> | null = null;
   private resolveTailnetSignal: ((url: string | null) => void) | null = null;
   private rejectTailnetSignal: ((error: Error) => void) | null = null;
@@ -1049,6 +1058,9 @@ export class WebVmBackend
       options.onStatus,
       options.onDebug,
     );
+    if (options.probePreviewUrl) {
+      backend.probePreviewUrl = options.probePreviewUrl;
+    }
     try {
       backend.attachConsole();
       await backend.prepareWorkspace(options.prepareWorkspace ?? 'clean-site');
@@ -1755,7 +1767,7 @@ export class WebVmBackend
     const launch = this.launchTrackedServerProcess(command, cwd);
     if (launch.status !== 0) return launch;
 
-    const health = await this.waitForHttpServer(port, 45_000);
+    const health = await this.waitForManagedPreviewReadiness(port, 45_000);
     if (health.status !== 0) {
       const log = await this.readServerLog(60);
       const lastExit = this.getServerLastExit();
@@ -1763,7 +1775,7 @@ export class WebVmBackend
       return {
         status: 1,
         output: [
-          `Preview process did not accept HTTP connections on port ${port}.`,
+          `Preview process did not answer HTTP on port ${port} from the browser.`,
           health.output,
           lastExit?.output,
           log,
@@ -2443,12 +2455,26 @@ export class WebVmBackend
     return null;
   }
 
-  private async waitForHttpServer(
+  /**
+   * Prove a managed preview from the outer browser: the tailnet URL must
+   * answer an HTTP request. Guest-side liveness (early exit, watchdog) still
+   * fails fast, but no guest command is issued for the network check itself.
+   */
+  private async waitForManagedPreviewReadiness(
     port: number,
     timeoutMs: number,
   ): Promise<VmCommandResult> {
     const started = Date.now();
-    let lastOutput = '';
+    let attempts = 0;
+    const tailnetIp = this.tailnetIp;
+    if (!tailnetIp) {
+      return {
+        status: 1,
+        output: 'Tailnet IP is not available, so the preview cannot be reached from the browser.',
+        background: false,
+      };
+    }
+    const url = `http://${tailnetIp}:${port}/`;
     while (Date.now() - started < timeoutMs) {
       if (this.disposed || this.getFatalNetworkFailure()) {
         return {
@@ -2465,16 +2491,20 @@ export class WebVmBackend
           background: false,
         };
       }
-      const probe = await this.execBash(
-        buildInternalHttpProbeCommand(port),
-        '/',
-        false,
-        false,
-        HTTP_PROBE_COMMAND_TIMEOUT_MS,
-        false,
+      attempts += 1;
+      const controller = new AbortController();
+      const abortTimer = setTimeout(
+        () => controller.abort(),
+        MANAGED_PREVIEW_PROBE_TIMEOUT_MS,
       );
-      lastOutput = probe.output;
-      const exitAfterProbe = this.getServerLastExit();
+      let responded = false;
+      try {
+        responded = await this.probePreviewUrl(url, controller.signal);
+      } catch {
+        responded = false;
+      } finally {
+        clearTimeout(abortTimer);
+      }
       if (this.disposed || this.getFatalNetworkFailure()) {
         return {
           status: 1,
@@ -2482,6 +2512,7 @@ export class WebVmBackend
           background: false,
         };
       }
+      const exitAfterProbe = this.getServerLastExit();
       if (exitAfterProbe || this.commandRunnerTimedOut) {
         return exitAfterProbe ?? {
           status: 124,
@@ -2489,18 +2520,22 @@ export class WebVmBackend
           background: false,
         };
       }
-      if (probe.status === 0 && /SPARKRUN_HTTP_\d{3}/.test(probe.output)) {
+      if (responded) {
         return {
           status: 0,
-          output: probe.output.trim(),
+          output: `SPARKRUN_HTTP_RESPONSE browser received an HTTP response from ${url} after ${attempts} attempt${
+            attempts === 1 ? '' : 's'
+          }.`,
           background: false,
         };
       }
-      await sleep(300);
+      await sleep(MANAGED_PREVIEW_PROBE_INTERVAL_MS);
     }
     return {
       status: 1,
-      output: lastOutput.trim() || `No HTTP response from 127.0.0.1:${port}.`,
+      output: `No HTTP response from ${url} within ${Math.round(
+        timeoutMs / 1_000,
+      )}s (${attempts} browser attempt${attempts === 1 ? '' : 's'}).`,
       background: false,
     };
   }
