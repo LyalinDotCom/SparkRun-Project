@@ -990,15 +990,21 @@ describe('SparkRun chat screen', () => {
   it('flushes terminal scrollback and cancels project timers before a project transition', async () => {
     const backend = fakeBackend();
     let emitConsole: ((text: string) => void) | undefined;
+    let boots = 0;
     appMocks.createBackend.mockImplementation(async (options) => {
-      emitConsole = options.onConsole;
-      options.onDebug?.({
-        phase: 'exec',
-        command: 'transition-debug-marker',
-        cwd: '/workspace/site',
-        output: 'debug output',
-        status: 0,
-      });
+      boots += 1;
+      if (boots === 1) {
+        // Only the first project's VM emits the marker: the new project boots
+        // automatically after the transition and must not inherit it.
+        emitConsole = options.onConsole;
+        options.onDebug?.({
+          phase: 'exec',
+          command: 'transition-debug-marker',
+          cwd: '/workspace/site',
+          output: 'debug output',
+          status: 0,
+        });
+      }
       return backend;
     });
     backend.writeTerminalInput.mockImplementation(() => {
