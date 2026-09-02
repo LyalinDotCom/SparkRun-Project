@@ -44,7 +44,14 @@ The ext2 container is 1600 MiB, below the Firebase Hosting 2 GB per-file limit
 and large enough for the development stack plus filesystem metadata and guest
 working space. Its measured rootfs usage is recorded by every image build.
 
-> **Rejected for promotion:** `vm-image/image.json` and
+> **Candidate rc4 (2026.09.02):** identical recipe to rc3 plus a
+> `process.reallyExit` override in the compatibility layer (see
+> [`compat/README.md`](compat/README.md)). rc3's Chrome gate failed on
+> `process.exit()`; the override passed the in-guest hypothesis probe on
+> 2026-09-02. rc4 must still pass the full `probe=release-gate` in Chrome
+> before promotion.
+>
+> **Rejected for promotion (rc3):** `vm-image/image.json` and
 > `src/lib/constants.ts` retain rc3's historical candidate identity. Its immutable GitHub
 > Release and Firebase byte-range mirror are published and verified; those facts
 > prove provenance and delivery only. Real-Chrome measurements found that its

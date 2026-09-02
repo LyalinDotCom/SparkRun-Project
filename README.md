@@ -70,8 +70,11 @@ logs:
   one continuous stream;
 - the model selector is visible at the composer—3.7 Flash is the only enabled
   model in this release;
-- the collapsible Environment inspector exposes Preview, Files, Terminal, and
-  Activity only when the user needs the lower-level detail;
+- the collapsible Environment inspector exposes Preview, Files, and Activity
+  only when the user needs the lower-level detail;
+- the terminal is a full-width, resizable bottom dock (toolbar button or
+  Ctrl/Cmd+`) with a real xterm.js root shell and a Start VM control; the VM
+  boots automatically as soon as a project opens in the workbench;
 - detailed commands and output remain expandable, while milestones and failures
   stay readable at a glance.
 
@@ -198,16 +201,20 @@ before giving an automated guest access to a real tailnet.
 5. A web project calls `start_preview` with a foreground server command and an
    exact port. A plain `index.html` receives a built-in Python static-server
    fallback.
-6. SparkRun activates Tailscale only after normal workspace writes, starts the
-   server under supervision, and verifies its bind certificate and tracked
-   PID. Opening the reported URL in outer Chrome and observing its request in
-   the server log is the separate end-to-end connection proof.
+6. SparkRun activates Tailscale only after normal workspace writes and starts
+   the server under supervision. The built-in static server proves readiness
+   with its bind certificate and tracked PID; an agent-started preview is
+   proven by the outer browser receiving an HTTP response from the tailnet
+   URL (no guest loopback request, which can wedge CheerpX's network stack).
+   Opening the reported URL in outer Chrome and observing its request in the
+   server log is the end-to-end connection proof.
 7. The app saves the harness session after model and tool steps and checkpoints
    the project after the run, including on recoverable failures.
 
 The workbench exposes conversations, agent/tool events, generated files,
 diagnostics, storage state, snapshots, VM restart controls, and a real xterm
-terminal with raw input, resize, arrow keys, paste, and Ctrl-C. These surfaces
+terminal (docked at the bottom, resizable, Ctrl/Cmd+`) with raw input, resize,
+arrow keys, paste, and Ctrl-C. These surfaces
 are implemented; the release gate still requires their complete real-Chrome
 flow rather than treating unit coverage as browser proof.
 

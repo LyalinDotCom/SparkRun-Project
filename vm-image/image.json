@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "profileId": "sparkrun-coding",
-  "version": "2026.08.27-rc3",
+  "version": "2026.09.02-rc4",
   "status": "candidate",
   "architecture": "linux/386",
   "distribution": "Alpine Linux 3.24.1",
@@ -23,15 +23,16 @@
   },
   "imageSizeMiB": 1600,
   "filesystem": "ext2 revision 0",
-  "diskFile": "sparkrun-coding-2026.08.27-rc3.ext2",
+  "diskFile": "sparkrun-coding-2026.09.02-rc4.ext2",
   "nodeCompatibility": {
-    "mechanism": "N-API environment cleanup hook with exact-status _exit",
+    "mechanism": "N-API environment cleanup hook plus process.reallyExit override with exact-status _exit",
     "preload": "/usr/local/lib/sparkrun/node-exit-preload.cjs",
     "addon": "/usr/local/lib/sparkrun/node-exit-addon.node",
     "profileScript": "/etc/profile.d/sparkrun-node.sh"
   },
   "notes": [
     "Candidate until the image passes the CheerpX Chrome runtime smoke suite.",
+    "rc4 routes process.exit() (process.reallyExit) and unhandled uncaught exceptions through the addon's _exit as well; rc3 hung in Node's C++ Exit path, which never reaches environment cleanup hooks. The override was proven inside the real CheerpX VM on 2026-09-02 before this rebuild.",
     "Alpine musl replaces the Debian glibc userspace, but musl alone did not fix Node's CheerpX native teardown hang.",
     "A root-owned N-API cleanup addon preserves Node's resolved exit status and exits before the broken native teardown path.",
     "The preload records status after user exit listeners, matching Node's final process.exitCode semantics.",

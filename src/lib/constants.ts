@@ -49,8 +49,8 @@ export const WEBVM_OFFICIAL_DISK_PROFILE: WebVmDiskProfile = {
 };
 
 export const WEBVM_CODING_CANDIDATE_PROFILE: WebVmDiskProfile = {
-  id: 'sparkrun-coding-2026-08-27-rc3',
-  label: 'SparkRun coding image 2026.08.27-rc3',
+  id: 'sparkrun-coding-2026-09-02-rc4',
+  label: 'SparkRun coding image 2026.09.02-rc4',
   distribution: 'Alpine Linux 3.24.1',
   kind: 'bytes',
   timeoutRunner: 'busybox',
@@ -69,7 +69,7 @@ export const WEBVM_CODING_CANDIDATE_PROFILE: WebVmDiskProfile = {
   // image size through the Content-Range response header; same-origin access
   // avoids making that correctness depend on CORS header exposure. Vite
   // proxies this immutable path to Firebase during local development.
-  url: '/vm-images/sparkrun-coding-2026.08.27-rc3.ext2',
+  url: '/vm-images/sparkrun-coding-2026.09.02-rc4.ext2',
 };
 
 export const WEBVM_VENDOR_ALPINE_PROFILE: WebVmDiskProfile = {

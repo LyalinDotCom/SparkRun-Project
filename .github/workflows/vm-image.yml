@@ -46,12 +46,12 @@ jobs:
               "go": "1.26.3-r0"
             } and
             .nodeCompatibility == {
-              "mechanism": "N-API environment cleanup hook with exact-status _exit",
+              "mechanism": "N-API environment cleanup hook plus process.reallyExit override with exact-status _exit",
               "preload": "/usr/local/lib/sparkrun/node-exit-preload.cjs",
               "addon": "/usr/local/lib/sparkrun/node-exit-addon.node",
               "profileScript": "/etc/profile.d/sparkrun-node.sh"
             } and
-            (.version | endswith("-rc3")) and
+            (.version | endswith("-rc4")) and
             (.diskFile | contains($version)) and
             (.imageSizeMiB >= 600 and .imageSizeMiB <= 1900) and
             (.diskFile | endswith(".ext2"))

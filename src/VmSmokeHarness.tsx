@@ -73,6 +73,7 @@ export type VmSmokeProbeStepId =
   | `inventory-${string}`
   | `npm-diagnostic-${string}`
   | 'node-exit'
+  | 'node-exit-override'
   | 'node-processes'
   | 'npm-offline'
   | 'python-runtime'
@@ -768,6 +769,67 @@ const NODE_EXIT_STEP: VmSmokeProbeStep = {
   ],
 };
 
+/**
+ * Hypothesis probe for the rc3 Node hang. `node -e 'void 0'` completes because
+ * the baked cleanup hook calls _exit() during environment teardown, but
+ * `process.exit()` takes Node's C++ Exit path (platform teardown, no env
+ * cleanup hooks) and never returns under CheerpX. This step compiles a tiny
+ * N-API addon inside the guest, overrides `process.reallyExit` with a direct
+ * `_exit(code)`, and checks that explicit, deferred, nested, and uncaught exits
+ * all terminate with the exact status. A pass here justifies baking the
+ * override into the next image revision.
+ */
+const NODE_EXIT_OVERRIDE_STEP: VmSmokeProbeStep = {
+  id: 'node-exit-override',
+  label: 'Prove a process.reallyExit override ends explicit Node exits',
+  command: [
+    'set -euo pipefail',
+    'sparkrun_work="$(mktemp -d)"',
+    'trap \'rm -rf "$sparkrun_work"\' EXIT',
+    // Sources are base64 so the command validator never sees a bare "&"
+    // (C address-of) as a shell background operator.
+    "printf '%s' 'I2luY2x1ZGUgPHN0ZGRlZi5oPgojaW5jbHVkZSA8c3RkaW50Lmg+CiNpbmNsdWRlIDx1bmlzdGQuaD4KdHlwZWRlZiBzdHJ1Y3QgbmFwaV9lbnZfXyAqbmFwaV9lbnY7CnR5cGVkZWYgc3RydWN0IG5hcGlfdmFsdWVfXyAqbmFwaV92YWx1ZTsKdHlwZWRlZiBzdHJ1Y3QgbmFwaV9jYWxsYmFja19pbmZvX18gKm5hcGlfY2FsbGJhY2tfaW5mbzsKdHlwZWRlZiBpbnQgbmFwaV9zdGF0dXM7CnR5cGVkZWYgbmFwaV92YWx1ZSAoKm5hcGlfY2FsbGJhY2spKG5hcGlfZW52LCBuYXBpX2NhbGxiYWNrX2luZm8pOwpleHRlcm4gbmFwaV9zdGF0dXMgbmFwaV9jcmVhdGVfZnVuY3Rpb24obmFwaV9lbnYsIGNvbnN0IGNoYXIgKiwgc2l6ZV90LCBuYXBpX2NhbGxiYWNrLCB2b2lkICosIG5hcGlfdmFsdWUgKik7CmV4dGVybiBuYXBpX3N0YXR1cyBuYXBpX2dldF9jYl9pbmZvKG5hcGlfZW52LCBuYXBpX2NhbGxiYWNrX2luZm8sIHNpemVfdCAqLCBuYXBpX3ZhbHVlICosIG5hcGlfdmFsdWUgKiwgdm9pZCAqKik7CmV4dGVybiBuYXBpX3N0YXR1cyBuYXBpX2dldF91bmRlZmluZWQobmFwaV9lbnYsIG5hcGlfdmFsdWUgKik7CmV4dGVybiBuYXBpX3N0YXR1cyBuYXBpX2dldF92YWx1ZV9pbnQzMihuYXBpX2VudiwgbmFwaV92YWx1ZSwgaW50MzJfdCAqKTsKZXh0ZXJuIG5hcGlfc3RhdHVzIG5hcGlfc2V0X25hbWVkX3Byb3BlcnR5KG5hcGlfZW52LCBuYXBpX3ZhbHVlLCBjb25zdCBjaGFyICosIG5hcGlfdmFsdWUpOwpzdGF0aWMgbmFwaV92YWx1ZSBleGl0X25vdyhuYXBpX2VudiBlbnYsIG5hcGlfY2FsbGJhY2tfaW5mbyBpbmZvKSB7CiAgc2l6ZV90IGFyZ2MgPSAxOyBuYXBpX3ZhbHVlIGFyZ3ZbMV07IG5hcGlfdmFsdWUgcmVzdWx0OyBpbnQzMl90IGNvZGUgPSAwOwogIGlmIChuYXBpX2dldF9jYl9pbmZvKGVudiwgaW5mbywgJmFyZ2MsIGFyZ3YsIE5VTEwsIE5VTEwpID09IDAgJiYgYXJnYyA9PSAxKSBuYXBpX2dldF92YWx1ZV9pbnQzMihlbnYsIGFyZ3ZbMF0sICZjb2RlKTsKICBfZXhpdChjb2RlKTsKICBuYXBpX2dldF91bmRlZmluZWQoZW52LCAmcmVzdWx0KTsKICByZXR1cm4gcmVzdWx0Owp9Cl9fYXR0cmlidXRlX18oKHZpc2liaWxpdHkoImRlZmF1bHQiKSkpCm5hcGlfdmFsdWUgbmFwaV9yZWdpc3Rlcl9tb2R1bGVfdjEobmFwaV9lbnYgZW52LCBuYXBpX3ZhbHVlIGV4cG9ydHMpIHsKICBuYXBpX3ZhbHVlIGZuOwogIGlmIChuYXBpX2NyZWF0ZV9mdW5jdGlvbihlbnYsICJleGl0Tm93IiwgNywgZXhpdF9ub3csIE5VTEwsICZmbikgIT0gMCkgcmV0dXJuIE5VTEw7CiAgaWYgKG5hcGlfc2V0X25hbWVkX3Byb3BlcnR5KGVudiwgZXhwb3J0cywgImV4aXROb3ciLCBmbikgIT0gMCkgcmV0dXJuIE5VTEw7CiAgcmV0dXJuIGV4cG9ydHM7Cn0K' | base64 -d >\"$sparkrun_work/exitnow.c\"",
+    'gcc -shared -fPIC -O2 -o "$sparkrun_work/exitnow.node" "$sparkrun_work/exitnow.c"',
+    "printf 'override:compiled:ok\\n'",
+    "printf '%s' 'InVzZSBzdHJpY3QiOwpjb25zdCBhZGRvbiA9IHJlcXVpcmUocHJvY2Vzcy5lbnYuU1BBUktSVU5fRVhJVE5PVyk7CmNvbnN0IHsgZmx1c2hDb21waWxlQ2FjaGUgfSA9IHJlcXVpcmUoIm5vZGU6bW9kdWxlIik7CnByb2Nlc3MucmVhbGx5RXhpdCA9IChjb2RlKSA9PiB7IHRyeSB7IGZsdXNoQ29tcGlsZUNhY2hlKCk7IH0gY2F0Y2gge30gYWRkb24uZXhpdE5vdyhOdW1iZXIoY29kZSkgfCAwKTsgfTsKcHJvY2Vzcy5vbigidW5jYXVnaHRFeGNlcHRpb24iLCAoZXJyb3IpID0+IHsKICBpZiAocHJvY2Vzcy5saXN0ZW5lckNvdW50KCJ1bmNhdWdodEV4Y2VwdGlvbiIpID4gMSkgcmV0dXJuOwogIHByb2Nlc3Muc3RkZXJyLndyaXRlKFN0cmluZyhlcnJvciAmJiBlcnJvci5zdGFjayA/IGVycm9yLnN0YWNrIDogZXJyb3IpICsgIlxuIik7CiAgcHJvY2Vzcy5leGl0KDEpOwp9KTsK' | base64 -d >\"$sparkrun_work/override.cjs\"",
+    'sparkrun_run() {',
+    '  sparkrun_expected="$1"; sparkrun_label="$2"; shift 2',
+    '  set +e',
+    '  SPARKRUN_EXITNOW="$sparkrun_work/exitnow.node" node -r "$sparkrun_work/override.cjs" "$@" >"$sparkrun_work/out.log" 2>&1',
+    '  sparkrun_actual=$?',
+    '  set -e',
+    '  if test "$sparkrun_actual" -ne "$sparkrun_expected"; then',
+    '    printf "override:%s:status=%s expected=%s\\n" "$sparkrun_label" "$sparkrun_actual" "$sparkrun_expected"',
+    '    sed -n \'1,40p\' "$sparkrun_work/out.log"',
+    '    return 1',
+    '  fi',
+    '  printf "override:%s:ok\\n" "$sparkrun_label"',
+    '}',
+    "sparkrun_run 7 explicit -e 'process.exit(7)'",
+    "sparkrun_run 7 deferred -e 'process.exitCode = 7'",
+    "sparkrun_run 0 natural -e 'void 0'",
+    "sparkrun_run 9 nested-exit -e \"process.on('exit', () => { process.exit(9); })\"",
+    "sparkrun_run 1 uncaught -e \"throw new Error('expected-override-error')\"",
+    "sparkrun_run 0 stdout-flush -e \"process.stdout.write('x'.repeat(65536)); process.exit(0)\"",
+    "printf 'process.exit(3)\\n' >\"$sparkrun_work/child.cjs\"",
+    "sparkrun_run 3 fork-child -e \"const { fork } = require('node:child_process'); const c = fork(process.argv[1], [], { execArgv: process.execArgv }); c.on('exit', (code) => process.exit(code === 3 ? 3 : 1));\" \"$sparkrun_work/child.cjs\"",
+    "printf 'override:all:ok\\n'",
+  ].join('\n'),
+  timeoutMs: 480_000,
+  expectedStatus: 0,
+  expectedOutput: [
+    'override:compiled:ok',
+    'override:explicit:ok',
+    'override:deferred:ok',
+    'override:natural:ok',
+    'override:nested-exit:ok',
+    'override:uncaught:ok',
+    'override:stdout-flush:ok',
+    'override:fork-child:ok',
+    'override:all:ok',
+  ],
+};
+
 const NODE_PROCESSES_STEP: VmSmokeProbeStep = {
   id: 'node-processes',
   label: 'Verify Node worker, fork, large stdout, and subsequent commands',
@@ -1048,6 +1110,11 @@ export const VM_SMOKE_PROBES = {
     label: 'Candidate Node compatibility gate',
     candidateOnly: true,
     steps: [NODE_EXIT_STEP, NODE_PROCESSES_STEP],
+  },
+  'node-exit-override': {
+    label: 'Candidate Node reallyExit-override hypothesis',
+    candidateOnly: true,
+    steps: [NODE_EXIT_OVERRIDE_STEP],
   },
   npm: {
     label: 'Candidate npm entry-point and offline build gate',

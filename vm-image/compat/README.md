@@ -16,6 +16,21 @@ and install their own hook. Because `_exit` also precedes Node's automatic
 compile-cache flush, the preload calls Node 24's `flushCompileCache()` before
 the native hook runs.
 
+**rc4 addition — explicit exits.** The cleanup hook only fires on Node's
+natural teardown. `process.exit()` (and the runtime's own exit after an
+unhandled uncaught exception) goes through `process.reallyExit`, Node's C++
+`Exit` path, which disposes the platform without running environment cleanup
+hooks and never returns under CheerpX 1.3.9. rc3 failed its Chrome gate
+exactly there: `node -e 'void 0'` returned, `node -e 'process.exit(7)'` hung
+for the full watchdog. The preload therefore replaces `process.reallyExit`
+with the addon's `exitNow(status)` (`_exit` after a best-effort compile-cache
+flush) and installs a lowest-priority `uncaughtException` listener that
+reproduces Node's default report and status 1 on that same path when no user
+listener exists. The override was proven inside the real CheerpX VM on
+2026-09-02 with the `probe=node-exit-override` smoke step, which compiles the
+same addon in the guest and checks explicit, deferred, natural, nested,
+uncaught, 64 KiB stdout, and forked-child exits, before this image rebuild.
+
 Docker image environment metadata is not included by `docker export`.
 `sparkrun-node.sh` therefore persists both defaults in `/etc/profile.d` for
 login shells without overwriting caller-supplied values. Non-login CheerpX

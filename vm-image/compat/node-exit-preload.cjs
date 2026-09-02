@@ -58,4 +58,39 @@ if (isMainThread) {
       throw error;
     }
   };
+
+  // process.exit() ends in process.reallyExit(), Node's C++ Exit path. That
+  // path tears the platform down without running environment cleanup hooks
+  // and hangs under CheerpX 1.3.9 (rc3 failed its Chrome gate exactly there:
+  // `node -e 'void 0'` returned, `node -e 'process.exit(7)'` never did).
+  // Node has already emitted "exit" by the time reallyExit runs, so the
+  // recorded status is final; terminate through the same _exit boundary.
+  // stdout/stderr to files, pipes, and TTYs are synchronous on Linux, so no
+  // buffered output is lost. This override is reachable from user code as
+  // well, which matches Node's own documented process.reallyExit hook.
+  process.reallyExit = function sparkrunReallyExit(code) {
+    const status = Number.isInteger(Number(code)) ? Number(code) : 1;
+    try {
+      flushCompileCache();
+    } catch {
+      // Cache persistence is best effort.
+    }
+    addon.exitNow(status);
+  };
+
+  // An uncaught exception with no user handler exits through the C++ Exit
+  // path directly, bypassing reallyExit. Reproduce Node's default outcome
+  // (report, status 1) on the working exit path. User listeners registered
+  // later take precedence exactly as they would without this preload.
+  process.on('uncaughtException', function sparkrunUncaught(error) {
+    if (process.listenerCount('uncaughtException') > 1) {
+      return;
+    }
+    const report =
+      error && typeof error === 'object' && typeof error.stack === 'string'
+        ? error.stack
+        : String(error);
+    process.stderr.write(`${report}\n`);
+    process.exit(1);
+  });
 }

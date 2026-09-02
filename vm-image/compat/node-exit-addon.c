@@ -55,9 +55,31 @@ static void finish_without_platform_teardown(void *data) {
   _exit(recorded_exit_code);
 }
 
+/*
+ * process.exit() takes Node's C++ Exit path (platform teardown) which never
+ * reaches environment cleanup hooks and hangs under CheerpX 1.3.9. The preload
+ * points process.reallyExit at this function so an explicit exit terminates
+ * through the same _exit boundary as a natural one, with the exact status.
+ * Proven in the real CheerpX VM on 2026-09-02 (smoke probe node-exit-override).
+ */
+static napi_value exit_now(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_value result;
+  int32_t code = recorded_exit_code;
+
+  if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) == 0 && argc == 1) {
+    napi_get_value_int32(env, argv[0], &code);
+  }
+  _exit(code);
+  napi_get_undefined(env, &result);
+  return result;
+}
+
 __attribute__((visibility("default")))
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_value setter;
+  napi_value exiter;
 
   if (napi_add_env_cleanup_hook(env, finish_without_platform_teardown, NULL) !=
       0) {
@@ -72,6 +94,12 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
     return NULL;
   }
   if (napi_set_named_property(env, exports, "setExitCode", setter) != 0) {
+    return NULL;
+  }
+  if (napi_create_function(env, "exitNow", 7, exit_now, NULL, &exiter) != 0) {
+    return NULL;
+  }
+  if (napi_set_named_property(env, exports, "exitNow", exiter) != 0) {
     return NULL;
   }
   return exports;
